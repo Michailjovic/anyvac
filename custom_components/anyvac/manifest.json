@@ -1,0 +1,12 @@
+{
+  "domain": "anyvac",
+  "name": "AnyVac",
+  "after_dependencies": ["roborock"],
+  "codeowners": ["@Michailjovic"],
+  "config_flow": true,
+  "documentation": "https://github.com/Michailjovic/anyvac",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/Michailjovic/anyvac/issues",
+  "requirements": [],
+  "version": "0.1.0"
+}
