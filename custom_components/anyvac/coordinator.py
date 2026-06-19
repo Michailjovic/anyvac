@@ -24,7 +24,9 @@ from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN, PATH_MAX_POINTS, ROBOROCK_DOMAIN, SCAN_INTERVAL_SECONDS
 
@@ -110,6 +112,11 @@ def _extract_map(map_data: Any) -> dict[str, Any]:
         )
     out["rooms"] = rooms
 
+    # Which segments the robot has cleaned (this session) + where it currently is.
+    out["cleaned_rooms"] = sorted(getattr(map_data, "cleaned_rooms", None) or [])
+    out["vacuum_room"] = getattr(map_data, "vacuum_room", None)
+    out["vacuum_room_name"] = getattr(map_data, "vacuum_room_name", None)
+
     # Image dimensions (for mm <-> map-pixel conversions on the card side).
     img = getattr(map_data, "image", None)
     dims = getattr(img, "dimensions", None) if img is not None else None
@@ -138,6 +145,45 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             update_interval=timedelta(seconds=SCAN_INTERVAL_SECONDS),
         )
         self.entry = entry
+        self._store: Store = Store(hass, 1, f"{DOMAIN}_clean_history")
+        self._last_cleaned: dict[str, dict[str, str]] = {}
+        self._session_seen: dict[str, set[str]] = {}
+        self._was_cleaning: dict[str, bool] = {}
+
+    async def _async_setup(self) -> None:
+        """Load persisted per-room clean history before the first refresh."""
+        stored = await self._store.async_load()
+        if isinstance(stored, dict):
+            self._last_cleaned = {k: dict(v) for k, v in stored.items() if isinstance(v, dict)}
+
+    def _history_for_save(self) -> dict[str, dict[str, str]]:
+        return self._last_cleaned
+
+    def _update_history(self, device: AnyVacDevice) -> None:
+        """Stamp 'last cleaned' per room from MapData.cleaned_rooms, persisted.
+
+        We reset our per-session tracking when a new cleaning session starts, so a
+        room is stamped once each time it is cleaned regardless of whether
+        cleaned_rooms is cumulative or reset by the firmware.
+        """
+        duid = device.duid
+        cleaning = bool(device.data.get("in_cleaning"))
+        cleaned = {str(s) for s in (device.data.get("cleaned_rooms") or [])}
+        if cleaning and not self._was_cleaning.get(duid, False):
+            self._session_seen[duid] = set()  # new cleaning session
+        seen = self._session_seen.setdefault(duid, set())
+        if cleaning and cleaned:
+            now = dt_util.utcnow().isoformat()
+            lc = self._last_cleaned.setdefault(duid, {})
+            changed = False
+            for seg in cleaned:
+                if seg not in seen:
+                    seen.add(seg)
+                    lc[seg] = now
+                    changed = True
+            if changed:
+                self._store.async_delay_save(self._history_for_save, 5)
+        self._was_cleaning[duid] = cleaning
 
     async def _async_update_data(self) -> dict[str, AnyVacDevice]:
         """Read every Roborock v1 coordinator and normalise its map data."""
@@ -152,6 +198,11 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     _LOGGER.debug("AnyVac: failed reading a Roborock coordinator: %s", err)
                     continue
                 if device is not None:
+                    self._update_history(device)
+                    lc = self._last_cleaned.get(device.duid, {})
+                    device.data["rooms_last_cleaned"] = dict(lc)
+                    for room in device.data.get("rooms", []):
+                        room["last_cleaned"] = lc.get(str(room.get("segment_id")))
                     result[device.duid] = device
         return result
 
@@ -188,6 +239,9 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         for room in data.get("rooms", []):
             if room.get("name") is None and room.get("segment_id") in names:
                 room["name"] = names[room["segment_id"]]
+
+        status = getattr(getattr(coord, "properties_api", None), "status", None)
+        data["in_cleaning"] = bool(getattr(status, "in_cleaning", False)) if status is not None else False
 
         duid = getattr(coord, "duid", None) or "unknown"
         slug = getattr(coord, "duid_slug", None) or duid
