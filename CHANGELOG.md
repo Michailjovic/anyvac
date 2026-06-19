@@ -4,6 +4,20 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-06-19
+
+### Changed
+
+- **Room cleaning detected by presence, not `cleaned_rooms`** — on real hardware `cleaned_rooms`
+  comes up empty, so tracking now uses `vacuum_room` (where the robot is) while it is cleaning, and
+  unions in `cleaned_rooms` when the firmware does provide it.
+- **Dry vs wet + cross-vacuum** — history is keyed by room **name** (so it aggregates across all
+  vacuums) and records `dry` / `wet` / `any` timestamps. Each room now exposes `last_cleaned`,
+  `last_dry`, `last_wet`. Dry/wet is derived from the water mode (best-effort).
+- **Raw signals for verification** — the sensor now also exposes `clean_type`, `vacuum_room_name`
+  and a `mop_signal` dict (fan power, water mode, mop mode, water-box / carriage state) so the
+  dry/wet classification can be confirmed and refined against hardware.
+
 ## [0.2.0] - 2026-06-19
 
 ### Added
@@ -16,6 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   verification. This replaces the fragile helper/automation approach with an
   event-driven, persistent source of truth. (Per-room timestamp sensors + card
   wiring to follow once the `cleaned_rooms` semantics are confirmed on hardware.)
+- **No recorder config needed** — the map payload attributes are marked unrecorded
+  (`_unrecorded_attributes`), so the large / fast-changing data stays out of the recorder database
+  without any `recorder: exclude` in `configuration.yaml`.
 
 ## [0.1.1] - 2026-06-19
 

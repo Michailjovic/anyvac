@@ -50,6 +50,15 @@ class AnyVacMapSensor(CoordinatorEntity[AnyVacCoordinator], SensorEntity):
     _attr_has_entity_name = True
     _attr_name = "AnyVac Map"
     _attr_icon = "mdi:map-marker-path"
+    # Keep the large / fast-changing map payload out of the recorder automatically,
+    # so the user never has to add a `recorder: exclude` to configuration.yaml.
+    _unrecorded_attributes = frozenset(
+        {
+            "vacuum_position", "charger", "calibration_points", "path", "rooms",
+            "image_dims", "cleaned_rooms", "rooms_last_cleaned", "vacuum_room",
+            "vacuum_room_name", "in_cleaning", "clean_type", "mop_signal",
+        }
+    )
 
     def __init__(self, coordinator: AnyVacCoordinator, duid: str) -> None:
         """Initialize the sensor."""

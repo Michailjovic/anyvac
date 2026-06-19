@@ -38,15 +38,9 @@ is the current path-point count and whose attributes carry the map payload:
 
 ## Recorder
 
-The `path` attribute can be large and changes while cleaning. Exclude these
-sensors from the recorder to keep your database small:
-
-```yaml
-recorder:
-  exclude:
-    entity_globs:
-      - sensor.*_anyvac_map
-```
+Nothing to configure — the large map attributes (`path`, `rooms`, `calibration_points`, …) are marked
+as unrecorded by the integration, so they stay out of your recorder database automatically. No
+`recorder: exclude` in `configuration.yaml` is needed.
 
 ## Status
 

@@ -145,45 +145,50 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             update_interval=timedelta(seconds=SCAN_INTERVAL_SECONDS),
         )
         self.entry = entry
-        self._store: Store = Store(hass, 1, f"{DOMAIN}_clean_history")
-        self._last_cleaned: dict[str, dict[str, str]] = {}
-        self._session_seen: dict[str, set[str]] = {}
-        self._was_cleaning: dict[str, bool] = {}
+        self._store: Store = Store(hass, 1, f"{DOMAIN}_room_history")
+        # Cross-vacuum room history keyed by room NAME: {name: {dry, wet, any: iso}}
+        self._history: dict[str, dict[str, str]] = {}
 
     async def _async_setup(self) -> None:
         """Load persisted per-room clean history before the first refresh."""
         stored = await self._store.async_load()
         if isinstance(stored, dict):
-            self._last_cleaned = {k: dict(v) for k, v in stored.items() if isinstance(v, dict)}
+            self._history = {k: dict(v) for k, v in stored.items() if isinstance(v, dict)}
 
     def _history_for_save(self) -> dict[str, dict[str, str]]:
-        return self._last_cleaned
+        return self._history
 
     def _update_history(self, device: AnyVacDevice) -> None:
-        """Stamp 'last cleaned' per room from MapData.cleaned_rooms, persisted.
+        """While a vacuum is cleaning, stamp the room it is currently in (and any
+        firmware-reported cleaned segments) with the current clean type, keyed by
+        room NAME so history aggregates across all vacuums. Persisted across restarts.
 
-        We reset our per-session tracking when a new cleaning session starts, so a
-        room is stamped once each time it is cleaned regardless of whether
-        cleaned_rooms is cumulative or reset by the firmware.
+        We use vacuum_room (presence) as the primary signal because cleaned_rooms is
+        not reliably populated; cleaned_rooms is unioned in when present.
         """
-        duid = device.duid
-        cleaning = bool(device.data.get("in_cleaning"))
-        cleaned = {str(s) for s in (device.data.get("cleaned_rooms") or [])}
-        if cleaning and not self._was_cleaning.get(duid, False):
-            self._session_seen[duid] = set()  # new cleaning session
-        seen = self._session_seen.setdefault(duid, set())
-        if cleaning and cleaned:
-            now = dt_util.utcnow().isoformat()
-            lc = self._last_cleaned.setdefault(duid, {})
-            changed = False
-            for seg in cleaned:
-                if seg not in seen:
-                    seen.add(seg)
-                    lc[seg] = now
-                    changed = True
-            if changed:
-                self._store.async_delay_save(self._history_for_save, 5)
-        self._was_cleaning[duid] = cleaning
+        if not device.data.get("in_cleaning"):
+            return
+        names: set[str] = set()
+        current = device.data.get("vacuum_room_name")
+        if current:
+            names.add(current)
+        seg_to_name = {
+            str(r.get("segment_id")): r.get("name") for r in device.data.get("rooms", [])
+        }
+        for seg in device.data.get("cleaned_rooms") or []:
+            nm = seg_to_name.get(str(seg))
+            if nm:
+                names.add(nm)
+        if not names:
+            return
+        ctype = device.data.get("clean_type")
+        now = dt_util.utcnow().isoformat()
+        for nm in names:
+            rec = self._history.setdefault(nm, {})
+            rec["any"] = now
+            if ctype in ("dry", "wet"):
+                rec[ctype] = now
+        self._store.async_delay_save(self._history_for_save, 5)
 
     async def _async_update_data(self) -> dict[str, AnyVacDevice]:
         """Read every Roborock v1 coordinator and normalise its map data."""
@@ -199,10 +204,12 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     continue
                 if device is not None:
                     self._update_history(device)
-                    lc = self._last_cleaned.get(device.duid, {})
-                    device.data["rooms_last_cleaned"] = dict(lc)
                     for room in device.data.get("rooms", []):
-                        room["last_cleaned"] = lc.get(str(room.get("segment_id")))
+                        rec = self._history.get(room.get("name")) or {}
+                        room["last_cleaned"] = rec.get("any")
+                        room["last_dry"] = rec.get("dry")
+                        room["last_wet"] = rec.get("wet")
+                    device.data["rooms_last_cleaned"] = {k: dict(v) for k, v in self._history.items()}
                     result[device.duid] = device
         return result
 
@@ -241,7 +248,31 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 room["name"] = names[room["segment_id"]]
 
         status = getattr(getattr(coord, "properties_api", None), "status", None)
-        data["in_cleaning"] = bool(getattr(status, "in_cleaning", False)) if status is not None else False
+
+        def _s(attr: str) -> Any:
+            return getattr(status, attr, None) if status is not None else None
+
+        data["in_cleaning"] = bool(_s("in_cleaning"))
+        water_name = _s("water_mode_name")
+        data["mop_signal"] = {
+            "fan_power": _s("fan_power"),
+            "fan_speed_name": _s("fan_speed_name"),
+            "water_box_mode": _s("water_box_mode"),
+            "water_mode_name": water_name,
+            "mop_mode": _s("mop_mode"),
+            "mop_route_name": _s("mop_route_name"),
+            "water_box_status": _s("water_box_status"),
+            "water_box_carriage_status": _s("water_box_carriage_status"),
+            "is_water_box_carriage_attached": _s("is_water_box_carriage_attached"),
+        }
+        # Best-effort dry/wet: "wet" when a water level is active. Verify via mop_signal
+        # and we will refine the exact field once confirmed on hardware.
+        data["clean_type"] = (
+            "wet" if water_name and str(water_name).lower() not in ("off", "none", "closed") else "dry"
+        )
+        vr = data.get("vacuum_room")
+        if vr is not None and not data.get("vacuum_room_name"):
+            data["vacuum_room_name"] = names.get(vr)
 
         duid = getattr(coord, "duid", None) or "unknown"
         slug = getattr(coord, "duid_slug", None) or duid
