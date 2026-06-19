@@ -94,6 +94,19 @@ def _extract_map(map_data: Any) -> dict[str, Any]:
                     flat.append({"x": px, "y": py})
     out["path"] = _decimate(flat, PATH_MAX_POINTS)
 
+    # Mop (wet) path as a separate layer.
+    mflat: list[dict[str, float]] = []
+    mop_obj = getattr(map_data, "mop_path", None)
+    msub = getattr(mop_obj, "path", None) if mop_obj is not None else None
+    if msub:
+        for sub in msub:
+            for pt in sub:
+                mx = getattr(pt, "x", None)
+                my = getattr(pt, "y", None)
+                if mx is not None and my is not None:
+                    mflat.append({"x": mx, "y": my})
+    out["mop_path"] = _decimate(mflat, PATH_MAX_POINTS)
+
     # Rooms: {segment_number: Room} -> list of plain dicts.
     rooms: list[dict[str, Any]] = []
     room_dict = getattr(map_data, "rooms", None) or {}
