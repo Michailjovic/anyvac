@@ -173,7 +173,23 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         if map_data is None:
             return None
 
+        data = _extract_map(map_data)
+
+        # MapData.rooms carry no names; merge them from the home trait's room mapping.
+        names: dict[int, str] = {}
+        try:
+            for room_map in getattr(home, "current_rooms", None) or []:
+                seg = getattr(room_map, "segment_id", None)
+                nm = getattr(room_map, "name", None)
+                if seg is not None and nm:
+                    names[seg] = nm
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("AnyVac: failed reading room names: %s", err)
+        for room in data.get("rooms", []):
+            if room.get("name") is None and room.get("segment_id") in names:
+                room["name"] = names[room["segment_id"]]
+
         duid = getattr(coord, "duid", None) or "unknown"
         slug = getattr(coord, "duid_slug", None) or duid
         name = getattr(getattr(coord, "device", None), "name", None) or slug
-        return AnyVacDevice(duid=duid, slug=slug, name=name, data=_extract_map(map_data))
+        return AnyVacDevice(duid=duid, slug=slug, name=name, data=data)
