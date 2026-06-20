@@ -4,6 +4,21 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-06-20
+
+### Added
+
+- **Per-room "last cleaned" timestamp sensors** — `sensor.<room>_last_dry` / `_last_wet`
+  (`device_class: timestamp`, on an "AnyVac Rooms" device), keyed by room name across vacuums. The
+  foundation for "overdue" automations/notifications.
+- **Clean events** — `anyvac_clean_started` / `anyvac_clean_finished`
+  (`{vacuum, duid, clean_type, rooms}`) fired on cleaning transitions, for clean-finished notifications.
+- **Auto-installed notification blueprints** — on setup the integration copies three automation
+  blueprints into `config/blueprints/automation/anyvac/` (room overdue, clean finished, vacuum error).
+  Create an automation from one, pick your notify service and **write your own message in any
+  language** — the integration never composes message text. It never overwrites a blueprint you have
+  edited.
+
 ## [0.3.1] - 2026-06-19
 
 ### Added

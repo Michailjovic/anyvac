@@ -1,0 +1,51 @@
+blueprint:
+  name: AnyVac — Clean finished
+  description: >
+    Notify when an AnyVac vacuum finishes cleaning. Fires on the anyvac_clean_finished
+    event. You can use {{ vacuum }}, {{ clean_type }} and {{ rooms }} in the message.
+  domain: automation
+  input:
+    notify_service:
+      name: Notify service
+      description: e.g. notify.mobile_app_phone or persistent_notification.create
+      default: persistent_notification.create
+      selector:
+        text:
+    vacuum_filter:
+      name: Only this vacuum (optional)
+      description: Leave empty for all vacuums. Otherwise the vacuum name or its duid.
+      default: ""
+      selector:
+        text:
+    title:
+      name: Title
+      default: Cleaning finished
+      selector:
+        text:
+    message:
+      name: Message
+      description: "Available: {{ vacuum }}, {{ clean_type }}, {{ rooms }}."
+      default: "{{ vacuum }} finished {{ clean_type }} cleaning: {{ rooms | join(', ') }}"
+      selector:
+        text:
+          multiline: true
+mode: parallel
+variables:
+  vacuum_filter: !input vacuum_filter
+trigger:
+  - platform: event
+    event_type: anyvac_clean_finished
+condition:
+  - condition: template
+    value_template: >
+      {{ vacuum_filter == '' or trigger.event.data.vacuum == vacuum_filter
+         or trigger.event.data.duid == vacuum_filter }}
+action:
+  - variables:
+      vacuum: "{{ trigger.event.data.vacuum }}"
+      clean_type: "{{ trigger.event.data.clean_type }}"
+      rooms: "{{ trigger.event.data.rooms }}"
+  - service: !input notify_service
+    data:
+      title: !input title
+      message: !input message

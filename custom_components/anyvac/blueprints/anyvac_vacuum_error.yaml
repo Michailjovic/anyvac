@@ -1,0 +1,48 @@
+blueprint:
+  name: AnyVac — Vacuum error
+  description: >
+    Notify when a vacuum reports an error. Uses the existing Roborock vacuum error
+    sensor. You can use {{ error }} in the message.
+  domain: automation
+  input:
+    error_sensor:
+      name: Vacuum error sensor
+      description: The Roborock error sensor, e.g. sensor.s8_maxv_ultra_vacuum_error
+      selector:
+        entity:
+          filter:
+            - domain: sensor
+    notify_service:
+      name: Notify service
+      description: e.g. notify.mobile_app_phone or persistent_notification.create
+      default: persistent_notification.create
+      selector:
+        text:
+    title:
+      name: Title
+      default: Vacuum error
+      selector:
+        text:
+    message:
+      name: Message
+      description: "Available: {{ error }}."
+      default: "Vacuum error: {{ error }}"
+      selector:
+        text:
+          multiline: true
+mode: single
+variables:
+  error_sensor: !input error_sensor
+trigger:
+  - platform: state
+    entity_id: !input error_sensor
+condition:
+  - condition: template
+    value_template: "{{ states(error_sensor) not in ['none', 'unknown', 'unavailable', ''] }}"
+action:
+  - variables:
+      error: "{{ states(error_sensor) }}"
+  - service: !input notify_service
+    data:
+      title: !input title
+      message: !input message

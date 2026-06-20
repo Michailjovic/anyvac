@@ -1,0 +1,73 @@
+blueprint:
+  name: AnyVac — Room overdue
+  description: >
+    Notify when a room has not been cleaned for too long. Pick an AnyVac per-room
+    "last dry"/"last wet" timestamp sensor, a threshold in days, your notify service
+    and the message text. Checks once per hour. (A room never cleaned counts as overdue.)
+  domain: automation
+  input:
+    room_sensor:
+      name: Room "last cleaned" sensor
+      description: An AnyVac per-room timestamp sensor, e.g. sensor.kitchen_last_wet
+      selector:
+        entity:
+          filter:
+            - integration: anyvac
+              domain: sensor
+    threshold_days:
+      name: Overdue after (days)
+      default: 7
+      selector:
+        number:
+          min: 1
+          max: 60
+          step: 1
+          unit_of_measurement: days
+          mode: box
+    notify_service:
+      name: Notify service
+      description: e.g. notify.mobile_app_phone or persistent_notification.create
+      default: persistent_notification.create
+      selector:
+        text:
+    title:
+      name: Title
+      default: Vacuum reminder
+      selector:
+        text:
+    message:
+      name: Message
+      description: "Write your own text. Available variable: {{ days }} (days since last clean)."
+      default: "A room is overdue for cleaning ({{ days }} days)."
+      selector:
+        text:
+          multiline: true
+mode: single
+variables:
+  room_sensor: !input room_sensor
+  threshold_days: !input threshold_days
+trigger:
+  - platform: time_pattern
+    hours: "/1"
+condition:
+  - condition: template
+    value_template: >
+      {% set ts = states(room_sensor) %}
+      {% if ts in ['unknown', 'unavailable', 'none', ''] %}
+        true
+      {% else %}
+        {{ (now() - as_datetime(ts)).total_seconds() > (threshold_days | float) * 86400 }}
+      {% endif %}
+action:
+  - variables:
+      days: >
+        {% set ts = states(room_sensor) %}
+        {% if ts in ['unknown', 'unavailable', 'none', ''] %}
+          999
+        {% else %}
+          {{ ((now() - as_datetime(ts)).total_seconds() / 86400) | round(0) }}
+        {% endif %}
+  - service: !input notify_service
+    data:
+      title: !input title
+      message: !input message

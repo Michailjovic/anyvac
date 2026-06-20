@@ -161,6 +161,55 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         self._store: Store = Store(hass, 1, f"{DOMAIN}_room_history")
         # Cross-vacuum room history keyed by room NAME: {name: {dry, wet, any: iso}}
         self._history: dict[str, dict[str, str]] = {}
+        self._was_cleaning: dict[str, bool] = {}
+        self._session_rooms: dict[str, set[str]] = {}
+
+    @property
+    def rooms_history(self) -> dict[str, dict[str, str]]:
+        """Cross-vacuum per-room clean history (by room name)."""
+        return self._history
+
+    def all_room_names(self) -> set[str]:
+        """All known room names across vacuums (for per-room timestamp sensors)."""
+        names: set[str] = set()
+        for dev in (self.data or {}).values():
+            for r in dev.data.get("rooms", []):
+                nm = r.get("name")
+                if nm:
+                    names.add(nm)
+        return names
+
+    def _track_and_emit(self, device: AnyVacDevice) -> None:
+        """Fire anyvac_clean_started / anyvac_clean_finished events on cleaning transitions.
+
+        Notifications are built by the user from these events + the per-room timestamp
+        sensors; the integration never composes message text itself.
+        """
+        duid = device.duid
+        cleaning = bool(device.data.get("in_cleaning"))
+        was = self._was_cleaning.get(duid, False)
+        if cleaning:
+            if not was:
+                self._session_rooms[duid] = set()
+                self.hass.bus.async_fire(
+                    f"{DOMAIN}_clean_started",
+                    {"vacuum": device.name, "duid": duid, "clean_type": device.data.get("clean_type")},
+                )
+            room = device.data.get("vacuum_room_name")
+            if room:
+                self._session_rooms.setdefault(duid, set()).add(room)
+        elif was:
+            self.hass.bus.async_fire(
+                f"{DOMAIN}_clean_finished",
+                {
+                    "vacuum": device.name,
+                    "duid": duid,
+                    "clean_type": device.data.get("clean_type"),
+                    "rooms": sorted(self._session_rooms.get(duid, set())),
+                },
+            )
+            self._session_rooms[duid] = set()
+        self._was_cleaning[duid] = cleaning
 
     async def _async_setup(self) -> None:
         """Load persisted per-room clean history before the first refresh."""
@@ -217,6 +266,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     continue
                 if device is not None:
                     self._update_history(device)
+                    self._track_and_emit(device)
                     for room in device.data.get("rooms", []):
                         rec = self._history.get(room.get("name")) or {}
                         room["last_cleaned"] = rec.get("any")

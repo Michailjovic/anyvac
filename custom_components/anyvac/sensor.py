@@ -9,13 +9,16 @@ the recorder (see README).
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
-from homeassistant.components.sensor import SensorEntity
+from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import slugify
 
 from .const import DOMAIN, ROBOROCK_DOMAIN
 from .coordinator import AnyVacCoordinator
@@ -42,6 +45,23 @@ async def async_setup_entry(
 
     _add_new()
     entry.async_on_unload(coordinator.async_add_listener(_add_new))
+
+    known_rooms: set[str] = set()
+
+    @callback
+    def _add_room_sensors() -> None:
+        new = []
+        for room in coordinator.all_room_names():
+            for kind in ("dry", "wet"):
+                key = f"{room}|{kind}"
+                if key not in known_rooms:
+                    known_rooms.add(key)
+                    new.append(AnyVacRoomTimeSensor(coordinator, room, kind))
+        if new:
+            async_add_entities(new)
+
+    _add_room_sensors()
+    entry.async_on_unload(coordinator.async_add_listener(_add_room_sensors))
 
 
 class AnyVacMapSensor(CoordinatorEntity[AnyVacCoordinator], SensorEntity):
@@ -95,3 +115,35 @@ class AnyVacMapSensor(CoordinatorEntity[AnyVacCoordinator], SensorEntity):
         if device is None:
             return None
         return device.data
+
+
+class AnyVacRoomTimeSensor(CoordinatorEntity[AnyVacCoordinator], SensorEntity):
+    """Per-room 'last cleaned' timestamp (dry or wet) — for overdue notifications/automations."""
+
+    _attr_has_entity_name = True
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coordinator: AnyVacCoordinator, room: str, kind: str) -> None:
+        """Initialize the room timestamp sensor."""
+        super().__init__(coordinator)
+        self._room = room
+        self._kind = kind
+        self._attr_name = f"{room} last {kind}"
+        self._attr_unique_id = f"anyvac_room_{slugify(room)}_{kind}"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, "rooms")},
+            "name": "AnyVac Rooms",
+            "manufacturer": "AnyVac",
+        }
+
+    @property
+    def native_value(self) -> datetime | None:
+        """Timestamp of the last clean of this room for this clean type."""
+        iso = (self.coordinator.rooms_history.get(self._room) or {}).get(self._kind)
+        if not iso:
+            return None
+        try:
+            return datetime.fromisoformat(iso)
+        except ValueError:
+            return None

@@ -42,8 +42,37 @@ Nothing to configure — the large map attributes (`path`, `rooms`, `calibration
 as unrecorded by the integration, so they stay out of your recorder database automatically. No
 `recorder: exclude` in `configuration.yaml` is needed.
 
+## Notifications
+
+AnyVac never writes notification text itself — it exposes **data + events**, and you write the
+message (in any language) when you create an automation. Building blocks:
+
+**Per-room timestamp sensors** (on the *AnyVac Rooms* device): `sensor.<room>_last_dry` and
+`sensor.<room>_last_wet` (`device_class: timestamp`), keyed by room name across all vacuums. Use them
+for "overdue" logic (`now() - states(sensor) > N days`).
+
+**Events:**
+
+| Event | Data |
+| --- | --- |
+| `anyvac_clean_started` | `{ vacuum, duid, clean_type }` |
+| `anyvac_clean_finished` | `{ vacuum, duid, clean_type, rooms }` |
+
+**Errors:** use the existing Roborock `sensor.<vacuum>_vacuum_error`.
+
+**Auto-installed blueprints.** On first setup AnyVac copies three automation blueprints into
+`config/blueprints/automation/anyvac/`:
+
+- *AnyVac — Room overdue* — pick a room timestamp sensor + threshold days + notify service + message.
+- *AnyVac — Clean finished* — fires on `anyvac_clean_finished`; message can use `{{ vacuum }}`,
+  `{{ clean_type }}`, `{{ rooms }}`.
+- *AnyVac — Vacuum error* — pick the error sensor + notify service + message (`{{ error }}`).
+
+Create an automation from one (Settings → Automations → Blueprints), choose your notify service and
+write your own message. Existing (edited) blueprints are never overwritten.
+
 ## Status
 
-Experimental v0.1.0. AnyVac reads the Roborock integration's internal runtime
+Experimental v0.4.0. AnyVac reads the Roborock integration's internal runtime
 data; if a future Roborock release changes that structure, AnyVac degrades
 gracefully (no data) rather than breaking — please open an issue if that happens.
