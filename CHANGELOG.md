@@ -4,6 +4,14 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-06-21
+
+### Added
+
+- **`duration_min` on `anyvac_clean_finished`** — the integration times each cleaning session
+  (start → end) and reports the elapsed minutes on the finish event, so a fully back-end
+  "clean finished" notification can state how long it took without the card being open.
+
 ## [0.4.0] - 2026-06-20
 
 ### Added

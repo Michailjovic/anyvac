@@ -56,7 +56,11 @@ for "overdue" logic (`now() - states(sensor) > N days`).
 | Event | Data |
 | --- | --- |
 | `anyvac_clean_started` | `{ vacuum, duid, clean_type }` |
-| `anyvac_clean_finished` | `{ vacuum, duid, clean_type, rooms }` |
+| `anyvac_clean_finished` | `{ vacuum, duid, clean_type, rooms, duration_min }` |
+
+Both events are fired **server-side** on the vacuum's cleaning transitions, so notifications built on
+them fire reliably whether or not the AnyVac card (or any dashboard) is open. `rooms` is the set of
+rooms actually visited during the session; `duration_min` is the measured session length in minutes.
 
 **Errors:** use the existing Roborock `sensor.<vacuum>_vacuum_error`.
 
@@ -73,6 +77,6 @@ write your own message. Existing (edited) blueprints are never overwritten.
 
 ## Status
 
-Experimental v0.4.0. AnyVac reads the Roborock integration's internal runtime
+Experimental v0.4.1. AnyVac reads the Roborock integration's internal runtime
 data; if a future Roborock release changes that structure, AnyVac degrades
 gracefully (no data) rather than breaking — please open an issue if that happens.

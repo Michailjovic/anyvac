@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
@@ -163,6 +163,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         self._history: dict[str, dict[str, str]] = {}
         self._was_cleaning: dict[str, bool] = {}
         self._session_rooms: dict[str, set[str]] = {}
+        self._session_start: dict[str, datetime] = {}
 
     @property
     def rooms_history(self) -> dict[str, dict[str, str]]:
@@ -191,6 +192,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         if cleaning:
             if not was:
                 self._session_rooms[duid] = set()
+                self._session_start[duid] = dt_util.utcnow()
                 self.hass.bus.async_fire(
                     f"{DOMAIN}_clean_started",
                     {"vacuum": device.name, "duid": duid, "clean_type": device.data.get("clean_type")},
@@ -199,6 +201,8 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             if room:
                 self._session_rooms.setdefault(duid, set()).add(room)
         elif was:
+            started = self._session_start.get(duid)
+            duration_min = round((dt_util.utcnow() - started).total_seconds() / 60) if started else None
             self.hass.bus.async_fire(
                 f"{DOMAIN}_clean_finished",
                 {
@@ -206,6 +210,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     "duid": duid,
                     "clean_type": device.data.get("clean_type"),
                     "rooms": sorted(self._session_rooms.get(duid, set())),
+                    "duration_min": duration_min,
                 },
             )
             self._session_rooms[duid] = set()
