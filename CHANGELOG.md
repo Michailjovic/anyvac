@@ -4,6 +4,20 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-06-25
+
+### Added
+
+- **Backend-owned clean-time estimates with single-room calibration.** The integration now learns how
+  long each room actually takes, per clean type, and persists it (`{room: {dry, wet}}`, keyed by room
+  name across all vacuums). When a cleaning session covers exactly one room, its measured duration
+  updates that room+type estimate (first sample = measured, then a rolling average), so estimates
+  self-calibrate from real cleans instead of static config guesses. Exposed as `rooms_estimate` on the
+  map sensor (and `estimate_dry` / `estimate_wet` per room) for the card to read.
+- **Calibration reported on the finish event** — `anyvac_clean_finished` now carries
+  `calibrated_room`, `estimate_before` and `estimate_after` when the finished clean was a single-room
+  calibration, so a notification can state "estimate for <room> went from X to Y min".
+
 ## [0.4.2] - 2026-06-24
 
 ### Added
