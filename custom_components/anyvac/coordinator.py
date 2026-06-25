@@ -165,8 +165,9 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         self._session_rooms: dict[str, set[str]] = {}
         self._session_start: dict[str, datetime] = {}
         self._est_store: Store = Store(hass, 1, f"{DOMAIN}_room_estimates")
-        # Learned clean-time estimates by room NAME: {name: {dry: min, wet: min}}
-        self._estimates: dict[str, dict[str, float]] = {}
+        # Learned clean-time estimates kept PER VACUUM (cleaning speeds differ between
+        # models, so they are never shared): {duid: {room_name: {dry: min, wet: min}}}
+        self._estimates: dict[str, dict[str, dict[str, float]]] = {}
 
     @property
     def rooms_history(self) -> dict[str, dict[str, str]]:
@@ -184,19 +185,20 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         return names
 
     @property
-    def rooms_estimate(self) -> dict[str, dict[str, float]]:
-        """Learned per-room, per-type (dry/wet) clean-time estimates, in minutes."""
+    def rooms_estimate(self) -> dict[str, dict[str, dict[str, float]]]:
+        """Learned clean-time estimates per vacuum: {duid: {room: {dry, wet}}}."""
         return self._estimates
 
     def _learn_estimate(
-        self, room: str, kind: str | None, minutes: float
+        self, duid: str, room: str, kind: str | None, minutes: float
     ) -> tuple[float | None, float | None]:
-        """Update the learned estimate for one room+type from a measured single-room
-        clean. Rolling average (first sample = the measured value, then weighted).
-        Returns (before, after); (None, None) when the sample is rejected."""
+        """Update one vacuum's learned estimate for a room+type from a measured
+        single-room clean. Estimates are kept PER VACUUM because cleaning speeds differ
+        between models — they are never shared across vacuums. Rolling average (first
+        sample = the measured value, then weighted). Returns (before, after)."""
         if kind not in ("dry", "wet") or not (1 <= minutes <= 180):
             return None, None
-        rec = self._estimates.setdefault(room, {})
+        rec = self._estimates.setdefault(duid, {}).setdefault(room, {})
         before = rec.get(kind)
         after = round(minutes) if before is None else round(0.6 * before + 0.4 * minutes)
         rec[kind] = after
@@ -239,7 +241,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             # notification can say "estimate went from X to Y".
             if len(rooms) == 1 and duration_min is not None:
                 before, after = self._learn_estimate(
-                    rooms[0], device.data.get("clean_type"), duration_min
+                    duid, rooms[0], device.data.get("clean_type"), duration_min
                 )
                 if after is not None:
                     event["calibrated_room"] = rooms[0]
@@ -256,11 +258,17 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             self._history = {k: dict(v) for k, v in stored.items() if isinstance(v, dict)}
         est = await self._est_store.async_load()
         if isinstance(est, dict):
-            self._estimates = {
-                k: {kk: float(vv) for kk, vv in v.items() if isinstance(vv, (int, float))}
-                for k, v in est.items()
-                if isinstance(v, dict)
-            }
+            loaded: dict[str, dict[str, dict[str, float]]] = {}
+            for duid, rooms in est.items():
+                if not isinstance(rooms, dict):
+                    continue
+                for room, kinds in rooms.items():
+                    if not isinstance(kinds, dict):
+                        continue
+                    vals = {k: float(v) for k, v in kinds.items() if isinstance(v, (int, float))}
+                    if vals:
+                        loaded.setdefault(duid, {})[room] = vals
+            self._estimates = loaded
 
     def _history_for_save(self) -> dict[str, dict[str, str]]:
         return self._history
@@ -317,11 +325,13 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                         room["last_cleaned"] = rec.get("any")
                         room["last_dry"] = rec.get("dry")
                         room["last_wet"] = rec.get("wet")
-                        est = self._estimates.get(room.get("name")) or {}
+                        est = (self._estimates.get(device.duid) or {}).get(room.get("name")) or {}
                         room["estimate_dry"] = est.get("dry")
                         room["estimate_wet"] = est.get("wet")
                     device.data["rooms_last_cleaned"] = {k: dict(v) for k, v in self._history.items()}
-                    device.data["rooms_estimate"] = {k: dict(v) for k, v in self._estimates.items()}
+                    device.data["rooms_estimate"] = {
+                        r: dict(c) for r, c in (self._estimates.get(device.duid) or {}).items()
+                    }
                     result[device.duid] = device
         return result
 

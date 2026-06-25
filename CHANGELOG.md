@@ -4,6 +4,15 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-06-25
+
+### Fixed
+
+- **Clean-time estimates are now kept per vacuum**, not shared across vacuums. Different models clean
+  at different speeds, so a room's learned dry/wet duration is stored under `{duid: {room: {dry, wet}}}`
+  and each vacuum's map sensor exposes only its own `rooms_estimate`. (Last-cleaned *freshness* stays
+  cross-vacuum by room — that is intentional; only the duration estimates are per-vacuum.)
+
 ## [0.5.0] - 2026-06-25
 
 ### Added
