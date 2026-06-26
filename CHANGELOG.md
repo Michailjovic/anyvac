@@ -4,6 +4,14 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2] - 2026-06-26
+
+### Fixed
+
+- **Version sync / clean re-release.** Aligned the version across `manifest.json`, the README status
+  line (was stale at v0.7.0) and the changelog so HACS reports a single consistent version. No code
+  change versus 0.7.1 (single-room calibration fix below).
+
 ## [0.7.1] - 2026-06-26
 
 ### Fixed
