@@ -185,6 +185,10 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # Diagnostics: the last single-room calibration decision per vacuum (for the
         # card's Debug tab) — so you can see exactly why an estimate did / didn't write.
         self._last_calib: dict[str, dict[str, Any]] = {}
+        # Card-level room selection (which rooms are queued to clean), shared across
+        # devices and fed to the orchestrator. Persisted across restarts.
+        self._sel_store: Store = Store(hass, 1, f"{DOMAIN}_selection")
+        self._selected_rooms: set[str] = set()
 
     @property
     def rooms_history(self) -> dict[str, dict[str, str]]:
@@ -205,6 +209,27 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
     def rooms_estimate(self) -> dict[str, dict[str, dict[str, float]]]:
         """Learned clean-time estimates per vacuum: {duid: {room: {dry, wet}}}."""
         return self._estimates
+
+    @property
+    def selected_rooms(self) -> list[str]:
+        """Card-level set of rooms queued to clean (shared across devices)."""
+        return sorted(self._selected_rooms)
+
+    def set_selection(self, rooms: list[str], mode: str = "set") -> None:
+        """Mutate the shared room selection. mode: set / add / remove / toggle / clear."""
+        names = {str(r) for r in rooms}
+        if mode == "clear":
+            self._selected_rooms = set()
+        elif mode == "set":
+            self._selected_rooms = set(names)
+        elif mode == "add":
+            self._selected_rooms |= names
+        elif mode == "remove":
+            self._selected_rooms -= names
+        elif mode == "toggle":
+            self._selected_rooms ^= names
+        self._sel_store.async_delay_save(lambda: sorted(self._selected_rooms), 2)
+        self.async_update_listeners()
 
     def _learn_estimate(
         self, duid: str, room: str, kind: str | None, minutes: float
@@ -349,6 +374,9 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         stored = await self._store.async_load()
         if isinstance(stored, dict):
             self._history = {k: dict(v) for k, v in stored.items() if isinstance(v, dict)}
+        sel = await self._sel_store.async_load()
+        if isinstance(sel, list):
+            self._selected_rooms = {str(r) for r in sel}
         est = await self._est_store.async_load()
         if isinstance(est, dict):
             loaded: dict[str, dict[str, dict[str, float]]] = {}

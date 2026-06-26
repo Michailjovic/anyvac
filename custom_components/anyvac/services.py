@@ -37,9 +37,18 @@ from .const import DOMAIN
 _LOGGER = logging.getLogger(__name__)
 
 SERVICE_RUN_JOB = "run_job"
+SERVICE_SELECT_ROOMS = "select_rooms"
 JOB_TIMEOUT_SECONDS = 3 * 3600  # safety: tear down a stuck job after 3 h
 
 RUN_JOB_SCHEMA = vol.Schema({vol.Required("tasks"): [dict]})
+SELECT_ROOMS_SCHEMA = vol.Schema(
+    {
+        vol.Optional("rooms", default=list): [str],
+        vol.Optional("mode", default="set"): vol.In(
+            ["set", "add", "remove", "toggle", "clear"]
+        ),
+    }
+)
 
 
 class _JobRunner:
@@ -133,14 +142,27 @@ class _JobRunner:
 
 
 def async_register_services(hass: HomeAssistant) -> None:
-    """Register the ``anyvac.run_job`` service (idempotent)."""
-    if hass.services.has_service(DOMAIN, SERVICE_RUN_JOB):
-        return
+    """Register the AnyVac services (idempotent)."""
+    if not hass.services.has_service(DOMAIN, SERVICE_RUN_JOB):
 
-    async def _handle_run_job(call: ServiceCall) -> None:
-        runner = _JobRunner(hass, list(call.data["tasks"]))
-        await runner.start()
+        async def _handle_run_job(call: ServiceCall) -> None:
+            runner = _JobRunner(hass, list(call.data["tasks"]))
+            await runner.start()
 
-    hass.services.async_register(
-        DOMAIN, SERVICE_RUN_JOB, _handle_run_job, schema=RUN_JOB_SCHEMA
-    )
+        hass.services.async_register(
+            DOMAIN, SERVICE_RUN_JOB, _handle_run_job, schema=RUN_JOB_SCHEMA
+        )
+
+    if not hass.services.has_service(DOMAIN, SERVICE_SELECT_ROOMS):
+
+        async def _handle_select_rooms(call: ServiceCall) -> None:
+            rooms = list(call.data.get("rooms", []))
+            mode = call.data.get("mode", "set")
+            for entry in hass.config_entries.async_entries(DOMAIN):
+                coord = getattr(entry, "runtime_data", None)
+                if coord is not None:
+                    coord.set_selection(rooms, mode)
+
+        hass.services.async_register(
+            DOMAIN, SERVICE_SELECT_ROOMS, _handle_select_rooms, schema=SELECT_ROOMS_SCHEMA
+        )

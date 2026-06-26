@@ -77,7 +77,7 @@ class AnyVacMapSensor(CoordinatorEntity[AnyVacCoordinator], SensorEntity):
             "vacuum_position", "charger", "calibration_points", "path", "mop_path", "rooms",
             "image_dims", "cleaned_rooms", "rooms_last_cleaned", "rooms_estimate",
             "vacuum_room", "vacuum_room_name", "in_cleaning", "clean_type", "mop_signal", "duid",
-            "path_points", "mop_path_points", "calib_debug",
+            "path_points", "mop_path_points", "calib_debug", "selected_rooms",
         }
     )
 
@@ -115,7 +115,7 @@ class AnyVacMapSensor(CoordinatorEntity[AnyVacCoordinator], SensorEntity):
         device = self._device
         if device is None:
             return None
-        return device.data
+        return {**device.data, "selected_rooms": self.coordinator.selected_rooms}
 
 
 class AnyVacRoomTimeSensor(CoordinatorEntity[AnyVacCoordinator], SensorEntity):

@@ -4,6 +4,15 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-06-26
+
+### Added
+
+- **Shared room selection (backend-owned).** The set of rooms queued to clean now lives in the
+  integration instead of each browser, so phone and PC show the same selection and it can feed the
+  orchestrator. Exposed as `selected_rooms` on the map sensor; mutated via the new **`anyvac.select_rooms`**
+  service (`{rooms: [...], mode: set | add | remove | toggle | clear}`). Persisted across restarts.
+
 ## [0.8.0] - 2026-06-26
 
 ### Added

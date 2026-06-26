@@ -23,7 +23,7 @@ from homeassistant.core import HomeAssistant
 
 from .const import DOMAIN
 from .coordinator import AnyVacCoordinator
-from .services import SERVICE_RUN_JOB, async_register_services
+from .services import SERVICE_RUN_JOB, SERVICE_SELECT_ROOMS, async_register_services
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -65,6 +65,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload an AnyVac config entry."""
     unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-    if unloaded and hass.services.has_service(DOMAIN, SERVICE_RUN_JOB):
-        hass.services.async_remove(DOMAIN, SERVICE_RUN_JOB)
+    if unloaded:
+        for svc in (SERVICE_RUN_JOB, SERVICE_SELECT_ROOMS):
+            if hass.services.has_service(DOMAIN, svc):
+                hass.services.async_remove(DOMAIN, svc)
     return unloaded
