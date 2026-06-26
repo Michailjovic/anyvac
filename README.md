@@ -76,8 +76,16 @@ rooms actually visited during the session; `duration_min` is the measured sessio
 Create an automation from one (Settings → Automations → Blueprints), choose your notify service and
 write your own message. Existing (edited) blueprints are never overwritten.
 
+## Orchestration service
+
+`anyvac.run_job` executes a plan of gated vacuum tasks **server-side** (so it survives the dashboard
+closing). The AnyVac card builds the plan — which robot cleans which rooms, and the dry→wet ordering —
+and calls this service. Each task runs once its `after` conditions (`anyvac_room_done` per room, or
+`anyvac_clean_finished` per vacuum) are met, so a wet robot follows a dry robot per room without
+colliding. See the service's docstring for the task shape.
+
 ## Status
 
-Experimental v0.5.1. AnyVac reads the Roborock integration's internal runtime
+Experimental v0.7.0. AnyVac reads the Roborock integration's internal runtime
 data; if a future Roborock release changes that structure, AnyVac degrades
 gracefully (no data) rather than breaking — please open an issue if that happens.

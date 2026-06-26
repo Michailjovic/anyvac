@@ -4,6 +4,21 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-06-26
+
+### Added
+
+- **`anyvac.run_job` service — the server-side orchestration executor.** The card builds an
+  orchestration plan (capability-aware assignment + dry→wet dependencies, since it has the config and
+  estimates) and hands it to this service as a list of tasks. The service runs the plan **server-side**
+  (survives the dashboard being closed) and **gates each task on `anyvac_room_done` /
+  `anyvac_clean_finished`** — so a wet robot is released to follow a dry robot per room without
+  colliding. Tasks with no `after` conditions run immediately; a 3 h safety timeout tears down a stuck
+  job. Each task may carry pre-clean `selects` (mop mode/intensity) + `fan_speed` before its clean
+  `service` call.
+- **`duid` exposed on the map sensor** so the card can address `anyvac_room_done` conditions per
+  vacuum when building a job.
+
 ## [0.6.0] - 2026-06-26
 
 ### Added

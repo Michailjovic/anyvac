@@ -378,6 +378,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     device.data["rooms_estimate"] = {
                         r: dict(c) for r, c in (self._estimates.get(device.duid) or {}).items()
                     }
+                    device.data["duid"] = device.duid
                     result[device.duid] = device
         return result
 
