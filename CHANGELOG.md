@@ -4,6 +4,15 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.3] - 2026-06-26
+
+### Fixed
+
+- **Calibration recorded the wrong clean type (dry clean logged as wet).** The clean type was read at
+  the finish poll, but the robot resets its settings to its default mode at the end of a clean, so a
+  dry clean looked wet by then. The clean type is now captured **while the robot is actually cleaning
+  a room** (mid-clean, settings applied) and used for both the estimate and the finish event.
+
 ## [0.7.2] - 2026-06-26
 
 ### Fixed

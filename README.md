@@ -86,6 +86,6 @@ colliding. See the service's docstring for the task shape.
 
 ## Status
 
-Experimental v0.7.2. AnyVac reads the Roborock integration's internal runtime
+Experimental v0.7.3. AnyVac reads the Roborock integration's internal runtime
 data; if a future Roborock release changes that structure, AnyVac degrades
 gracefully (no data) rather than breaking — please open an issue if that happens.

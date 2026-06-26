@@ -176,6 +176,10 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # Rooms the robot was *confirmed* in this session (debounced) — used for the
         # single-room calibration check so a momentary boundary cross does not count.
         self._session_confirmed: dict[str, set[str]] = {}
+        # Clean type observed *while actually cleaning a room* this session. The robot
+        # resets its settings to default at the end of a clean, so the clean_type read
+        # at the finish poll is unreliable — capture it mid-clean instead.
+        self._session_clean_type: dict[str, str] = {}
 
     @property
     def rooms_history(self) -> dict[str, dict[str, str]]:
@@ -267,6 +271,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             if not was:
                 self._session_rooms[duid] = set()
                 self._session_confirmed[duid] = set()
+                self._session_clean_type.pop(duid, None)
                 self._session_start[duid] = dt_util.utcnow()
                 self.hass.bus.async_fire(
                     f"{DOMAIN}_clean_started",
@@ -275,14 +280,22 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             room = device.data.get("vacuum_room_name")
             if room:
                 self._session_rooms.setdefault(duid, set()).add(room)
+                # Capture clean type only while genuinely cleaning a room (settings
+                # applied, before the end-of-clean reset to default).
+                ct_now = device.data.get("clean_type")
+                if ct_now in ("dry", "wet"):
+                    self._session_clean_type[duid] = ct_now
         elif was:
             started = self._session_start.get(duid)
             duration_min = round((dt_util.utcnow() - started).total_seconds() / 60) if started else None
             rooms = sorted(self._session_rooms.get(duid, set()))
+            # Use the clean type captured *during* the clean, not the finish-poll value
+            # (the robot resets to its default mode at the end of a clean).
+            ct = self._session_clean_type.get(duid) or device.data.get("clean_type")
             event: dict[str, Any] = {
                 "vacuum": device.name,
                 "duid": duid,
-                "clean_type": device.data.get("clean_type"),
+                "clean_type": ct,
                 "rooms": rooms,
                 "duration_min": duration_min,
             }
@@ -294,7 +307,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             confirmed = sorted(self._session_confirmed.get(duid, set()))
             if len(confirmed) == 1 and duration_min is not None:
                 before, after = self._learn_estimate(
-                    duid, confirmed[0], device.data.get("clean_type"), duration_min
+                    duid, confirmed[0], ct, duration_min
                 )
                 if after is not None:
                     event["calibrated_room"] = confirmed[0]
