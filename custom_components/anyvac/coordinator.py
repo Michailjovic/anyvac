@@ -173,6 +173,9 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         self._raw_room: dict[str, str | None] = {}
         self._raw_count: dict[str, int] = {}
         self._confirmed_room: dict[str, str | None] = {}
+        # Rooms the robot was *confirmed* in this session (debounced) — used for the
+        # single-room calibration check so a momentary boundary cross does not count.
+        self._session_confirmed: dict[str, set[str]] = {}
 
     @property
     def rooms_history(self) -> dict[str, dict[str, str]]:
@@ -244,6 +247,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         if raw and self._raw_count[duid] >= 2 and raw != self._confirmed_room.get(duid):
             prev = self._confirmed_room.get(duid)
             self._confirmed_room[duid] = raw
+            self._session_confirmed.setdefault(duid, set()).add(raw)
             if prev:
                 self.hass.bus.async_fire(
                     f"{DOMAIN}_room_done",
@@ -262,6 +266,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         if cleaning:
             if not was:
                 self._session_rooms[duid] = set()
+                self._session_confirmed[duid] = set()
                 self._session_start[duid] = dt_util.utcnow()
                 self.hass.bus.async_fire(
                     f"{DOMAIN}_clean_started",
@@ -283,13 +288,16 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             }
             # A single-room clean is a clean calibration sample: learn that room+type's
             # real duration and report the change (before -> after) on the event so a
-            # notification can say "estimate went from X to Y".
-            if len(rooms) == 1 and duration_min is not None:
+            # notification can say "estimate went from X to Y". Use the *confirmed*
+            # (debounced) rooms, not every transiently reported one, so a brief boundary
+            # cross into a neighbour does not disqualify a genuine single-room clean.
+            confirmed = sorted(self._session_confirmed.get(duid, set()))
+            if len(confirmed) == 1 and duration_min is not None:
                 before, after = self._learn_estimate(
-                    duid, rooms[0], device.data.get("clean_type"), duration_min
+                    duid, confirmed[0], device.data.get("clean_type"), duration_min
                 )
                 if after is not None:
-                    event["calibrated_room"] = rooms[0]
+                    event["calibrated_room"] = confirmed[0]
                     event["estimate_before"] = before
                     event["estimate_after"] = after
             self.hass.bus.async_fire(f"{DOMAIN}_clean_finished", event)
