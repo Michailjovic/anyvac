@@ -93,6 +93,7 @@ def _extract_map(map_data: Any) -> dict[str, Any]:
                 if px is not None and py is not None:
                     flat.append({"x": px, "y": py})
     out["path"] = _decimate(flat, PATH_MAX_POINTS)
+    out["path_points"] = len(flat)  # raw (undecimated) count — grows through the clean
 
     # Mop (wet) path as a separate layer.
     mflat: list[dict[str, float]] = []
@@ -106,6 +107,7 @@ def _extract_map(map_data: Any) -> dict[str, Any]:
                 if mx is not None and my is not None:
                     mflat.append({"x": mx, "y": my})
     out["mop_path"] = _decimate(mflat, PATH_MAX_POINTS)
+    out["mop_path_points"] = len(mflat)
 
     # Rooms: {segment_number: Room} -> list of plain dicts.
     rooms: list[dict[str, Any]] = []
@@ -180,6 +182,9 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # resets its settings to default at the end of a clean, so the clean_type read
         # at the finish poll is unreliable — capture it mid-clean instead.
         self._session_clean_type: dict[str, str] = {}
+        # Diagnostics: the last single-room calibration decision per vacuum (for the
+        # card's Debug tab) — so you can see exactly why an estimate did / didn't write.
+        self._last_calib: dict[str, dict[str, Any]] = {}
 
     @property
     def rooms_history(self) -> dict[str, dict[str, str]]:
@@ -305,14 +310,36 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             # (debounced) rooms, not every transiently reported one, so a brief boundary
             # cross into a neighbour does not disqualify a genuine single-room clean.
             confirmed = sorted(self._session_confirmed.get(duid, set()))
+            wrote = False
+            before: float | None = None
+            after: float | None = None
             if len(confirmed) == 1 and duration_min is not None:
-                before, after = self._learn_estimate(
-                    duid, confirmed[0], ct, duration_min
-                )
+                before, after = self._learn_estimate(duid, confirmed[0], ct, duration_min)
                 if after is not None:
+                    wrote = True
                     event["calibrated_room"] = confirmed[0]
                     event["estimate_before"] = before
                     event["estimate_after"] = after
+            self._last_calib[duid] = {
+                "at": dt_util.utcnow().isoformat(timespec="seconds"),
+                "confirmed_rooms": confirmed,
+                "clean_type": ct,
+                "duration_min": duration_min,
+                "wrote": wrote,
+                "before": before,
+                "after": after,
+                "reason": (
+                    "ok"
+                    if wrote
+                    else f"{len(confirmed)} confirmed rooms (need exactly 1)"
+                    if len(confirmed) != 1
+                    else "clean_type not dry/wet"
+                    if ct not in ("dry", "wet")
+                    else "duration out of 1-180 min range"
+                    if not (duration_min and 1 <= duration_min <= 180)
+                    else "rejected"
+                ),
+            }
             self.hass.bus.async_fire(f"{DOMAIN}_clean_finished", event)
             self._session_rooms[duid] = set()
         self._was_cleaning[duid] = cleaning
@@ -400,6 +427,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                         r: dict(c) for r, c in (self._estimates.get(device.duid) or {}).items()
                     }
                     device.data["duid"] = device.duid
+                    device.data["calib_debug"] = self._last_calib.get(device.duid)
                     result[device.duid] = device
         return result
 

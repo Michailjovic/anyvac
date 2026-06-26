@@ -4,6 +4,16 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-06-26
+
+### Added
+
+- **Calibration diagnostics + raw path counts on the map sensor.** New attributes: `path_points` /
+  `mop_path_points` (the raw, undecimated trajectory point counts, which grow through a clean — a
+  better signal than the decimated `path`), and `calib_debug` — the last single-room calibration
+  decision (`{confirmed_rooms, clean_type, duration_min, wrote, before, after, reason}`) so it's
+  visible why an estimate did or didn't get written.
+
 ## [0.7.3] - 2026-06-26
 
 ### Fixed

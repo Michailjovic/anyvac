@@ -77,6 +77,7 @@ class AnyVacMapSensor(CoordinatorEntity[AnyVacCoordinator], SensorEntity):
             "vacuum_position", "charger", "calibration_points", "path", "mop_path", "rooms",
             "image_dims", "cleaned_rooms", "rooms_last_cleaned", "rooms_estimate",
             "vacuum_room", "vacuum_room_name", "in_cleaning", "clean_type", "mop_signal", "duid",
+            "path_points", "mop_path_points", "calib_debug",
         }
     )
 
