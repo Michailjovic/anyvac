@@ -168,6 +168,11 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # Learned clean-time estimates kept PER VACUUM (cleaning speeds differ between
         # models, so they are never shared): {duid: {room_name: {dry: min, wet: min}}}
         self._estimates: dict[str, dict[str, dict[str, float]]] = {}
+        # Room-done detection (orchestrator real-time signal): debounce a room change
+        # over consecutive polls so a momentary boundary cross does not fire.
+        self._raw_room: dict[str, str | None] = {}
+        self._raw_count: dict[str, int] = {}
+        self._confirmed_room: dict[str, str | None] = {}
 
     @property
     def rooms_history(self) -> dict[str, dict[str, str]]:
@@ -204,6 +209,46 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         rec[kind] = after
         self._est_store.async_delay_save(lambda: self._estimates, 5)
         return before, after
+
+    def _detect_room_done(self, device: AnyVacDevice) -> None:
+        """Fire anyvac_room_done when a vacuum has truly finished and left a room.
+
+        This is the real-time signal the orchestrator's wet robot waits on. We do NOT
+        use the raw current room directly (the robot crosses its own room borders
+        mid-clean and briefly reports neighbours); a new room must persist over two
+        consecutive polls before it is "confirmed", and the previously confirmed room
+        is then reported done. The last room is also reported done on return-to-dock.
+        """
+        duid = device.duid
+        cleaning = bool(device.data.get("in_cleaning"))
+        raw = device.data.get("vacuum_room_name")
+
+        if not cleaning:
+            prev = self._confirmed_room.get(duid)
+            if prev and self._was_cleaning.get(duid):
+                self.hass.bus.async_fire(
+                    f"{DOMAIN}_room_done",
+                    {"vacuum": device.name, "duid": duid, "room": prev, "reason": "docked"},
+                )
+            self._confirmed_room[duid] = None
+            self._raw_room[duid] = None
+            self._raw_count[duid] = 0
+            return
+
+        if raw == self._raw_room.get(duid):
+            self._raw_count[duid] = self._raw_count.get(duid, 0) + 1
+        else:
+            self._raw_room[duid] = raw
+            self._raw_count[duid] = 1
+
+        if raw and self._raw_count[duid] >= 2 and raw != self._confirmed_room.get(duid):
+            prev = self._confirmed_room.get(duid)
+            self._confirmed_room[duid] = raw
+            if prev:
+                self.hass.bus.async_fire(
+                    f"{DOMAIN}_room_done",
+                    {"vacuum": device.name, "duid": duid, "room": prev, "reason": "left"},
+                )
 
     def _track_and_emit(self, device: AnyVacDevice) -> None:
         """Fire anyvac_clean_started / anyvac_clean_finished events on cleaning transitions.
@@ -319,6 +364,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     continue
                 if device is not None:
                     self._update_history(device)
+                    self._detect_room_done(device)
                     self._track_and_emit(device)
                     for room in device.data.get("rooms", []):
                         rec = self._history.get(room.get("name")) or {}

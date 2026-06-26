@@ -4,6 +4,18 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-06-26
+
+### Added
+
+- **`anyvac_room_done` event — the orchestrator's real-time "room finished" signal.** Fired when a
+  vacuum has truly left a room it was cleaning. It does **not** use the raw current room (the robot
+  crosses its own room borders mid-clean and briefly reports neighbours): a new room must persist over
+  two consecutive polls before it is confirmed, and the previously confirmed room is then reported
+  done (`reason: "left"`). The last room is also reported on return-to-dock (`reason: "docked"`).
+  Payload: `{ vacuum, duid, room, reason }`. This is the signal a wet robot waits on to follow a dry
+  robot per room without colliding.
+
 ## [0.5.1] - 2026-06-25
 
 ### Fixed

@@ -57,6 +57,7 @@ for "overdue" logic (`now() - states(sensor) > N days`).
 | --- | --- |
 | `anyvac_clean_started` | `{ vacuum, duid, clean_type }` |
 | `anyvac_clean_finished` | `{ vacuum, duid, clean_type, rooms, duration_min }` plus `calibrated_room, estimate_before, estimate_after` when the session was a single-room calibration |
+| `anyvac_room_done` | `{ vacuum, duid, room, reason }` — fired when a vacuum has truly left a room it was cleaning (`reason: "left"`, debounced over 2 polls) or on return-to-dock (`reason: "docked"`). The orchestrator's per-room "wet follows dry" signal. |
 
 Both events are fired **server-side** on the vacuum's cleaning transitions, so notifications built on
 them fire reliably whether or not the AnyVac card (or any dashboard) is open. `rooms` is the set of
