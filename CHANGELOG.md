@@ -4,6 +4,15 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.1] - 2026-06-27
+
+### Fixed
+
+- **Spatial coverage was always null.** `_room_coverage` ran inside `_extract_map`, before room names
+  are merged in, and it skipped any room without a name — so every room was skipped and coverage came
+  out empty. Coverage is now keyed by `segment_id` (always present) and mapped onto room names when
+  the progress payload is built, so `spatial_pct` / `visited_cells` / `total_cells` now populate.
+
 ## [0.10.0] - 2026-06-27
 
 ### Added

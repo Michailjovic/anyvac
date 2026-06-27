@@ -83,19 +83,23 @@ def _room_coverage(
     furniture / non-floor area, so a fully cleaned room typically plateaus below 100 %.
     Good enough as a live debug signal that the path is being tracked correctly.
     """
+    # Keyed by segment_id (always present). Names are merged into the rooms only after
+    # _extract_map runs, so keying by name here would skip every room; the caller maps
+    # segment_id -> name when consuming the coverage.
     boxes: list[tuple[str, float, float, float, float, int]] = []
     cov: dict[str, dict[str, Any]] = {}
     for r in rooms:
-        nm = r.get("name")
+        seg = r.get("segment_id")
         x0, y0, x1, y1 = r.get("x0"), r.get("y0"), r.get("x1"), r.get("y1")
-        if not nm or None in (x0, y0, x1, y1):
+        if seg is None or None in (x0, y0, x1, y1):
             continue
+        key = str(seg)
         lx, hx = (x0, x1) if x0 <= x1 else (x1, x0)
         ly, hy = (y0, y1) if y0 <= y1 else (y1, y0)
         ncx = max(1, int((hx - lx) // COVERAGE_CELL_MM) + 1)
         ncy = max(1, int((hy - ly) // COVERAGE_CELL_MM) + 1)
-        boxes.append((nm, lx, ly, hx, hy, ncx))
-        cov[nm] = {"_cells": set(), "total": ncx * ncy}
+        boxes.append((key, lx, ly, hx, hy, ncx))
+        cov[key] = {"_cells": set(), "total": ncx * ncy}
     for p in points:
         x = p.get("x")
         y = p.get("y")
@@ -513,7 +517,16 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         """Merge per-room spatial coverage with the time-ratio into one debug payload:
         {room: {spatial_pct, visited_cells, total_cells, time_pct, elapsed_s, est_s}}."""
         duid = device.duid
-        cov = device.data.get("rooms_coverage") or {}
+        # rooms_coverage is keyed by segment_id; map it onto room names (now merged in).
+        cov_by_seg = device.data.get("rooms_coverage") or {}
+        seg_to_name = {
+            str(r.get("segment_id")): r.get("name") for r in device.data.get("rooms", [])
+        }
+        cov: dict[str, Any] = {}
+        for seg, c in cov_by_seg.items():
+            nm = seg_to_name.get(str(seg))
+            if nm:
+                cov[nm] = c
         elapsed = self._room_elapsed.get(duid, {})
         ests = self._estimates.get(duid, {})
         ctype = self._session_clean_type.get(duid) or device.data.get("clean_type")
