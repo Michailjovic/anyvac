@@ -4,6 +4,43 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] - 2026-06-27
+
+### Added
+
+- **Normalised coverage (learned full-clean baseline).** Because a room's bounding box includes
+  unreachable nooks (arches, under furniture), raw coverage plateaus well below 100 %. The integration
+  now learns each room's "full clean" cell count per type (dry/wet) and per vacuum, and normalises
+  coverage against it so a fully cleaned room reads ~100 %. It is a rolling average (first sample =
+  measured, then weighted 0.4 — the same formula as the time estimate), so it adapts over a few cleans
+  when furniture changes; a clean covering less than half the baseline is treated as partial and
+  ignored; capped at the bounding-box cell count. `rooms_progress` now also carries `dry_calibrating` /
+  `wet_calibrating` (true until the first full clean, while raw bbox % is shown) and the learned
+  `dry_baseline` / `wet_baseline`.
+
+### Fixed
+
+- **Time estimate now calibrates from active cleaning time, not wall-clock duration.** A clean that
+  was paused (manually or by getting stuck) previously inflated the learned room time. Calibration now
+  uses the summed in-cleaning poll time (pauses excluded). `anyvac_clean_finished` / `calib_debug` now
+  also report `active_min` alongside `duration_min`.
+
+## [0.10.3] - 2026-06-27
+
+### Changed
+
+- **Per-room coverage split into dry and wet.** `rooms_progress` now reports `dry_pct` / `wet_pct`
+  (and `dry_visited` / `wet_visited`) separately — the dry value from the vacuum trace, the wet value
+  from the mop trace — so the card can show a dry and a wet gauge side by side. `spatial_pct` is kept
+  as the max of the two for backward compatibility.
+
+### Fixed
+
+- **Time no longer accrues to rooms merely driven through.** Per-room elapsed time was attributed to
+  the raw current room when no room was confirmed yet, so passing through a room (e.g. the kitchen on
+  the way to the target) added time to it. Elapsed is now attributed only to the **confirmed** room,
+  matching the coverage logic.
+
 ## [0.10.2] - 2026-06-27
 
 ### Changed
