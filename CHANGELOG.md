@@ -4,6 +4,18 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.2] - 2026-06-27
+
+### Changed
+
+- **Spatial coverage now counts only the room actively being cleaned.** Previously the whole
+  trajectory was bucketed against every room's bounding box each poll, so a room the robot merely
+  drives through repeatedly (e.g. crossing the hall on its way to wash the mop) filled up to high
+  coverage despite never being cleaned. Coverage is now accumulated incrementally: each poll only the
+  newly-added path points are attributed, and only to the room the robot is **confirmed to be cleaning**
+  (debounced current room), counting only points inside that room's box. Transit through other rooms
+  no longer inflates them — a room accumulates coverage only while it is the active target.
+
 ## [0.10.1] - 2026-06-27
 
 ### Fixed

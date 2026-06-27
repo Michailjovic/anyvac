@@ -182,9 +182,10 @@ def _extract_map(map_data: Any) -> dict[str, Any]:
         )
     out["rooms"] = rooms
 
-    # Per-room spatial coverage (debug / live progress): both dry and wet paths count
-    # as "floor covered". Computed from the full (undecimated) trajectory.
-    out["rooms_coverage"] = _room_coverage(flat + mflat, rooms)
+    # Full (undecimated) trajectory, kept transiently so the coordinator can attribute
+    # only the newly-added points to the room currently being cleaned (popped before the
+    # data is exposed on the sensor).
+    out["_path_full"] = flat + mflat
 
     # Which segments the robot has cleaned (this session) + where it currently is.
     out["cleaned_rooms"] = sorted(getattr(map_data, "cleaned_rooms", None) or [])
@@ -252,6 +253,13 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # gauge's time-ratio) + last poll timestamp to measure the per-poll delta.
         self._room_elapsed: dict[str, dict[str, float]] = {}
         self._last_poll: dict[str, datetime] = {}
+        # Per-room spatial coverage: visited grid cells, accumulated ONLY for the room the
+        # robot is currently confirmed to be cleaning (so transit / mop-wash trips through
+        # other rooms are not counted). {duid: {room_name: set[(cx, cy)]}}.
+        self._room_cells: dict[str, dict[str, set[tuple[int, int]]]] = {}
+        # How many trajectory points have already been attributed, per vacuum, so each poll
+        # only processes the newly-added points.
+        self._path_seen: dict[str, int] = {}
 
     @property
     def rooms_history(self) -> dict[str, dict[str, str]]:
@@ -327,6 +335,45 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             e = self._room_elapsed.setdefault(duid, {})
             e[room] = e.get(room, 0.0) + delta
 
+    def _accumulate_coverage(self, device: AnyVacDevice) -> None:
+        """Attribute the newly-added trajectory points to the room the robot is currently
+        CONFIRMED to be cleaning. Only points falling inside that room's bounding box are
+        counted, so driving through other rooms (e.g. returning to wash the mop) does not
+        inflate their coverage. A room therefore only accumulates coverage while it is the
+        active target, never before."""
+        duid = device.duid
+        full = device.data.get("_path_full") or []
+        seen = self._path_seen.get(duid, 0)
+        if len(full) < seen:  # path was reset/trimmed -> start over
+            seen = 0
+            self._room_cells[duid] = {}
+        new_points = full[seen:]
+        self._path_seen[duid] = len(full)
+
+        if not device.data.get("in_cleaning"):
+            return
+        room = self._confirmed_room.get(duid)
+        if not room or not new_points:
+            return
+        box = None
+        for r in device.data.get("rooms", []):
+            if r.get("name") == room:
+                x0, y0, x1, y1 = r.get("x0"), r.get("y0"), r.get("x1"), r.get("y1")
+                if None not in (x0, y0, x1, y1):
+                    box = (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+                break
+        if box is None:
+            return
+        lx, ly, hx, hy = box
+        cells = self._room_cells.setdefault(duid, {}).setdefault(room, set())
+        for p in new_points:
+            x = p.get("x")
+            y = p.get("y")
+            if x is None or y is None:
+                continue
+            if lx <= x <= hx and ly <= y <= hy:
+                cells.add((int((x - lx) // COVERAGE_CELL_MM), int((y - ly) // COVERAGE_CELL_MM)))
+
     def _detect_room_done(self, device: AnyVacDevice) -> None:
         """Fire anyvac_room_done when a vacuum has truly finished and left a room.
 
@@ -389,6 +436,8 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 self._session_confirmed[duid] = set()
                 self._session_clean_type.pop(duid, None)
                 self._room_elapsed[duid] = {}
+                self._room_cells[duid] = {}
+                self._path_seen[duid] = 0
                 self._session_start[duid] = dt_util.utcnow()
                 self.hass.bus.async_fire(
                     f"{DOMAIN}_clean_started",
@@ -517,22 +566,26 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         """Merge per-room spatial coverage with the time-ratio into one debug payload:
         {room: {spatial_pct, visited_cells, total_cells, time_pct, elapsed_s, est_s}}."""
         duid = device.duid
-        # rooms_coverage is keyed by segment_id; map it onto room names (now merged in).
-        cov_by_seg = device.data.get("rooms_coverage") or {}
-        seg_to_name = {
-            str(r.get("segment_id")): r.get("name") for r in device.data.get("rooms", [])
-        }
-        cov: dict[str, Any] = {}
-        for seg, c in cov_by_seg.items():
-            nm = seg_to_name.get(str(seg))
-            if nm:
-                cov[nm] = c
+        # Spatial coverage from the per-room visited cells we accumulated (only for the
+        # room actively being cleaned). Total cells come from each room's bounding box.
+        cells_map = self._room_cells.get(duid, {})
+        total_cells: dict[str, int] = {}
+        for r in device.data.get("rooms", []):
+            nm = r.get("name")
+            x0, y0, x1, y1 = r.get("x0"), r.get("y0"), r.get("x1"), r.get("y1")
+            if not nm or None in (x0, y0, x1, y1):
+                continue
+            ncx = max(1, int(abs(x1 - x0) // COVERAGE_CELL_MM) + 1)
+            ncy = max(1, int(abs(y1 - y0) // COVERAGE_CELL_MM) + 1)
+            total_cells[nm] = ncx * ncy
         elapsed = self._room_elapsed.get(duid, {})
         ests = self._estimates.get(duid, {})
         ctype = self._session_clean_type.get(duid) or device.data.get("clean_type")
         out: dict[str, dict[str, Any]] = {}
-        for nm in set(cov) | set(elapsed):
-            c = cov.get(nm) or {}
+        for nm in set(cells_map) | set(elapsed):
+            visited = len(cells_map.get(nm, set()))
+            total = total_cells.get(nm)
+            spatial_pct = round(100 * visited / total) if (total and visited) else (0 if total else None)
             el = elapsed.get(nm)
             er = ests.get(nm) or {}
             est_min = er.get(ctype) if ctype in ("dry", "wet") else None
@@ -543,9 +596,9 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             if el is not None and est_s:
                 time_pct = min(round(100 * el / est_s), 999)
             out[nm] = {
-                "spatial_pct": c.get("pct"),
-                "visited_cells": c.get("visited"),
-                "total_cells": c.get("total"),
+                "spatial_pct": spatial_pct,
+                "visited_cells": visited,
+                "total_cells": total,
                 "elapsed_s": round(el) if el is not None else None,
                 "est_s": est_s,
                 "time_pct": time_pct,
@@ -569,6 +622,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     self._detect_room_done(device)
                     self._track_and_emit(device)
                     self._accumulate_elapsed(device)
+                    self._accumulate_coverage(device)
                     progress = self._build_progress(device)
                     for room in device.data.get("rooms", []):
                         rec = self._history.get(room.get("name")) or {}
@@ -584,7 +638,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                         r: dict(c) for r, c in (self._estimates.get(device.duid) or {}).items()
                     }
                     device.data["rooms_progress"] = progress
-                    device.data.pop("rooms_coverage", None)
+                    device.data.pop("_path_full", None)
                     device.data["duid"] = device.duid
                     device.data["calib_debug"] = self._last_calib.get(device.duid)
                     result[device.duid] = device
