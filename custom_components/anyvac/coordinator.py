@@ -32,6 +32,11 @@ from .const import DOMAIN, PATH_MAX_POINTS, ROBOROCK_DOMAIN, SCAN_INTERVAL_SECON
 
 _LOGGER = logging.getLogger(__name__)
 
+# Grid cell size (mm) for the per-room spatial cleaning-coverage estimate. The path
+# is bucketed into cells of this size; coverage = visited cells / cells in the room
+# bounding box. ~250 mm ≈ the vacuum's cleaning width, a sensible coverage granularity.
+COVERAGE_CELL_MM = 250
+
 
 @dataclass
 class AnyVacDevice:
@@ -65,6 +70,52 @@ def _decimate(points: list[Any], max_points: int) -> list[Any]:
         return points
     step = (n + max_points - 1) // max_points
     return points[::step]
+
+
+def _room_coverage(
+    points: list[dict[str, float]], rooms: list[dict[str, Any]]
+) -> dict[str, dict[str, Any]]:
+    """Estimate per-room spatial cleaning coverage from the cleaning path.
+
+    The room bounding box is gridded into ``COVERAGE_CELL_MM`` cells; a cell counts as
+    cleaned if any path point falls in it. Coverage % = visited cells / total cells in
+    the box. NOTE this is an approximation: the box is rectangular and includes
+    furniture / non-floor area, so a fully cleaned room typically plateaus below 100 %.
+    Good enough as a live debug signal that the path is being tracked correctly.
+    """
+    boxes: list[tuple[str, float, float, float, float, int]] = []
+    cov: dict[str, dict[str, Any]] = {}
+    for r in rooms:
+        nm = r.get("name")
+        x0, y0, x1, y1 = r.get("x0"), r.get("y0"), r.get("x1"), r.get("y1")
+        if not nm or None in (x0, y0, x1, y1):
+            continue
+        lx, hx = (x0, x1) if x0 <= x1 else (x1, x0)
+        ly, hy = (y0, y1) if y0 <= y1 else (y1, y0)
+        ncx = max(1, int((hx - lx) // COVERAGE_CELL_MM) + 1)
+        ncy = max(1, int((hy - ly) // COVERAGE_CELL_MM) + 1)
+        boxes.append((nm, lx, ly, hx, hy, ncx))
+        cov[nm] = {"_cells": set(), "total": ncx * ncy}
+    for p in points:
+        x = p.get("x")
+        y = p.get("y")
+        if x is None or y is None:
+            continue
+        for nm, lx, ly, hx, hy, _ncx in boxes:
+            if lx <= x <= hx and ly <= y <= hy:
+                cx = int((x - lx) // COVERAGE_CELL_MM)
+                cy = int((y - ly) // COVERAGE_CELL_MM)
+                cov[nm]["_cells"].add((cx, cy))
+    out: dict[str, dict[str, Any]] = {}
+    for nm, d in cov.items():
+        visited = len(d["_cells"])
+        total = d["total"]
+        out[nm] = {
+            "visited": visited,
+            "total": total,
+            "pct": round(100 * visited / total) if total else None,
+        }
+    return out
 
 
 def _extract_map(map_data: Any) -> dict[str, Any]:
@@ -126,6 +177,10 @@ def _extract_map(map_data: Any) -> dict[str, Any]:
             }
         )
     out["rooms"] = rooms
+
+    # Per-room spatial coverage (debug / live progress): both dry and wet paths count
+    # as "floor covered". Computed from the full (undecimated) trajectory.
+    out["rooms_coverage"] = _room_coverage(flat + mflat, rooms)
 
     # Which segments the robot has cleaned (this session) + where it currently is.
     out["cleaned_rooms"] = sorted(getattr(map_data, "cleaned_rooms", None) or [])
@@ -189,6 +244,10 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # devices and fed to the orchestrator. Persisted across restarts.
         self._sel_store: Store = Store(hass, 1, f"{DOMAIN}_selection")
         self._selected_rooms: set[str] = set()
+        # Live per-room elapsed cleaning seconds this session (for the debug progress
+        # gauge's time-ratio) + last poll timestamp to measure the per-poll delta.
+        self._room_elapsed: dict[str, dict[str, float]] = {}
+        self._last_poll: dict[str, datetime] = {}
 
     @property
     def rooms_history(self) -> dict[str, dict[str, str]]:
@@ -247,6 +306,23 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         self._est_store.async_delay_save(lambda: self._estimates, 5)
         return before, after
 
+    def _accumulate_elapsed(self, device: AnyVacDevice) -> None:
+        """Add the per-poll time delta to the room the vacuum is currently cleaning, so
+        the debug gauge can show a time-ratio (elapsed / learned estimate)."""
+        duid = device.duid
+        now = dt_util.utcnow()
+        last = self._last_poll.get(duid)
+        self._last_poll[duid] = now
+        if not device.data.get("in_cleaning") or last is None:
+            return
+        delta = (now - last).total_seconds()
+        if delta <= 0 or delta > 600:  # ignore restarts / large gaps
+            return
+        room = self._confirmed_room.get(duid) or device.data.get("vacuum_room_name")
+        if room:
+            e = self._room_elapsed.setdefault(duid, {})
+            e[room] = e.get(room, 0.0) + delta
+
     def _detect_room_done(self, device: AnyVacDevice) -> None:
         """Fire anyvac_room_done when a vacuum has truly finished and left a room.
 
@@ -263,6 +339,9 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         if not cleaning:
             prev = self._confirmed_room.get(duid)
             if prev and self._was_cleaning.get(duid):
+                self._stamp_history(
+                    prev, self._session_clean_type.get(duid) or device.data.get("clean_type")
+                )
                 self.hass.bus.async_fire(
                     f"{DOMAIN}_room_done",
                     {"vacuum": device.name, "duid": duid, "room": prev, "reason": "docked"},
@@ -283,6 +362,9 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             self._confirmed_room[duid] = raw
             self._session_confirmed.setdefault(duid, set()).add(raw)
             if prev:
+                self._stamp_history(
+                    prev, self._session_clean_type.get(duid) or device.data.get("clean_type")
+                )
                 self.hass.bus.async_fire(
                     f"{DOMAIN}_room_done",
                     {"vacuum": device.name, "duid": duid, "room": prev, "reason": "left"},
@@ -302,6 +384,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 self._session_rooms[duid] = set()
                 self._session_confirmed[duid] = set()
                 self._session_clean_type.pop(duid, None)
+                self._room_elapsed[duid] = {}
                 self._session_start[duid] = dt_util.utcnow()
                 self.hass.bus.async_fire(
                     f"{DOMAIN}_clean_started",
@@ -394,37 +477,67 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
     def _history_for_save(self) -> dict[str, dict[str, str]]:
         return self._history
 
-    def _update_history(self, device: AnyVacDevice) -> None:
-        """While a vacuum is cleaning, stamp the room it is currently in (and any
-        firmware-reported cleaned segments) with the current clean type, keyed by
-        room NAME so history aggregates across all vacuums. Persisted across restarts.
+    def _stamp_history(self, name: str | None, ctype: str | None) -> None:
+        """Record that `name` was cleaned now, with the given clean type, keyed by room
+        NAME so history aggregates across all vacuums. Persisted across restarts."""
+        if not name:
+            return
+        now = dt_util.utcnow().isoformat()
+        rec = self._history.setdefault(name, {})
+        rec["any"] = now
+        if ctype in ("dry", "wet"):
+            rec[ctype] = now
+        self._store.async_delay_save(self._history_for_save, 5)
 
-        We use vacuum_room (presence) as the primary signal because cleaned_rooms is
-        not reliably populated; cleaned_rooms is unioned in when present.
+    def _update_history(self, device: AnyVacDevice) -> None:
+        """Stamp rooms the firmware explicitly reports as cleaned (cleaned_rooms).
+
+        Presence-based stamping (the room the robot is currently in) is intentionally
+        NOT done here: the robot crosses its own room borders and drives through rooms
+        on its way elsewhere, so the raw current room over-reports. Presence is instead
+        recorded by the DEBOUNCED confirmation in _detect_room_done (a room must be
+        genuinely cleaned and then left before it is stamped), the same signal as
+        anyvac_room_done. cleaned_rooms, when the firmware provides it, lists only
+        actually-cleaned segments, so it is trustworthy and unioned in here.
         """
         if not device.data.get("in_cleaning"):
             return
-        names: set[str] = set()
-        current = device.data.get("vacuum_room_name")
-        if current:
-            names.add(current)
         seg_to_name = {
             str(r.get("segment_id")): r.get("name") for r in device.data.get("rooms", [])
         }
+        ctype = self._session_clean_type.get(device.duid) or device.data.get("clean_type")
         for seg in device.data.get("cleaned_rooms") or []:
-            nm = seg_to_name.get(str(seg))
-            if nm:
-                names.add(nm)
-        if not names:
-            return
-        ctype = device.data.get("clean_type")
-        now = dt_util.utcnow().isoformat()
-        for nm in names:
-            rec = self._history.setdefault(nm, {})
-            rec["any"] = now
-            if ctype in ("dry", "wet"):
-                rec[ctype] = now
-        self._store.async_delay_save(self._history_for_save, 5)
+            self._stamp_history(seg_to_name.get(str(seg)), ctype)
+
+    def _build_progress(self, device: AnyVacDevice) -> dict[str, dict[str, Any]]:
+        """Merge per-room spatial coverage with the time-ratio into one debug payload:
+        {room: {spatial_pct, visited_cells, total_cells, time_pct, elapsed_s, est_s}}."""
+        duid = device.duid
+        cov = device.data.get("rooms_coverage") or {}
+        elapsed = self._room_elapsed.get(duid, {})
+        ests = self._estimates.get(duid, {})
+        ctype = self._session_clean_type.get(duid) or device.data.get("clean_type")
+        out: dict[str, dict[str, Any]] = {}
+        for nm in set(cov) | set(elapsed):
+            c = cov.get(nm) or {}
+            el = elapsed.get(nm)
+            er = ests.get(nm) or {}
+            est_min = er.get(ctype) if ctype in ("dry", "wet") else None
+            if est_min is None:
+                est_min = er.get("dry") or er.get("wet")
+            est_s = round(est_min * 60) if est_min else None
+            time_pct = None
+            if el is not None and est_s:
+                time_pct = min(round(100 * el / est_s), 999)
+            out[nm] = {
+                "spatial_pct": c.get("pct"),
+                "visited_cells": c.get("visited"),
+                "total_cells": c.get("total"),
+                "elapsed_s": round(el) if el is not None else None,
+                "est_s": est_s,
+                "time_pct": time_pct,
+            }
+        return out
 
     async def _async_update_data(self) -> dict[str, AnyVacDevice]:
         """Read every Roborock v1 coordinator and normalise its map data."""
@@ -442,6 +555,8 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     self._update_history(device)
                     self._detect_room_done(device)
                     self._track_and_emit(device)
+                    self._accumulate_elapsed(device)
+                    progress = self._build_progress(device)
                     for room in device.data.get("rooms", []):
                         rec = self._history.get(room.get("name")) or {}
                         room["last_cleaned"] = rec.get("any")
@@ -450,10 +565,13 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                         est = (self._estimates.get(device.duid) or {}).get(room.get("name")) or {}
                         room["estimate_dry"] = est.get("dry")
                         room["estimate_wet"] = est.get("wet")
+                        room["progress_pct"] = (progress.get(room.get("name")) or {}).get("spatial_pct")
                     device.data["rooms_last_cleaned"] = {k: dict(v) for k, v in self._history.items()}
                     device.data["rooms_estimate"] = {
                         r: dict(c) for r, c in (self._estimates.get(device.duid) or {}).items()
                     }
+                    device.data["rooms_progress"] = progress
+                    device.data.pop("rooms_coverage", None)
                     device.data["duid"] = device.duid
                     device.data["calib_debug"] = self._last_calib.get(device.duid)
                     result[device.duid] = device

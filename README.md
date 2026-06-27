@@ -35,6 +35,7 @@ is the current path-point count and whose attributes carry the map payload:
 | `path` | decimated cleaning path, list of `{x, y}` in millimetres |
 | `rooms` | `[{segment_id, name, x0,y0,x1,y1, pos_x,pos_y}, …]` |
 | `image_dims` | `{top,left,width,height,scale,rotation}` of the rendered map |
+| `rooms_progress` | per-room debug progress: `{room: {spatial_pct, visited_cells, total_cells, time_pct, elapsed_s, est_s}}` |
 
 ## Recorder
 
@@ -86,6 +87,6 @@ colliding. See the service's docstring for the task shape.
 
 ## Status
 
-Experimental v0.9.0. AnyVac reads the Roborock integration's internal runtime
+Experimental v0.10.0. AnyVac reads the Roborock integration's internal runtime
 data; if a future Roborock release changes that structure, AnyVac degrades
 gracefully (no data) rather than breaking — please open an issue if that happens.

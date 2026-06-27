@@ -4,6 +4,29 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] - 2026-06-27
+
+### Added
+
+- **Per-room cleaning progress (`rooms_progress`) — debug/live signal.** A new map-sensor attribute
+  exposing, per room, a **spatial coverage %** (the cleaning path bucketed into ~250 mm grid cells vs
+  the room's bounding box) and a **time ratio** (elapsed seconds in the room vs the learned estimate):
+  `{room: {spatial_pct, visited_cells, total_cells, time_pct, elapsed_s, est_s}}`. Each room dict also
+  carries `progress_pct` (= spatial). Lets the card draw a live per-room gauge to verify tracking
+  during a clean. Spatial % is approximate (the bounding box includes furniture, so a fully cleaned
+  room plateaus below 100 %).
+
+## [0.9.1] - 2026-06-27
+
+### Fixed
+
+- **"Last cleaned" stamped rooms the robot only drove through.** Per-room history was stamped from the
+  raw current room (`vacuum_room`) on every poll, so a room the vacuum merely crossed on its way
+  elsewhere (e.g. a large central living room) got a fresh "last cleaned" time even though it was not
+  cleaned. Presence-based stamping now uses the **debounced confirmation** (a room must be genuinely
+  cleaned and then left — the same signal as `anyvac_room_done`), and the firmware's `cleaned_rooms`
+  is still unioned in when present. Pass-throughs are no longer recorded as cleaned.
+
 ## [0.9.0] - 2026-06-26
 
 ### Added
