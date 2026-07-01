@@ -4,6 +4,47 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] - 2026-07-02
+
+Phase 1 of the backend-first canon (docs/14): the integration is now the single tracker
+of cleaning sessions — pair with anyvac-card ≥0.37.0, which dropped its client-side copy.
+
+### Fixed
+
+- **Mid-clean mop wash corrupted room tracking (docs/13 A2).** During a mop wash the
+  robot sits in the dock's room for minutes while `in_cleaning` stays truthy, so that
+  room got "confirmed": the previous room fired `anyvac_room_done` prematurely (releasing
+  the wet robot too early), the session gained a second confirmed room (single-room time
+  calibration then always failed with "2 confirmed rooms"), and elapsed time accrued to
+  the dock's room. Room confirmation, per-room elapsed time and coverage attribution now
+  freeze while the raw Roborock state is a transit/self-service state (`washing_the_mop`,
+  `going_to_wash_the_mop`, `emptying_the_bin`, `returning_home`, `docking`,
+  `going_to_target`, air-drying, charging).
+- **`clean_type` is now mop-carriage aware (docs/13 B2).** A configured water level with
+  the mop pad physically removed no longer records a dry clean as "wet"
+  (`is_water_box_carriage_attached` is honoured when the model reports it).
+
+### Added
+
+- **Segmented dry trace `path_dry` (+ `path_dry_points`, alias `path_wet`).** The parser's
+  `path` is the robot's FULL trajectory — transit, mop-wash trips and goto driving
+  included — which visually mixed into the "dry" layer and inflated dry coverage during
+  wet cleans. `path_dry` contains only points recorded while genuinely cleaning; the
+  per-room dry coverage now uses the same filter. `path` / `mop_path` remain unchanged
+  for older cards.
+- **`status_state` and `transit` attributes** (raw Roborock state + transit flag) for
+  debugging and automations.
+- **Shared room selection auto-clears** the finished rooms on `anyvac_clean_finished`
+  (replaces the card's removed client-side clearing).
+- **Pipeline observability (docs/13 B6):** one clear warning when a previously seen
+  vacuum stops yielding map data (roborock internals changed / reloading), and an info
+  log when data returns — instead of silent debug-level degradation.
+
+### Removed
+
+- Dead `_room_coverage` module function (superseded by per-room cell accumulation long
+  ago; it was never called).
+
 ## [0.11.0] - 2026-06-27
 
 ### Added

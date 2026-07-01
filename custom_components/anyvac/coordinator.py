@@ -37,6 +37,27 @@ _LOGGER = logging.getLogger(__name__)
 # bounding box. ~250 mm ≈ the vacuum's cleaning width, a sensible coverage granularity.
 COVERAGE_CELL_MM = 250
 
+# Raw Roborock states in which the robot is driving somewhere / servicing itself rather
+# than cleaning the room it is physically in. CRITICAL (docs/13 A1+A2, docs/14 rule 4):
+# a mid-clean mop wash keeps ``in_cleaning`` truthy while HA maps the vacuum state to
+# ``docked`` — so room confirmation, per-room elapsed time and coverage attribution must
+# all FREEZE during these states, otherwise the dock's room gets "confirmed", rooms fire
+# ``anyvac_room_done`` prematurely and single-room calibration never sees exactly 1 room.
+TRANSIT_STATES = {
+    "returning_home",
+    "docking",
+    "going_to_target",
+    "emptying_the_bin",
+    "washing_the_mop",
+    "washing_the_mop_2",
+    "going_to_wash_the_mop",
+    "back_to_dock_washing_duster",
+    "air_drying",
+    "air_drying_stopping",
+    "charging",
+    "charging_complete",
+}
+
 
 @dataclass
 class AnyVacDevice:
@@ -70,56 +91,6 @@ def _decimate(points: list[Any], max_points: int) -> list[Any]:
         return points
     step = (n + max_points - 1) // max_points
     return points[::step]
-
-
-def _room_coverage(
-    points: list[dict[str, float]], rooms: list[dict[str, Any]]
-) -> dict[str, dict[str, Any]]:
-    """Estimate per-room spatial cleaning coverage from the cleaning path.
-
-    The room bounding box is gridded into ``COVERAGE_CELL_MM`` cells; a cell counts as
-    cleaned if any path point falls in it. Coverage % = visited cells / total cells in
-    the box. NOTE this is an approximation: the box is rectangular and includes
-    furniture / non-floor area, so a fully cleaned room typically plateaus below 100 %.
-    Good enough as a live debug signal that the path is being tracked correctly.
-    """
-    # Keyed by segment_id (always present). Names are merged into the rooms only after
-    # _extract_map runs, so keying by name here would skip every room; the caller maps
-    # segment_id -> name when consuming the coverage.
-    boxes: list[tuple[str, float, float, float, float, int]] = []
-    cov: dict[str, dict[str, Any]] = {}
-    for r in rooms:
-        seg = r.get("segment_id")
-        x0, y0, x1, y1 = r.get("x0"), r.get("y0"), r.get("x1"), r.get("y1")
-        if seg is None or None in (x0, y0, x1, y1):
-            continue
-        key = str(seg)
-        lx, hx = (x0, x1) if x0 <= x1 else (x1, x0)
-        ly, hy = (y0, y1) if y0 <= y1 else (y1, y0)
-        ncx = max(1, int((hx - lx) // COVERAGE_CELL_MM) + 1)
-        ncy = max(1, int((hy - ly) // COVERAGE_CELL_MM) + 1)
-        boxes.append((key, lx, ly, hx, hy, ncx))
-        cov[key] = {"_cells": set(), "total": ncx * ncy}
-    for p in points:
-        x = p.get("x")
-        y = p.get("y")
-        if x is None or y is None:
-            continue
-        for nm, lx, ly, hx, hy, _ncx in boxes:
-            if lx <= x <= hx and ly <= y <= hy:
-                cx = int((x - lx) // COVERAGE_CELL_MM)
-                cy = int((y - ly) // COVERAGE_CELL_MM)
-                cov[nm]["_cells"].add((cx, cy))
-    out: dict[str, dict[str, Any]] = {}
-    for nm, d in cov.items():
-        visited = len(d["_cells"])
-        total = d["total"]
-        out[nm] = {
-            "visited": visited,
-            "total": total,
-            "pct": round(100 * visited / total) if total else None,
-        }
-    return out
 
 
 def _extract_map(map_data: Any) -> dict[str, Any]:
@@ -270,6 +241,15 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # {duid: {room_name: {"dry": n, "wet": n}}}. Persisted across restarts.
         self._cov_store: Store = Store(hass, 1, f"{DOMAIN}_coverage_baseline")
         self._cov_baseline: dict[str, dict[str, dict[str, int]]] = {}
+        # Segmented DRY trace (docs/14 §3.9): the parser's ``path`` is the robot's FULL
+        # trajectory (transit, mop-wash trips and goto included), so it must not be shown
+        # as the "dry" layer directly. Only points recorded while actively cleaning and
+        # not in a TRANSIT state are appended here. {duid: [ {x, y}, ... ]}.
+        self._dry_path: dict[str, list[dict[str, float]]] = {}
+        # Pipeline observability (docs/13 B6): warn (once) when a previously seen vacuum
+        # stops yielding map data — the roborock internals may have changed.
+        self._known_duids: set[str] = set()
+        self._pipeline_warned = False
 
     @property
     def rooms_history(self) -> dict[str, dict[str, str]]:
@@ -359,7 +339,9 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         now = dt_util.utcnow()
         last = self._last_poll.get(duid)
         self._last_poll[duid] = now
-        if not device.data.get("in_cleaning") or last is None:
+        # Transit/self-service states (mop wash, bin empty, returning): the robot is not
+        # cleaning the room it is in — freeze the per-room clock (docs/13 A2).
+        if not device.data.get("in_cleaning") or device.data.get("transit") or last is None:
             return
         delta = (now - last).total_seconds()
         if delta <= 0 or delta > 600:  # ignore restarts / large gaps
@@ -390,10 +372,22 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 start = 0
                 for rc in self._room_cells.get(duid, {}).values():
                     rc[layer] = set()
+                if layer == "dry":
+                    self._dry_path[duid] = []
             new_by_layer[layer] = full[start:]
             seen[layer] = len(full)
 
-        if not device.data.get("in_cleaning"):
+        cleaning = bool(device.data.get("in_cleaning"))
+        transit = bool(device.data.get("transit"))
+
+        # Segmented dry trace (docs/14 §3.9): append the new trajectory points only when
+        # the robot is genuinely cleaning — transit / mop-wash / goto driving must not
+        # render (or count) as the dry layer. The wet layer needs no segmentation: the
+        # parser's mop_path is recorded only while the mop is actually down.
+        if cleaning and not transit and new_by_layer["dry"]:
+            self._dry_path.setdefault(duid, []).extend(new_by_layer["dry"])
+
+        if not cleaning or transit:
             return
         room = self._confirmed_room.get(duid)
         if not room:
@@ -431,6 +425,14 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         duid = device.duid
         cleaning = bool(device.data.get("in_cleaning"))
         raw = device.data.get("vacuum_room_name")
+
+        # Mid-clean transit (mop wash, bin empty, returning, goto): the robot drives
+        # through / sits in rooms it is NOT cleaning. Freeze the debounce entirely —
+        # neither confirm the room the dock is in, nor report the previous room done
+        # (docs/13 A2: this used to break single-room calibration and released the wet
+        # robot into rooms the dry robot had not finished).
+        if cleaning and device.data.get("transit"):
+            return
 
         if not cleaning:
             prev = self._confirmed_room.get(duid)
@@ -483,6 +485,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 self._room_elapsed[duid] = {}
                 self._room_cells[duid] = {}
                 self._path_seen[duid] = {"dry": 0, "wet": 0}
+                self._dry_path[duid] = []
                 self._session_start[duid] = dt_util.utcnow()
                 self.hass.bus.async_fire(
                     f"{DOMAIN}_clean_started",
@@ -564,6 +567,12 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 self._learn_coverage(duid, rnm, "dry", len(cells.get("dry", set())), total)
                 self._learn_coverage(duid, rnm, "wet", len(cells.get("wet", set())), total)
             self.hass.bus.async_fire(f"{DOMAIN}_clean_finished", event)
+            # Auto-clear the finished rooms from the shared card-level selection —
+            # this replaces the card's old client-side selection clearing (docs/14 §3.11;
+            # room keys == integration room names by convention).
+            if rooms and self._selected_rooms & set(rooms):
+                self._selected_rooms -= set(rooms)
+                self._sel_store.async_delay_save(lambda: sorted(self._selected_rooms), 2)
             self._session_rooms[duid] = set()
         self._was_cleaning[duid] = cleaning
 
@@ -737,9 +746,32 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     device.data["rooms_progress"] = progress
                     device.data.pop("_path_dry", None)
                     device.data.pop("_path_wet", None)
+                    # Typed trace layers (docs/14 §3.9): path_dry = trajectory segmented
+                    # to actual cleaning (no transit / mop-wash driving); path_wet = the
+                    # mop trace. ``path`` (full trajectory) stays for backward compat.
+                    dry = self._dry_path.get(device.duid, [])
+                    device.data["path_dry"] = _decimate(dry, PATH_MAX_POINTS)
+                    device.data["path_dry_points"] = len(dry)
+                    device.data["path_wet"] = device.data.get("mop_path")
                     device.data["duid"] = device.duid
                     device.data["calib_debug"] = self._last_calib.get(device.duid)
                     result[device.duid] = device
+
+        # Observability (docs/13 B6): a vacuum we used to read suddenly yields no map
+        # data -> one clear warning instead of silent degradation.
+        missing = self._known_duids - set(result)
+        if missing and not self._pipeline_warned:
+            _LOGGER.warning(
+                "AnyVac: no map data for previously seen vacuum(s) %s — the Roborock "
+                "integration may have changed internally, be reloading, or the map is "
+                "unavailable. AnyVac sensors for them will be unavailable until data returns.",
+                sorted(missing),
+            )
+            self._pipeline_warned = True
+        if not missing and self._pipeline_warned:
+            _LOGGER.info("AnyVac: map data restored for all known vacuums.")
+            self._pipeline_warned = False
+        self._known_duids |= set(result)
         return result
 
     def _extract_device(self, coord: Any) -> AnyVacDevice | None:
@@ -782,6 +814,12 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             return getattr(status, attr, None) if status is not None else None
 
         data["in_cleaning"] = bool(_s("in_cleaning"))
+        # Raw Roborock state (e.g. "washing_the_mop"). NEVER use the HA vacuum entity
+        # state for phase detection — a mid-clean mop wash maps to "docked" there
+        # (docs/14 rule 4). ``transit`` = in a self-service/driving state.
+        state_name = _s("state_name") or getattr(_s("state"), "name", None)
+        data["status_state"] = state_name
+        data["transit"] = state_name in TRANSIT_STATES if state_name else False
         water_name = _s("water_mode_name")
         data["mop_signal"] = {
             "fan_power": _s("fan_power"),
@@ -794,10 +832,15 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             "water_box_carriage_status": _s("water_box_carriage_status"),
             "is_water_box_carriage_attached": _s("is_water_box_carriage_attached"),
         }
-        # Best-effort dry/wet: "wet" when a water level is active. Verify via mop_signal
-        # and we will refine the exact field once confirmed on hardware.
+        # Dry/wet: "wet" only when a water level is active AND the mop carriage is
+        # actually attached (docs/13 B2 — water set + mop pad removed used to record a
+        # dry clean as wet). Unknown attachment (None) keeps the water-mode verdict.
+        water_active = bool(
+            water_name and str(water_name).lower() not in ("off", "none", "closed")
+        )
+        attached = _s("is_water_box_carriage_attached")
         data["clean_type"] = (
-            "wet" if water_name and str(water_name).lower() not in ("off", "none", "closed") else "dry"
+            "wet" if water_active and (attached is None or bool(attached)) else "dry"
         )
         vr = data.get("vacuum_room")
         if vr is not None and not data.get("vacuum_room_name"):
