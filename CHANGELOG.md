@@ -4,6 +4,27 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.0] - 2026-07-02
+
+Refinements from the first full-apartment day of data.
+
+### Fixed
+
+- **A drive-through no longer stamps history or fires `anyvac_room_done`.** Field
+  finding: S6 docks in the Kitchen, so leaving/returning collected ~17 cells there —
+  enough to pass the old ≥3-cell floor, stamp Kitchen "dry cleaned" and (worse) fire
+  `anyvac_room_done`, which in a whole-home orchestration would release the wet robot
+  into an uncleaned room. Stamps and room_done now require real evidence: cells ≥30 %
+  of a valid baseline, else ≥10 % of the room bbox (always ≥3). Rooms listed by the
+  firmware in `cleaned_rooms` keep the lenient floor.
+
+### Added
+
+- **`anyvac.reset_learning` service** (`{room?, kind?, estimates?, baselines?}`):
+  prunes learned clean-time estimates and/or coverage baselines — for entries poisoned
+  before the evidence-based typing fix (e.g. wet estimates on a dry-only robot), or
+  after furniture changes invalidate a room's baseline.
+
 ## [0.15.0] - 2026-07-02
 
 ### Fixed

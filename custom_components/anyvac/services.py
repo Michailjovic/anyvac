@@ -56,6 +56,16 @@ SET_LAYERS_SCHEMA = vol.Schema(
         vol.Optional("wet"): bool,
     }
 )
+SERVICE_RESET_LEARNING = "reset_learning"
+RESET_LEARNING_SCHEMA = vol.Schema(
+    {
+        vol.Optional("duid"): str,
+        vol.Optional("room"): str,
+        vol.Optional("kind"): vol.In(["dry", "wet"]),
+        vol.Optional("estimates", default=True): bool,
+        vol.Optional("baselines", default=True): bool,
+    }
+)
 
 
 class _JobRunner:
@@ -184,4 +194,22 @@ def async_register_services(hass: HomeAssistant) -> None:
 
         hass.services.async_register(
             DOMAIN, SERVICE_SET_LAYERS, _handle_set_layers, schema=SET_LAYERS_SCHEMA
+        )
+
+    if not hass.services.has_service(DOMAIN, SERVICE_RESET_LEARNING):
+
+        async def _handle_reset_learning(call: ServiceCall) -> None:
+            for entry in hass.config_entries.async_entries(DOMAIN):
+                coord = getattr(entry, "runtime_data", None)
+                if coord is not None:
+                    coord.reset_learning(
+                        duid=call.data.get("duid"),
+                        room=call.data.get("room"),
+                        kind=call.data.get("kind"),
+                        estimates=call.data.get("estimates", True),
+                        baselines=call.data.get("baselines", True),
+                    )
+
+        hass.services.async_register(
+            DOMAIN, SERVICE_RESET_LEARNING, _handle_reset_learning, schema=RESET_LEARNING_SCHEMA
         )

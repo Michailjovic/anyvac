@@ -280,6 +280,39 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         """Card-level set of rooms queued to clean (shared across devices)."""
         return sorted(self._selected_rooms)
 
+    def reset_learning(
+        self,
+        duid: str | None = None,
+        room: str | None = None,
+        kind: str | None = None,
+        estimates: bool = True,
+        baselines: bool = True,
+    ) -> None:
+        """Prune learned data (anyvac.reset_learning) — e.g. estimate entries poisoned
+        before the evidence-based typing fix, or baselines invalidated by moving
+        furniture. Filters: vacuum duid, room name, kind (dry/wet); omitted = all."""
+        kinds = [kind] if kind in ("dry", "wet") else ["dry", "wet"]
+
+        def _prune(table: dict[str, dict[str, dict[str, Any]]]) -> None:
+            for dd, rooms in table.items():
+                if duid and dd != duid:
+                    continue
+                for rnm in list(rooms):
+                    if room and rnm != room:
+                        continue
+                    for k in kinds:
+                        rooms[rnm].pop(k, None)
+                    if not rooms[rnm]:
+                        rooms.pop(rnm)
+
+        if estimates:
+            _prune(self._estimates)
+            self._est_store.async_delay_save(lambda: self._estimates, 2)
+        if baselines:
+            _prune(self._cov_baseline)
+            self._cov_store.async_delay_save(lambda: self._cov_baseline, 2)
+        self.async_update_listeners()
+
     @property
     def view_layers(self) -> dict[str, bool]:
         """Shared dry/wet layer visibility for the card (synced across devices)."""
@@ -474,11 +507,17 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         if not cleaning:
             prev = self._confirmed_room.get(duid)
             if prev and self._was_cleaning.get(duid):
-                self._stamp_room(duid, prev)
-                self.hass.bus.async_fire(
-                    f"{DOMAIN}_room_done",
-                    {"vacuum": device.name, "duid": duid, "room": prev, "reason": "docked"},
-                )
+                # Fire done/stamp only with real cleaning evidence — a confirmed room
+                # the robot merely drove through (dock in room) must not release the
+                # orchestrator's wet pass nor stamp history.
+                if self._evidence_kinds(device, prev):
+                    self._stamp_room(device, prev)
+                    self.hass.bus.async_fire(
+                        f"{DOMAIN}_room_done",
+                        {"vacuum": device.name, "duid": duid, "room": prev, "reason": "docked"},
+                    )
+                else:
+                    _LOGGER.debug("AnyVac: %s left %s without evidence — no room_done", device.name, prev)
             self._confirmed_room[duid] = None
             self._raw_room[duid] = None
             self._raw_count[duid] = 0
@@ -495,11 +534,14 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             self._confirmed_room[duid] = raw
             self._session_confirmed.setdefault(duid, set()).add(raw)
             if prev:
-                self._stamp_room(duid, prev)
-                self.hass.bus.async_fire(
-                    f"{DOMAIN}_room_done",
-                    {"vacuum": device.name, "duid": duid, "room": prev, "reason": "left"},
-                )
+                if self._evidence_kinds(device, prev):
+                    self._stamp_room(device, prev)
+                    self.hass.bus.async_fire(
+                        f"{DOMAIN}_room_done",
+                        {"vacuum": device.name, "duid": duid, "room": prev, "reason": "left"},
+                    )
+                else:
+                    _LOGGER.debug("AnyVac: %s left %s without evidence — no room_done", device.name, prev)
 
     def _track_and_emit(self, device: AnyVacDevice) -> None:
         """Fire anyvac_clean_started / anyvac_clean_finished events on cleaning transitions.
@@ -683,22 +725,54 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
     def _history_for_save(self) -> dict[str, dict[str, str]]:
         return self._history
 
-    def _stamp_room(self, duid: str, name: str | None) -> None:
-        """Record that `name` was cleaned now — the dry/wet kinds are decided by
-        EVIDENCE (this session's coverage cells), not by the water-mode signal, which
-        can lie (field finding: an S7 dry pass reported clean_type=wet and stamped the
-        wrong kind). Wet cells only exist while the mop is physically engaged; dry
-        cells only while suction is on — so the cells are ground truth. Keyed by room
-        NAME so history aggregates across all vacuums. Persisted across restarts."""
+    def _evidence_kinds(self, device: AnyVacDevice, room: str, strict: bool = True) -> list[str]:
+        """Which clean kinds have real EVIDENCE in `room` this session (docs/16).
+
+        Ground truth are the coverage cells: wet cells only exist while the mop is
+        physically engaged, dry cells only while suction is on. A kind counts when its
+        cells clear a plausibility floor — ≥30 % of a valid baseline, else ≥10 % of the
+        room bbox, always ≥3 cells. Field finding behind the strict floor: a robot
+        docked IN a room collects ~15+ cells just driving out/home, which used to stamp
+        the room "cleaned" and fire anyvac_room_done (= releasing the wet robot into an
+        uncleaned room). ``strict=False`` keeps only the bare ≥3 floor — for rooms the
+        firmware itself lists in cleaned_rooms."""
+        duid = device.duid
+        cells_map = self._room_cells.get(duid, {}).get(room) or {}
+        bbox_total = None
+        rmeta = next((r for r in device.data.get("rooms", []) if r.get("name") == room), None)
+        if rmeta and None not in (rmeta.get("x0"), rmeta.get("y0"), rmeta.get("x1"), rmeta.get("y1")):
+            bbox_total = max(1, int(abs(rmeta["x1"] - rmeta["x0"]) // COVERAGE_CELL_MM) + 1) * max(
+                1, int(abs(rmeta["y1"] - rmeta["y0"]) // COVERAGE_CELL_MM) + 1
+            )
+        out: list[str] = []
+        for kind in ("dry", "wet"):
+            n = len(cells_map.get(kind) or ())
+            if n < 3:
+                continue
+            if strict:
+                base = ((self._cov_baseline.get(duid) or {}).get(room) or {}).get(kind)
+                if base and bbox_total and base < 0.2 * bbox_total:
+                    base = None  # implausible baseline (poisoned) — same rule as _norm
+                floor = 0.3 * base if base else (0.1 * bbox_total if bbox_total else 0)
+                if n < floor:
+                    continue
+            out.append(kind)
+        return out
+
+    def _stamp_room(self, device: AnyVacDevice, name: str | None, strict: bool = True) -> None:
+        """Record that `name` was cleaned now — kinds decided by evidence (see
+        _evidence_kinds). Keyed by room NAME so history aggregates across all vacuums.
+        Persisted across restarts."""
         if not name:
             return
-        cells = (self._room_cells.get(duid) or {}).get(name) or {}
+        kinds = self._evidence_kinds(device, name, strict)
+        if not kinds:
+            return
         now = dt_util.utcnow().isoformat()
         rec = self._history.setdefault(name, {})
         rec["any"] = now
-        for kind in ("dry", "wet"):
-            if len(cells.get(kind) or ()) >= 3:  # a couple of stray points don't count
-                rec[kind] = now
+        for kind in kinds:
+            rec[kind] = now
         self._store.async_delay_save(self._history_for_save, 5)
 
     def _update_history(self, device: AnyVacDevice) -> None:
@@ -718,7 +792,8 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             str(r.get("segment_id")): r.get("name") for r in device.data.get("rooms", [])
         }
         for seg in device.data.get("cleaned_rooms") or []:
-            self._stamp_room(device.duid, seg_to_name.get(str(seg)))
+            # Firmware-confirmed cleans use the lenient evidence floor.
+            self._stamp_room(device, seg_to_name.get(str(seg)), strict=False)
 
     def _build_progress(self, device: AnyVacDevice) -> dict[str, dict[str, Any]]:
         """Merge per-room spatial coverage with the time-ratio into one debug payload:
