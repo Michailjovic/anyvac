@@ -38,6 +38,7 @@ _LOGGER = logging.getLogger(__name__)
 
 SERVICE_RUN_JOB = "run_job"
 SERVICE_SELECT_ROOMS = "select_rooms"
+SERVICE_SET_LAYERS = "set_layers"
 JOB_TIMEOUT_SECONDS = 3 * 3600  # safety: tear down a stuck job after 3 h
 
 RUN_JOB_SCHEMA = vol.Schema({vol.Required("tasks"): [dict]})
@@ -47,6 +48,12 @@ SELECT_ROOMS_SCHEMA = vol.Schema(
         vol.Optional("mode", default="set"): vol.In(
             ["set", "add", "remove", "toggle", "clear"]
         ),
+    }
+)
+SET_LAYERS_SCHEMA = vol.Schema(
+    {
+        vol.Optional("dry"): bool,
+        vol.Optional("wet"): bool,
     }
 )
 
@@ -165,4 +172,16 @@ def async_register_services(hass: HomeAssistant) -> None:
 
         hass.services.async_register(
             DOMAIN, SERVICE_SELECT_ROOMS, _handle_select_rooms, schema=SELECT_ROOMS_SCHEMA
+        )
+
+    if not hass.services.has_service(DOMAIN, SERVICE_SET_LAYERS):
+
+        async def _handle_set_layers(call: ServiceCall) -> None:
+            for entry in hass.config_entries.async_entries(DOMAIN):
+                coord = getattr(entry, "runtime_data", None)
+                if coord is not None:
+                    coord.set_layers(call.data.get("dry"), call.data.get("wet"))
+
+        hass.services.async_register(
+            DOMAIN, SERVICE_SET_LAYERS, _handle_set_layers, schema=SET_LAYERS_SCHEMA
         )

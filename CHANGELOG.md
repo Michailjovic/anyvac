@@ -4,6 +4,30 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0] - 2026-07-02
+
+Field-test fixes from the first 0.13.0 runs + shared layer visibility.
+
+### Fixed
+
+- **A mop-only pass no longer paints the dry layer.** The trajectory of a wet clean with
+  suction off (observed: S8, `fan_speed_name: off`) was counted into `path_dry` and dry
+  coverage, instantly pushing the dry gauge to 100 % during a wet clean. Dry trace and
+  dry coverage now require the robot to actually be VACUUMING (new `vacuuming` attribute
+  from `fan_speed_name`; falls back to `clean_type` when unknown). Time attribution still
+  uses the full trajectory — movement is movement.
+- **Poisoned coverage baselines self-heal.** A baseline learned long ago from a partial
+  run (observed: 15 cells vs a 221-cell bbox) made gauges jump to 100 % immediately and
+  let the calibration gate pass trivially. Baselines below 20 % of the room's bbox are
+  now ignored (gauge falls back to raw % with `~`), and a completed clean covering ≥1.5×
+  the stored baseline replaces it outright — upward corrections jump, they don't crawl.
+
+### Added
+
+- **`anyvac.set_layers` service + `view_layers` attribute**: the card's dry/wet layer
+  toggles are now backend-shared state — they survive page refreshes and stay in sync
+  across browsers/devices, exactly like the room selection. Persisted across restarts.
+
 ## [0.13.0] - 2026-07-02
 
 Continuous time calibration (docs/16): every clean calibrates, polling stops mattering.

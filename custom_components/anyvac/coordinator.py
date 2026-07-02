@@ -250,6 +250,10 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # stops yielding map data — the roborock internals may have changed.
         self._known_duids: set[str] = set()
         self._pipeline_warned = False
+        # Shared dry/wet layer visibility (card view state, synced across devices the
+        # same way as the room selection). Persisted across restarts.
+        self._layers_store: Store = Store(hass, 1, f"{DOMAIN}_view_layers")
+        self._view_layers: dict[str, bool] = {"dry": True, "wet": False}
 
     @property
     def rooms_history(self) -> dict[str, dict[str, str]]:
@@ -275,6 +279,20 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
     def selected_rooms(self) -> list[str]:
         """Card-level set of rooms queued to clean (shared across devices)."""
         return sorted(self._selected_rooms)
+
+    @property
+    def view_layers(self) -> dict[str, bool]:
+        """Shared dry/wet layer visibility for the card (synced across devices)."""
+        return dict(self._view_layers)
+
+    def set_layers(self, dry: bool | None = None, wet: bool | None = None) -> None:
+        """Mutate the shared layer visibility (anyvac.set_layers)."""
+        if dry is not None:
+            self._view_layers["dry"] = bool(dry)
+        if wet is not None:
+            self._view_layers["wet"] = bool(wet)
+        self._layers_store.async_delay_save(lambda: dict(self._view_layers), 2)
+        self.async_update_listeners()
 
     def set_selection(self, rooms: list[str], mode: str = "set") -> None:
         """Mutate the shared room selection. mode: set / add / remove / toggle / clear."""
@@ -323,6 +341,11 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         old = rec.get(kind)
         if old is None:
             new = measured
+        elif measured >= 1.5 * old:
+            # A completed clean covered far MORE than the baseline → the baseline was
+            # poisoned (learned from an old partial run). Upward corrections jump
+            # directly: a genuine full clean can never be smaller than an observed one.
+            new = measured
         elif measured >= 0.5 * old:
             new = round(0.6 * old + 0.4 * measured)
         else:
@@ -367,12 +390,14 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
 
         cleaning = bool(device.data.get("in_cleaning"))
         transit = bool(device.data.get("transit"))
+        vacuuming = bool(device.data.get("vacuuming"))
 
         # Segmented dry trace (docs/14 §3.9): append the new trajectory points only when
-        # the robot is genuinely cleaning — transit / mop-wash / goto driving must not
-        # render (or count) as the dry layer. The wet layer needs no segmentation: the
-        # parser's mop_path is recorded only while the mop is actually down.
-        if cleaning and not transit and new_by_layer["dry"]:
+        # the robot is genuinely cleaning AND vacuuming (suction on) — transit / mop-wash
+        # / goto driving and mop-only passes must not render (or count) as the dry layer.
+        # The wet layer needs no segmentation: the parser's mop_path is recorded only
+        # while the mop is actually down.
+        if cleaning and not transit and vacuuming and new_by_layer["dry"]:
             self._dry_path.setdefault(duid, []).extend(new_by_layer["dry"])
 
         if not cleaning or transit:
@@ -401,12 +426,16 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     continue
                 for nm, lx, ly, hx, hy in boxes:
                     if lx <= x <= hx and ly <= y <= hy:
-                        cset = cells_all.setdefault(nm, {"dry": set(), "wet": set()}).setdefault(layer, set())
-                        cset.add((int((x - lx) // COVERAGE_CELL_MM), int((y - ly) // COVERAGE_CELL_MM)))
-                        # Time weighting from the trajectory (dry) layer only — the mop
-                        # trace mirrors the same physical movement.
+                        # Time weighting comes from the trajectory ("dry" source layer =
+                        # the robot's movement) regardless of the clean type; the DRY
+                        # COVERAGE however only accrues while actually vacuuming, so a
+                        # mop-only pass doesn't fill the dry gauge.
                         if layer == "dry":
                             weights[nm] = weights.get(nm, 0) + 1
+                            if not vacuuming:
+                                break
+                        cset = cells_all.setdefault(nm, {"dry": set(), "wet": set()}).setdefault(layer, set())
+                        cset.add((int((x - lx) // COVERAGE_CELL_MM), int((y - ly) // COVERAGE_CELL_MM)))
                         break
 
         if last is None:
@@ -548,6 +577,16 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     if ct in ("dry", "wet")
                     else None
                 )
+                # Implausibly small baseline (poisoned by an old partial run) must not
+                # trivially pass the coverage gate — ignore it (same rule as _norm).
+                bbox_total = None
+                rmeta = next((r for r in device.data.get("rooms", []) if r.get("name") == nm), None)
+                if rmeta and None not in (rmeta.get("x0"), rmeta.get("y0"), rmeta.get("x1"), rmeta.get("y1")):
+                    bbox_total = max(1, int(abs(rmeta["x1"] - rmeta["x0"]) // COVERAGE_CELL_MM) + 1) * max(
+                        1, int(abs(rmeta["y1"] - rmeta["y0"]) // COVERAGE_CELL_MM) + 1
+                    )
+                if base and bbox_total and base < 0.2 * bbox_total:
+                    base = None
                 rec: dict[str, Any] = {"active_min": active_min, "cells": cells, "baseline": base}
                 if ct not in ("dry", "wet"):
                     rec["accepted"], rec["reason"] = False, "clean_type not dry/wet"
@@ -617,6 +656,12 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         sel = await self._sel_store.async_load()
         if isinstance(sel, list):
             self._selected_rooms = {str(r) for r in sel}
+        lay = await self._layers_store.async_load()
+        if isinstance(lay, dict):
+            self._view_layers = {
+                "dry": bool(lay.get("dry", True)),
+                "wet": bool(lay.get("wet", False)),
+            }
         cov = await self._cov_store.async_load()
         if isinstance(cov, dict):
             self._cov_baseline = {
@@ -706,9 +751,11 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
 
             def _norm(visited: int, kind: str) -> tuple[int | None, bool]:
                 """Normalised %: against the learned full-clean baseline once it exists,
-                else the raw bounding-box % (flagged as still calibrating)."""
+                else the raw bounding-box % (flagged as still calibrating). A baseline
+                below 20 % of the bbox is implausible (poisoned by an old partial run)
+                and is ignored until a completed clean re-learns it."""
                 b = base.get(kind)
-                if b:
+                if b and (not total or b >= 0.2 * total):
                     return min(100, round(100 * visited / b)), False
                 if total:
                     return (round(100 * visited / total) if visited else 0), True
@@ -874,6 +921,14 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         data["clean_type"] = (
             "wet" if water_active and (attached is None or bool(attached)) else "dry"
         )
+        # Is the robot actually VACUUMING (suction on)? A mop-only pass (fan "off")
+        # must not paint the dry layer / dry coverage (docs/16 field finding: an S8
+        # wet clean filled dry cells because its trajectory was counted as dry).
+        fan_name = _s("fan_speed_name")
+        if fan_name is not None:
+            data["vacuuming"] = str(fan_name).lower() not in ("off", "none", "closed")
+        else:
+            data["vacuuming"] = data["clean_type"] == "dry"
         vr = data.get("vacuum_room")
         if vr is not None and not data.get("vacuum_room_name"):
             data["vacuum_room_name"] = names.get(vr)
