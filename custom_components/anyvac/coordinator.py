@@ -474,9 +474,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         if not cleaning:
             prev = self._confirmed_room.get(duid)
             if prev and self._was_cleaning.get(duid):
-                self._stamp_history(
-                    prev, self._session_clean_type.get(duid) or device.data.get("clean_type")
-                )
+                self._stamp_room(duid, prev)
                 self.hass.bus.async_fire(
                     f"{DOMAIN}_room_done",
                     {"vacuum": device.name, "duid": duid, "room": prev, "reason": "docked"},
@@ -497,9 +495,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             self._confirmed_room[duid] = raw
             self._session_confirmed.setdefault(duid, set()).add(raw)
             if prev:
-                self._stamp_history(
-                    prev, self._session_clean_type.get(duid) or device.data.get("clean_type")
-                )
+                self._stamp_room(duid, prev)
                 self.hass.bus.async_fire(
                     f"{DOMAIN}_room_done",
                     {"vacuum": device.name, "duid": duid, "room": prev, "reason": "left"},
@@ -563,55 +559,52 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             cleaned_names = {
                 seg_names.get(str(s)) for s in device.data.get("cleaned_rooms") or []
             } - {None}
+            # Which KIND(S) a room calibrates is decided by EVIDENCE (its dry/wet cells),
+            # never by the water-mode signal — an S7 dry pass once reported clean_type=wet
+            # and poisoned the wet estimate table. Wet cells only exist while the mop is
+            # physically down; dry cells only while suction is on. A combined pass
+            # rightfully learns the same minutes into BOTH tables.
             calibrated: dict[str, dict[str, Any]] = {}
             calib_rooms: dict[str, dict[str, Any]] = {}
             for nm, sec in sorted((self._room_elapsed.get(duid) or {}).items()):
                 active_min = round(sec / 60)
-                cells = (
-                    len((self._room_cells.get(duid, {}).get(nm) or {}).get(ct, set()))
-                    if ct in ("dry", "wet")
-                    else 0
-                )
-                base = (
-                    ((self._cov_baseline.get(duid) or {}).get(nm) or {}).get(ct)
-                    if ct in ("dry", "wet")
-                    else None
-                )
-                # Implausibly small baseline (poisoned by an old partial run) must not
-                # trivially pass the coverage gate — ignore it (same rule as _norm).
+                rc = self._room_cells.get(duid, {}).get(nm) or {}
+                completed = nm in cleaned_names or nm in confirmed
                 bbox_total = None
                 rmeta = next((r for r in device.data.get("rooms", []) if r.get("name") == nm), None)
                 if rmeta and None not in (rmeta.get("x0"), rmeta.get("y0"), rmeta.get("x1"), rmeta.get("y1")):
                     bbox_total = max(1, int(abs(rmeta["x1"] - rmeta["x0"]) // COVERAGE_CELL_MM) + 1) * max(
                         1, int(abs(rmeta["y1"] - rmeta["y0"]) // COVERAGE_CELL_MM) + 1
                     )
-                if base and bbox_total and base < 0.2 * bbox_total:
-                    base = None
-                rec: dict[str, Any] = {"active_min": active_min, "cells": cells, "baseline": base}
-                if ct not in ("dry", "wet"):
-                    rec["accepted"], rec["reason"] = False, "clean_type not dry/wet"
-                elif nm not in cleaned_names and nm not in confirmed:
-                    rec["accepted"], rec["reason"] = False, "not completed (transit only?)"
-                elif base and cells < 0.7 * base:
-                    rec["accepted"], rec["reason"] = False, f"coverage {cells}/{base} < 70% of baseline"
-                elif not (1 <= active_min <= 180):
-                    rec["accepted"], rec["reason"] = False, "active time out of 1-180 min range"
-                else:
-                    before, after = self._learn_estimate(duid, nm, ct, active_min)
-                    if after is not None:
-                        rec["accepted"], rec["reason"] = True, "ok"
-                        rec["before"], rec["after"] = before, after
-                        calibrated[nm] = {"before": before, "after": after}
+                room_rec: dict[str, Any] = {"active_min": active_min}
+                for kind in ("dry", "wet"):
+                    cells = len(rc.get(kind) or set())
+                    base = ((self._cov_baseline.get(duid) or {}).get(nm) or {}).get(kind)
+                    # Implausibly small baseline (poisoned by an old partial run) must
+                    # not trivially pass the coverage gate — ignore it (same as _norm).
+                    if base and bbox_total and base < 0.2 * bbox_total:
+                        base = None
+                    krec: dict[str, Any] = {"cells": cells, "baseline": base}
+                    if cells < 3:
+                        krec["accepted"], krec["reason"] = False, "no evidence of this kind"
+                    elif not completed:
+                        krec["accepted"], krec["reason"] = False, "not completed (transit only?)"
+                    elif base and cells < 0.7 * base:
+                        krec["accepted"], krec["reason"] = False, f"coverage {cells}/{base} < 70% of baseline"
+                    elif not (1 <= active_min <= 180):
+                        krec["accepted"], krec["reason"] = False, "active time out of 1-180 min range"
                     else:
-                        rec["accepted"], rec["reason"] = False, "rejected by learner"
-                calib_rooms[nm] = rec
+                        before, after = self._learn_estimate(duid, nm, kind, active_min)
+                        if after is not None:
+                            krec["accepted"], krec["reason"] = True, "ok"
+                            krec["before"], krec["after"] = before, after
+                            calibrated.setdefault(nm, {})[kind] = {"before": before, "after": after}
+                        else:
+                            krec["accepted"], krec["reason"] = False, "rejected by learner"
+                    room_rec[kind] = krec
+                calib_rooms[nm] = room_rec
             if calibrated:
                 event["calibrated"] = calibrated
-                if len(calibrated) == 1:
-                    only = next(iter(calibrated))  # backward-compatible single-room fields
-                    event["calibrated_room"] = only
-                    event["estimate_before"] = calibrated[only]["before"]
-                    event["estimate_after"] = calibrated[only]["after"]
             self._last_calib[duid] = {
                 "at": dt_util.utcnow().isoformat(timespec="seconds"),
                 "clean_type": ct,
@@ -690,16 +683,22 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
     def _history_for_save(self) -> dict[str, dict[str, str]]:
         return self._history
 
-    def _stamp_history(self, name: str | None, ctype: str | None) -> None:
-        """Record that `name` was cleaned now, with the given clean type, keyed by room
+    def _stamp_room(self, duid: str, name: str | None) -> None:
+        """Record that `name` was cleaned now — the dry/wet kinds are decided by
+        EVIDENCE (this session's coverage cells), not by the water-mode signal, which
+        can lie (field finding: an S7 dry pass reported clean_type=wet and stamped the
+        wrong kind). Wet cells only exist while the mop is physically engaged; dry
+        cells only while suction is on — so the cells are ground truth. Keyed by room
         NAME so history aggregates across all vacuums. Persisted across restarts."""
         if not name:
             return
+        cells = (self._room_cells.get(duid) or {}).get(name) or {}
         now = dt_util.utcnow().isoformat()
         rec = self._history.setdefault(name, {})
         rec["any"] = now
-        if ctype in ("dry", "wet"):
-            rec[ctype] = now
+        for kind in ("dry", "wet"):
+            if len(cells.get(kind) or ()) >= 3:  # a couple of stray points don't count
+                rec[kind] = now
         self._store.async_delay_save(self._history_for_save, 5)
 
     def _update_history(self, device: AnyVacDevice) -> None:
@@ -718,9 +717,8 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         seg_to_name = {
             str(r.get("segment_id")): r.get("name") for r in device.data.get("rooms", [])
         }
-        ctype = self._session_clean_type.get(device.duid) or device.data.get("clean_type")
         for seg in device.data.get("cleaned_rooms") or []:
-            self._stamp_history(seg_to_name.get(str(seg)), ctype)
+            self._stamp_room(device.duid, seg_to_name.get(str(seg)))
 
     def _build_progress(self, device: AnyVacDevice) -> dict[str, dict[str, Any]]:
         """Merge per-room spatial coverage with the time-ratio into one debug payload:

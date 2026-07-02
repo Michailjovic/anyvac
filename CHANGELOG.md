@@ -4,6 +4,22 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0] - 2026-07-02
+
+### Fixed
+
+- **Dry/wet is now decided by EVIDENCE, not by the water-mode signal.** Field finding:
+  an S7 dry pass (orchestrated, mop intensity set to "off") still reported
+  `clean_type: wet` — so its room got a WET history stamp (the dry age never updated on
+  the card) and 3 minutes of dry cleaning were learned into the WET estimate table.
+  History stamps and calibration now derive the kind from the session's coverage cells:
+  wet cells only exist while the mop is physically engaged, dry cells only while suction
+  is on (0.14.0), so the cells are ground truth. A room stamps/learns "dry" only with
+  dry evidence, "wet" only with wet evidence — and a genuine combined pass correctly
+  learns the same minutes into both tables. `calib_debug.rooms` is now per-kind
+  (`{room: {active_min, dry: {...}, wet: {...}}}`); `anyvac_clean_finished.calibrated`
+  is likewise nested per kind, and the legacy single-room fields were dropped.
+
 ## [0.14.0] - 2026-07-02
 
 Field-test fixes from the first 0.13.0 runs + shared layer visibility.
