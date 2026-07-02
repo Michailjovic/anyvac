@@ -332,34 +332,22 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         rec[kind] = max(1, int(new))
         self._cov_store.async_delay_save(lambda: self._cov_baseline, 5)
 
-    def _accumulate_elapsed(self, device: AnyVacDevice) -> None:
-        """Add the per-poll time delta to the room the vacuum is currently cleaning, so
-        the debug gauge can show a time-ratio (elapsed / learned estimate)."""
+    def _attribute_points(self, device: AnyVacDevice) -> None:
+        """Point-weighted attribution (docs/16 §3).
+
+        Slice the newly-added trajectory points per layer, assign each point to the
+        SMALLEST room bbox containing it, then (a) mark that room's coverage cell and
+        (b) split this poll's time delta across rooms in proportion to their new
+        cleaning points. The 30 s polling interval stops mattering for accuracy: the
+        trajectory is dense (recorded continuously by the firmware), we only read it
+        in snapshots. A poll with no new points (paused / stuck) attributes nothing,
+        so pauses fall out automatically; transit states attribute nothing either.
+        """
         duid = device.duid
         now = dt_util.utcnow()
         last = self._last_poll.get(duid)
         self._last_poll[duid] = now
-        # Transit/self-service states (mop wash, bin empty, returning): the robot is not
-        # cleaning the room it is in — freeze the per-room clock (docs/13 A2).
-        if not device.data.get("in_cleaning") or device.data.get("transit") or last is None:
-            return
-        delta = (now - last).total_seconds()
-        if delta <= 0 or delta > 600:  # ignore restarts / large gaps
-            return
-        # Only the CONFIRMED room (debounced) — never the raw current room — so merely
-        # driving through a room on the way elsewhere does not accrue time to it.
-        room = self._confirmed_room.get(duid)
-        if room:
-            e = self._room_elapsed.setdefault(duid, {})
-            e[room] = e.get(room, 0.0) + delta
 
-    def _accumulate_coverage(self, device: AnyVacDevice) -> None:
-        """Attribute the newly-added trajectory points to the room the robot is currently
-        CONFIRMED to be cleaning, separately for the dry (vacuum) and wet (mop) traces.
-        Only points falling inside that room's bounding box are counted, so driving through
-        other rooms (e.g. returning to wash the mop) does not inflate their coverage. A
-        room therefore only accumulates coverage while it is the active target."""
-        duid = device.duid
         seen = self._path_seen.setdefault(duid, {"dry": 0, "wet": 0})
         layers = (("dry", "_path_dry"), ("wet", "_path_wet"))
 
@@ -389,29 +377,49 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
 
         if not cleaning or transit:
             return
-        room = self._confirmed_room.get(duid)
-        if not room:
-            return
-        box = None
+
+        # Room boxes sorted smallest-first: a point inside overlapping bboxes belongs
+        # to the most specific (smallest) room.
+        boxes: list[tuple[str, float, float, float, float]] = []
         for r in device.data.get("rooms", []):
-            if r.get("name") == room:
-                x0, y0, x1, y1 = r.get("x0"), r.get("y0"), r.get("x1"), r.get("y1")
-                if None not in (x0, y0, x1, y1):
-                    box = (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
-                break
-        if box is None:
+            nm = r.get("name")
+            x0, y0, x1, y1 = r.get("x0"), r.get("y0"), r.get("x1"), r.get("y1")
+            if not nm or None in (x0, y0, x1, y1):
+                continue
+            boxes.append((nm, min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)))
+        boxes.sort(key=lambda b: (b[3] - b[1]) * (b[4] - b[2]))
+        if not boxes:
             return
-        lx, ly, hx, hy = box
-        cells = self._room_cells.setdefault(duid, {}).setdefault(room, {"dry": set(), "wet": set()})
+
+        cells_all = self._room_cells.setdefault(duid, {})
+        weights: dict[str, int] = {}
         for layer, _dkey in layers:
-            cset = cells.setdefault(layer, set())
             for p in new_by_layer[layer]:
                 x = p.get("x")
                 y = p.get("y")
                 if x is None or y is None:
                     continue
-                if lx <= x <= hx and ly <= y <= hy:
-                    cset.add((int((x - lx) // COVERAGE_CELL_MM), int((y - ly) // COVERAGE_CELL_MM)))
+                for nm, lx, ly, hx, hy in boxes:
+                    if lx <= x <= hx and ly <= y <= hy:
+                        cset = cells_all.setdefault(nm, {"dry": set(), "wet": set()}).setdefault(layer, set())
+                        cset.add((int((x - lx) // COVERAGE_CELL_MM), int((y - ly) // COVERAGE_CELL_MM)))
+                        # Time weighting from the trajectory (dry) layer only — the mop
+                        # trace mirrors the same physical movement.
+                        if layer == "dry":
+                            weights[nm] = weights.get(nm, 0) + 1
+                        break
+
+        if last is None:
+            return
+        delta = (now - last).total_seconds()
+        if delta <= 0 or delta > 600:  # ignore restarts / large gaps
+            return
+        total = sum(weights.values())
+        if not total:
+            return  # no new cleaning points this poll → no time attributed
+        e = self._room_elapsed.setdefault(duid, {})
+        for nm, w in weights.items():
+            e[nm] = e.get(nm, 0.0) + delta * (w / total)
 
     def _detect_room_done(self, device: AnyVacDevice) -> None:
         """Fire anyvac_room_done when a vacuum has truly finished and left a room.
@@ -513,50 +521,75 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 "rooms": rooms,
                 "duration_min": duration_min,
             }
-            # A single-room clean is a clean calibration sample: learn that room+type's
-            # real duration and report the change (before -> after) on the event so a
-            # notification can say "estimate went from X to Y". Use the *confirmed*
-            # (debounced) rooms, not every transiently reported one, so a brief boundary
-            # cross into a neighbour does not disqualify a genuine single-room clean.
-            confirmed = sorted(self._session_confirmed.get(duid, set()))
-            # Calibrate from ACTIVE cleaning time (sum of in-cleaning poll deltas), not the
-            # wall-clock session duration, so pauses / stuck time are excluded.
-            active_s = self._room_elapsed.get(duid, {}).get(confirmed[0]) if len(confirmed) == 1 else None
-            active_min = round(active_s / 60) if active_s else None
-            wrote = False
-            before: float | None = None
-            after: float | None = None
-            if len(confirmed) == 1 and active_min:
-                before, after = self._learn_estimate(duid, confirmed[0], ct, active_min)
-                if after is not None:
-                    wrote = True
-                    event["calibrated_room"] = confirmed[0]
-                    event["estimate_before"] = before
-                    event["estimate_after"] = after
+            # Continuous calibration (docs/16 §4): EVERY completed room of the session is
+            # a sample — a single-room clean is just the trivial case. A room counts as
+            # completed when the firmware lists it in cleaned_rooms OR it was confirmed
+            # (debounced) during the session; the coverage gate (vs the learned full-clean
+            # baseline) rejects partially cleaned rooms, and the point-weighted active
+            # time already excludes pauses, transit and mop washes.
+            confirmed = set(self._session_confirmed.get(duid, set()))
+            seg_names = {
+                str(r.get("segment_id")): r.get("name") for r in device.data.get("rooms", [])
+            }
+            cleaned_names = {
+                seg_names.get(str(s)) for s in device.data.get("cleaned_rooms") or []
+            } - {None}
+            calibrated: dict[str, dict[str, Any]] = {}
+            calib_rooms: dict[str, dict[str, Any]] = {}
+            for nm, sec in sorted((self._room_elapsed.get(duid) or {}).items()):
+                active_min = round(sec / 60)
+                cells = (
+                    len((self._room_cells.get(duid, {}).get(nm) or {}).get(ct, set()))
+                    if ct in ("dry", "wet")
+                    else 0
+                )
+                base = (
+                    ((self._cov_baseline.get(duid) or {}).get(nm) or {}).get(ct)
+                    if ct in ("dry", "wet")
+                    else None
+                )
+                rec: dict[str, Any] = {"active_min": active_min, "cells": cells, "baseline": base}
+                if ct not in ("dry", "wet"):
+                    rec["accepted"], rec["reason"] = False, "clean_type not dry/wet"
+                elif nm not in cleaned_names and nm not in confirmed:
+                    rec["accepted"], rec["reason"] = False, "not completed (transit only?)"
+                elif base and cells < 0.7 * base:
+                    rec["accepted"], rec["reason"] = False, f"coverage {cells}/{base} < 70% of baseline"
+                elif not (1 <= active_min <= 180):
+                    rec["accepted"], rec["reason"] = False, "active time out of 1-180 min range"
+                else:
+                    before, after = self._learn_estimate(duid, nm, ct, active_min)
+                    if after is not None:
+                        rec["accepted"], rec["reason"] = True, "ok"
+                        rec["before"], rec["after"] = before, after
+                        calibrated[nm] = {"before": before, "after": after}
+                    else:
+                        rec["accepted"], rec["reason"] = False, "rejected by learner"
+                calib_rooms[nm] = rec
+            if calibrated:
+                event["calibrated"] = calibrated
+                if len(calibrated) == 1:
+                    only = next(iter(calibrated))  # backward-compatible single-room fields
+                    event["calibrated_room"] = only
+                    event["estimate_before"] = calibrated[only]["before"]
+                    event["estimate_after"] = calibrated[only]["after"]
             self._last_calib[duid] = {
                 "at": dt_util.utcnow().isoformat(timespec="seconds"),
-                "confirmed_rooms": confirmed,
                 "clean_type": ct,
                 "duration_min": duration_min,
-                "active_min": active_min,
-                "wrote": wrote,
-                "before": before,
-                "after": after,
-                "reason": (
-                    "ok"
-                    if wrote
-                    else f"{len(confirmed)} confirmed rooms (need exactly 1)"
-                    if len(confirmed) != 1
-                    else "clean_type not dry/wet"
-                    if ct not in ("dry", "wet")
-                    else "active time out of 1-180 min range"
-                    if not (active_min and 1 <= active_min <= 180)
-                    else "rejected"
-                ),
+                "confirmed_rooms": sorted(confirmed),
+                "cleaned_rooms": sorted(cleaned_names),  # type: ignore[type-var]
+                "accepted": sorted(calibrated),
+                "rooms": calib_rooms,
             }
             # Learn each room's "full clean" coverage baseline from this session's cells.
+            # Only for COMPLETED rooms — with point-based attribution a drive-through
+            # room also collects a thin line of cells, and a first sample from that
+            # would poison its baseline (docs/13 B8).
             rooms_meta = {r.get("name"): r for r in device.data.get("rooms", [])}
             for rnm, cells in self._room_cells.get(duid, {}).items():
+                if rnm not in cleaned_names and rnm not in confirmed:
+                    continue
                 rmeta = rooms_meta.get(rnm) or {}
                 x0, y0, x1, y1 = rmeta.get("x0"), rmeta.get("y0"), rmeta.get("x1"), rmeta.get("y1")
                 total = None
@@ -727,8 +760,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     self._update_history(device)
                     self._detect_room_done(device)
                     self._track_and_emit(device)
-                    self._accumulate_elapsed(device)
-                    self._accumulate_coverage(device)
+                    self._attribute_points(device)
                     progress = self._build_progress(device)
                     for room in device.data.get("rooms", []):
                         rec = self._history.get(room.get("name")) or {}

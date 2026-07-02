@@ -4,6 +4,39 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0] - 2026-07-02
+
+Continuous time calibration (docs/16): every clean calibrates, polling stops mattering.
+
+### Changed
+
+- **Point-weighted time attribution.** Per-room elapsed time is no longer "the whole 30 s
+  poll goes to the confirmed room" — each poll's delta is split across rooms in proportion
+  to where the NEW trajectory points fell (smallest containing bbox wins on overlaps).
+  The trajectory is recorded continuously by the firmware, so accuracy no longer depends
+  on the 30 s polling interval, and the old 60 s confirmation debounce no longer eats the
+  start of every room (small rooms used to under-measure by up to a third). Polls with no
+  new points (paused / stuck) attribute nothing, so pauses fall out automatically.
+- **Coverage cells are attributed the same way** (point → its room), so the per-room
+  gauges start filling from the first poll instead of waiting ~60 s for room confirmation.
+  The room-done debounce remains — but only for the `anyvac_room_done` event.
+- **Continuous multi-room calibration.** Every COMPLETED room of every session is now a
+  calibration sample — a single-room clean is just the trivial case, not a ritual.
+  A room qualifies when the firmware lists it in `cleaned_rooms` or it was confirmed
+  during the session, its coverage reaches ≥70 % of the learned full-clean baseline
+  (partial cleans are rejected), and its point-weighted active time is 1–180 min.
+  `anyvac_clean_finished` gains `calibrated: {room: {before, after}}`; the old
+  single-room fields are kept when exactly one room calibrated.
+- **`calib_debug` v2**: per-room decisions (`{active_min, cells, baseline, accepted,
+  reason, before, after}`) so the Debug tab shows exactly why each room did or didn't
+  learn.
+- Coverage baselines are now learned only from completed rooms — a drive-through room's
+  thin trail of cells can no longer seed a poisoned baseline.
+
+### Fixed
+
+- `manifest.json` version now matches the release (0.12.x shipped stating 0.11.0).
+
 ## [0.12.0] - 2026-07-02
 
 Phase 1 of the backend-first canon (docs/14): the integration is now the single tracker
