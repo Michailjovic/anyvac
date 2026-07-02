@@ -93,6 +93,77 @@ def _decimate(points: list[Any], max_points: int) -> list[Any]:
     return points[::step]
 
 
+def _extract_debug(map_data: Any) -> dict[str, Any]:
+    """Debug exposure of so-far unadopted MapData fields (docs/17 §2) — for reverse
+    engineering which sources are worth adopting (goto/predicted path for transit
+    labeling, no-go areas for coverage totals, …). Everything defensive: a missing
+    field just reports 0 / []."""
+    out: dict[str, Any] = {}
+
+    # Navigation routes — the transit-labeling candidates.
+    for name in ("goto_path", "predicted_path"):
+        obj = getattr(map_data, name, None)
+        pts: list[dict[str, float]] = []
+        subpaths = getattr(obj, "path", None) if obj is not None else None
+        if subpaths:
+            for sub in subpaths:
+                for pt in sub:
+                    px = getattr(pt, "x", None)
+                    py = getattr(pt, "y", None)
+                    if px is not None and py is not None:
+                        pts.append({"x": px, "y": py})
+        out[f"{name}_points"] = len(pts)
+        out[name] = _decimate(pts, 60)
+
+    def _shape_list(attr: str) -> list[dict[str, float]]:
+        res: list[dict[str, float]] = []
+        for obj in getattr(map_data, attr, None) or []:
+            shape: dict[str, float] = {}
+            for k in ("x0", "y0", "x1", "y1", "x2", "y2", "x3", "y3", "x", "y"):
+                v = getattr(obj, k, None)
+                if v is not None:
+                    shape[k] = v
+            if shape:
+                res.append(shape)
+        return res
+
+    # NOTE: `walls` are USER-DRAWN virtual walls (differ per robot), not physical walls
+    # — physical structure lives in the image pixel grid (docs/17 §3).
+    out["walls"] = _shape_list("walls")
+    out["no_go_areas"] = _shape_list("no_go_areas")
+    out["no_mopping_areas"] = _shape_list("no_mopping_areas")
+    out["zones"] = _shape_list("zones")
+
+    obstacles: list[dict[str, Any]] = []
+    for ob in getattr(map_data, "obstacles", None) or []:
+        rec: dict[str, Any] = {}
+        for k in ("x", "y"):
+            v = getattr(ob, k, None)
+            if v is not None:
+                rec[k] = v
+        for k in ("type", "details"):
+            v = getattr(ob, k, None)
+            if v is not None:
+                rec[k] = str(v)
+        if rec:
+            obstacles.append(rec)
+    out["obstacles"] = obstacles[:30]
+    out["obstacles_count"] = len(obstacles)
+
+    # Presence/size probes for heavier structures.
+    for name in ("blocks", "carpet_map", "ignored_obstacles", "ignored_obstacles_with_photo"):
+        v = getattr(map_data, name, None)
+        try:
+            out[f"{name}_count"] = len(v) if v is not None else 0
+        except TypeError:
+            out[f"{name}_count"] = 1 if v is not None else 0
+    img = getattr(map_data, "image", None)
+    out["image_present"] = img is not None
+    out["image_data_type"] = type(getattr(img, "data", None)).__name__ if img is not None else None
+
+    return out
+
+
 def _extract_map(map_data: Any) -> dict[str, Any]:
     """Pull the fields the card needs out of a parser MapData object."""
     out: dict[str, Any] = {}
@@ -945,6 +1016,11 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             return None
 
         data = _extract_map(map_data)
+        try:
+            data["debug_map"] = _extract_debug(map_data)
+        except Exception as err:  # noqa: BLE001 - debug data must never break the update
+            _LOGGER.debug("AnyVac: debug extraction failed: %s", err)
+            data["debug_map"] = None
 
         # MapData.rooms carry no names; merge them from the home trait's room mapping.
         names: dict[int, str] = {}

@@ -4,6 +4,21 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.0] - 2026-07-02
+
+### Added
+
+- **`debug_map` attribute — reverse-engineering probe of unadopted MapData fields**
+  (docs/17). Exposes per vacuum: `goto_path` / `predicted_path` (counts + decimated
+  sample — candidates for exact transit labeling of mop-wash trips), `walls` (NOTE:
+  user-drawn VIRTUAL walls, not physical structure), `no_go_areas`,
+  `no_mopping_areas`, `zones` (candidates for subtracting blocked area from room
+  coverage totals), `obstacles` (positions + type), and presence/size probes for
+  `blocks`, `carpet_map`, ignored obstacles and the image pixel layer. Visible in the
+  card editor's Debug tab under Raw attributes; excluded from the recorder. Field data
+  from a regular clean (ideally with a mid-clean mop wash) will decide which of these
+  sources get adopted for transit labeling and analytics v2.
+
 ## [0.16.0] - 2026-07-02
 
 Refinements from the first full-apartment day of data.
