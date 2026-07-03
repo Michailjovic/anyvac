@@ -4,6 +4,18 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.1] - 2026-07-02
+
+### Added
+
+- **`debug_map` probe extended** after cross-checking the roborock integration's map
+  Options dialog: `cleaned_areas`, `no_carpet_areas`, `goto` target, and full
+  position/type lists for all four obstacle variants (`obstacles`,
+  `obstacles_with_photo`, `ignored_obstacles`, `ignored_obstacles_with_photo`).
+  Most importantly, `map_data_fields` and `image_fields` list every public field the
+  parser actually populates on the given model — the definitive reverse-engineering
+  inventory, no more guessing which data sources exist.
+
 ## [0.17.0] - 2026-07-02
 
 ### Added

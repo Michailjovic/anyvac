@@ -127,31 +127,39 @@ def _extract_debug(map_data: Any) -> dict[str, Any]:
                 res.append(shape)
         return res
 
-    # NOTE: `walls` are USER-DRAWN virtual walls (differ per robot), not physical walls
-    # — physical structure lives in the image pixel grid (docs/17 §3).
+    # NOTE: `walls` are USER-DRAWN virtual walls (differ per robot). Physical walls =
+    # the image pixel layer ("Show walls" render toggle draws them from pixels).
     out["walls"] = _shape_list("walls")
     out["no_go_areas"] = _shape_list("no_go_areas")
     out["no_mopping_areas"] = _shape_list("no_mopping_areas")
+    out["no_carpet_areas"] = _shape_list("no_carpet_areas")
     out["zones"] = _shape_list("zones")
+    out["cleaned_areas"] = _shape_list("cleaned_areas") or _shape_list("cleaned_area")
+    out["goto"] = _point(getattr(map_data, "goto", None))
 
-    obstacles: list[dict[str, Any]] = []
-    for ob in getattr(map_data, "obstacles", None) or []:
-        rec: dict[str, Any] = {}
-        for k in ("x", "y"):
-            v = getattr(ob, k, None)
-            if v is not None:
-                rec[k] = v
-        for k in ("type", "details"):
-            v = getattr(ob, k, None)
-            if v is not None:
-                rec[k] = str(v)
-        if rec:
-            obstacles.append(rec)
-    out["obstacles"] = obstacles[:30]
-    out["obstacles_count"] = len(obstacles)
+    def _obstacle_list(attr: str) -> list[dict[str, Any]]:
+        res: list[dict[str, Any]] = []
+        for ob in getattr(map_data, attr, None) or []:
+            rec: dict[str, Any] = {}
+            for k in ("x", "y"):
+                v = getattr(ob, k, None)
+                if v is not None:
+                    rec[k] = v
+            for k in ("type", "details"):
+                v = getattr(ob, k, None)
+                if v is not None:
+                    rec[k] = str(v)
+            if rec:
+                res.append(rec)
+        return res
+
+    for attr in ("obstacles", "obstacles_with_photo", "ignored_obstacles", "ignored_obstacles_with_photo"):
+        obs = _obstacle_list(attr)
+        out[attr] = obs[:30]
+        out[f"{attr}_count"] = len(obs)
 
     # Presence/size probes for heavier structures.
-    for name in ("blocks", "carpet_map", "ignored_obstacles", "ignored_obstacles_with_photo"):
+    for name in ("blocks", "carpet_map"):
         v = getattr(map_data, name, None)
         try:
             out[f"{name}_count"] = len(v) if v is not None else 0
@@ -160,6 +168,26 @@ def _extract_debug(map_data: Any) -> dict[str, Any]:
     img = getattr(map_data, "image", None)
     out["image_present"] = img is not None
     out["image_data_type"] = type(getattr(img, "data", None)).__name__ if img is not None else None
+
+    # Field inventory — the definitive ground truth: every public, non-callable field
+    # the parser actually carries on THIS model. Ends the guesswork about what exists.
+    def _fields(obj: Any) -> list[str]:
+        names: list[str] = []
+        for k in dir(obj):
+            if k.startswith("_"):
+                continue
+            try:
+                v = getattr(obj, k)
+            except Exception:  # noqa: BLE001 - a raising property is still a field
+                names.append(k + "!")
+                continue
+            if callable(v):
+                continue
+            names.append(k)
+        return sorted(names)
+
+    out["map_data_fields"] = _fields(map_data)
+    out["image_fields"] = _fields(img) if img is not None else []
 
     return out
 
