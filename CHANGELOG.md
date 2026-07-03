@@ -4,6 +4,33 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.2] - 2026-07-03
+
+### Added
+
+- **`debug_map.watermarks`** — goto/predicted navigation paths are transient (cleared
+  once the robot arrives), so a manual post-clean dump always shows 0 (confirmed in the
+  field). The coordinator now remembers the last non-empty sighting per vacuum
+  (point count, timestamp, robot state, sample), so one regular clean definitively
+  answers whether the firmware publishes navigation routes usable for transit labeling.
+- **`debug_map.carpet_map_sample`** — coordinates of the cells the robot classifies as
+  carpet (ultrasonic models; S7 reported 8 in a carpet-free flat, so these are false
+  positives — mats, thresholds or glossy tiles — and the positions will identify the
+  culprit).
+
+### Field findings (2026-07-03, full-apartment day — no code impact)
+
+- Continuous multi-room calibration validated: one 53-min 4-room dry session calibrated
+  3 rooms; transit-only rooms rejected. Estimates converged to the observed times
+  (23:09/23:00). Evidence-based typing kept wet timestamps intact through dry cleans;
+  the dock-trip gate correctly withheld the Kitchen stamp and room_done during an S8
+  wash trip.
+- `map_data_fields` inventory identical across S6/S7/S8; `cleaned_areas` does NOT exist
+  as a vector field (the "Cleaned area" drawable renders from image pixels);
+  `image.data` is a full image object + `additional_layers` — room pixel MASKS are
+  feasible via the parser's deterministic segment palette (docs/17 §3). S7 reports
+  `carpet_map_count: 8`.
+
 ## [0.17.1] - 2026-07-02
 
 ### Added

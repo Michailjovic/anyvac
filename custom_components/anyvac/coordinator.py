@@ -159,12 +159,30 @@ def _extract_debug(map_data: Any) -> dict[str, Any]:
         out[f"{attr}_count"] = len(obs)
 
     # Presence/size probes for heavier structures.
-    for name in ("blocks", "carpet_map"):
+    for name in ("blocks",):
         v = getattr(map_data, name, None)
         try:
             out[f"{name}_count"] = len(v) if v is not None else 0
         except TypeError:
             out[f"{name}_count"] = 1 if v is not None else 0
+
+    # Carpet detection (ultrasonic models, e.g. S7): cells the ROBOT believes are
+    # carpet — false positives (mats, thresholds, glossy tiles) are common, so the
+    # coordinates matter more than the count.
+    carpet = getattr(map_data, "carpet_map", None)
+    try:
+        out["carpet_map_count"] = len(carpet) if carpet is not None else 0
+    except TypeError:
+        out["carpet_map_count"] = 1 if carpet is not None else 0
+    carpet_sample: list[Any] = []
+    if carpet:
+        try:
+            for item in list(carpet)[:30]:
+                p = _point(item)
+                carpet_sample.append(p if p is not None else str(item))
+        except TypeError:
+            carpet_sample = [str(carpet)[:200]]
+    out["carpet_map_sample"] = carpet_sample
     img = getattr(map_data, "image", None)
     out["image_present"] = img is not None
     out["image_data_type"] = type(getattr(img, "data", None)).__name__ if img is not None else None
@@ -353,6 +371,11 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # same way as the room selection). Persisted across restarts.
         self._layers_store: Store = Store(hass, 1, f"{DOMAIN}_view_layers")
         self._view_layers: dict[str, bool] = {"dry": True, "wet": False}
+        # Debug watermarks (docs/17 §2): goto/predicted paths are TRANSIENT — they only
+        # exist while the robot navigates and are gone by the time anyone reads the
+        # sensor manually. Remember the last non-empty sighting per vacuum so a regular
+        # clean answers "does the firmware publish them?" without manual timing.
+        self._debug_seen: dict[str, dict[str, Any]] = {}
 
     @property
     def rooms_history(self) -> dict[str, dict[str, str]]:
@@ -976,6 +999,20 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     _LOGGER.debug("AnyVac: failed reading a Roborock coordinator: %s", err)
                     continue
                 if device is not None:
+                    dbg = device.data.get("debug_map")
+                    if isinstance(dbg, dict):
+                        seen = self._debug_seen.setdefault(device.duid, {})
+                        for pname in ("goto_path", "predicted_path", "goto"):
+                            val = dbg.get(pname)
+                            n = dbg.get(f"{pname}_points", 1 if val else 0)
+                            if val and n:
+                                seen[pname] = {
+                                    "points": n,
+                                    "at": dt_util.utcnow().isoformat(timespec="seconds"),
+                                    "status_state": device.data.get("status_state"),
+                                    "sample": val[:20] if isinstance(val, list) else val,
+                                }
+                        dbg["watermarks"] = seen or None
                     self._update_history(device)
                     self._detect_room_done(device)
                     self._track_and_emit(device)
