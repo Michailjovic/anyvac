@@ -93,6 +93,72 @@ def _decimate(points: list[Any], max_points: int) -> list[Any]:
     return points[::step]
 
 
+def _solve_affine(calib: Any) -> tuple[float, float, float, float, float, float] | None:
+    """Solve the 2D affine transform mm→px from the parser's calibration points.
+
+    Kontrakt v2 (docs/14 §3.6): mm never leave the backend. The parser gives ≥3
+    (vacuum mm ↔ rendered-image px) pairs; solving `u = a·x + b·y + c`,
+    `v = d·x + e·y + f` from the first three yields the exact transform the card
+    used to compute client-side. Returns (a, b, c, d, e, f) or None.
+    """
+
+    def _xy(o: Any) -> tuple[float, float] | None:
+        if o is None:
+            return None
+        x = o.get("x") if isinstance(o, dict) else getattr(o, "x", None)
+        y = o.get("y") if isinstance(o, dict) else getattr(o, "y", None)
+        if x is None or y is None:
+            return None
+        return float(x), float(y)
+
+    pts: list[tuple[float, float, float, float]] = []
+    for cp in calib or []:
+        v = cp.get("vacuum") if isinstance(cp, dict) else getattr(cp, "vacuum", None)
+        m = cp.get("map") if isinstance(cp, dict) else getattr(cp, "map", None)
+        vxy, mxy = _xy(v), _xy(m)
+        if vxy is None or mxy is None:
+            continue
+        pts.append((vxy[0], vxy[1], mxy[0], mxy[1]))
+        if len(pts) == 3:
+            break
+    if len(pts) < 3:
+        return None
+    (x1, y1, u1, v1), (x2, y2, u2, v2), (x3, y3, u3, v3) = pts
+    det = x1 * (y2 - y3) - y1 * (x2 - x3) + (x2 * y3 - x3 * y2)
+    if abs(det) < 1e-9:
+        return None
+
+    def _cramer(r1: float, r2: float, r3: float) -> tuple[float, float, float]:
+        a = (r1 * (y2 - y3) - y1 * (r2 - r3) + (r2 * y3 - r3 * y2)) / det
+        b = (x1 * (r2 - r3) - r1 * (x2 - x3) + (x2 * r3 - x3 * r2)) / det
+        c = (x1 * (y2 * r3 - y3 * r2) - y1 * (x2 * r3 - x3 * r2) + r1 * (x2 * y3 - x3 * y2)) / det
+        return a, b, c
+
+    a, b, c = _cramer(u1, u2, u3)
+    d, e, f = _cramer(v1, v2, v3)
+    return (a, b, c, d, e, f)
+
+
+def _px_point(
+    p: dict[str, float] | None, aff: tuple[float, float, float, float, float, float]
+) -> dict[str, float] | None:
+    """Transform one {x, y[, a]} mm point into rendered-image px space. The angle
+    ``a`` is passed through unchanged (it is a heading, not a coordinate)."""
+    if p is None:
+        return None
+    x, y = p.get("x"), p.get("y")
+    if x is None or y is None:
+        return None
+    a, b, c, d, e, f = aff
+    out: dict[str, float] = {
+        "x": round(a * x + b * y + c, 1),
+        "y": round(d * x + e * y + f, 1),
+    }
+    if p.get("a") is not None:
+        out["a"] = p["a"]
+    return out
+
+
 def _extract_debug(map_data: Any) -> dict[str, Any]:
     """Debug exposure of so-far unadopted MapData fields (docs/17 §2) — for reverse
     engineering which sources are worth adopting (goto/predicted path for transit
@@ -434,6 +500,33 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             _prune(self._cov_baseline)
             self._cov_store.async_delay_save(lambda: self._cov_baseline, 2)
         self.async_update_listeners()
+
+    def pct_to_mm(self, duid: str, x_pct: float, y_pct: float) -> tuple[int, int] | None:
+        """Convert a click given as PERCENT of the rendered map image into vacuum mm.
+
+        Kontrakt v2 (docs/14 §3.6): the card sends clicks as image percentages to
+        ``anyvac.goto`` / ``anyvac.zone_clean``; the pct→px→mm conversion lives here.
+        Returns (x_mm, y_mm) or None when the vacuum/calibration is unavailable.
+        """
+        device = (self.data or {}).get(duid)
+        if device is None:
+            return None
+        aff = _solve_affine(device.data.get("calibration_points"))
+        dims = device.data.get("image_dims") or {}
+        width, height = dims.get("width"), dims.get("height")
+        scale = dims.get("scale") or 1
+        if aff is None or not width or not height:
+            return None
+        # Percent → rendered-image px (the same px space as calibration_points).
+        u = x_pct / 100.0 * width * scale
+        v = y_pct / 100.0 * height * scale
+        a, b, c, d, e, f = aff
+        det = a * e - b * d
+        if abs(det) < 1e-12:
+            return None
+        x = (e * (u - c) - b * (v - f)) / det
+        y = (-d * (u - c) + a * (v - f)) / det
+        return round(x), round(y)
 
     @property
     def view_layers(self) -> dict[str, bool]:
@@ -803,6 +896,12 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 self._selected_rooms -= set(rooms)
                 self._sel_store.async_delay_save(lambda: sorted(self._selected_rooms), 2)
             self._session_rooms[duid] = set()
+            # Clear the live per-room session accumulators NOW (calibration + baseline
+            # learning above already consumed them). Without this, rooms_progress kept
+            # showing residual transit percentages (e.g. "Kitchen 9 %" from the drive
+            # home through it) until the NEXT session started — stale gauges on the card.
+            self._room_elapsed[duid] = {}
+            self._room_cells[duid] = {}
         self._was_cleaning[duid] = cleaning
 
     async def _async_setup(self) -> None:
@@ -1043,6 +1142,42 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     device.data["path_wet"] = device.data.get("mop_path")
                     device.data["duid"] = device.duid
                     device.data["calib_debug"] = self._last_calib.get(device.duid)
+                    # Kontrakt v2 (docs/14 §3.6 + §5): geometry additionally in rendered
+                    # image PIXELS so the card never has to do mm math again. The mm
+                    # attributes stay in parallel until Fáze 3 removes the card's use.
+                    aff = _solve_affine(device.data.get("calibration_points"))
+                    device.data["schema_version"] = 2
+                    if aff is not None:
+                        device.data["vacuum_position_px"] = _px_point(
+                            device.data.get("vacuum_position"), aff
+                        )
+                        device.data["charger_px"] = _px_point(device.data.get("charger"), aff)
+                        device.data["path_dry_px"] = [
+                            q for p in device.data.get("path_dry") or [] if (q := _px_point(p, aff))
+                        ]
+                        device.data["path_wet_px"] = [
+                            q for p in device.data.get("path_wet") or [] if (q := _px_point(p, aff))
+                        ]
+                        for room in device.data.get("rooms", []):
+                            p0 = _px_point({"x": room.get("x0"), "y": room.get("y0")}, aff)
+                            p1 = _px_point({"x": room.get("x1"), "y": room.get("y1")}, aff)
+                            if p0 and p1:
+                                # Normalise after the transform — the y axis flips.
+                                room["bbox_px"] = {
+                                    "x0": min(p0["x"], p1["x"]),
+                                    "y0": min(p0["y"], p1["y"]),
+                                    "x1": max(p0["x"], p1["x"]),
+                                    "y1": max(p0["y"], p1["y"]),
+                                }
+                            else:
+                                room["bbox_px"] = None
+                    else:
+                        device.data["vacuum_position_px"] = None
+                        device.data["charger_px"] = None
+                        device.data["path_dry_px"] = []
+                        device.data["path_wet_px"] = []
+                        for room in device.data.get("rooms", []):
+                            room["bbox_px"] = None
                     result[device.duid] = device
 
         # Observability (docs/13 B6): a vacuum we used to read suddenly yields no map
@@ -1060,6 +1195,16 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             _LOGGER.info("AnyVac: map data restored for all known vacuums.")
             self._pipeline_warned = False
         self._known_duids |= set(result)
+        # Kontrakt v2 (docs/14 §5, docs/13 B6): the piggyback must not die silently —
+        # expose pipeline health on every sensor so the card can show a warning.
+        err_txt = (
+            "no map data for previously seen vacuum(s): " + ", ".join(sorted(missing))
+            if missing
+            else None
+        )
+        for device in result.values():
+            device.data["pipeline_ok"] = not missing
+            device.data["pipeline_error"] = err_txt
         return result
 
     def _extract_device(self, coord: Any) -> AnyVacDevice | None:
@@ -1112,7 +1257,13 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # (docs/14 rule 4). ``transit`` = in a self-service/driving state.
         state_name = _s("state_name") or getattr(_s("state"), "name", None)
         data["status_state"] = state_name
-        data["transit"] = state_name in TRANSIT_STATES if state_name else False
+        # ``transit`` is a *session* concept (mid-clean self-service driving). Outside a
+        # cleaning session it must read False — a docked robot is "charging" which is in
+        # TRANSIT_STATES, and the dangling True after a clean confused the card's debug
+        # view (stale flags). All consumers already condition on in_cleaning.
+        data["transit"] = bool(
+            data["in_cleaning"] and state_name and state_name in TRANSIT_STATES
+        )
         water_name = _s("water_mode_name")
         data["mop_signal"] = {
             "fan_power": _s("fan_power"),
@@ -1139,7 +1290,11 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # must not paint the dry layer / dry coverage (docs/16 field finding: an S8
         # wet clean filled dry cells because its trajectory was counted as dry).
         fan_name = _s("fan_speed_name")
-        if fan_name is not None:
+        if not data["in_cleaning"]:
+            # Same session-gating as ``transit``: a docked robot still reports its last
+            # fan speed, which is not "vacuuming".
+            data["vacuuming"] = False
+        elif fan_name is not None:
             data["vacuuming"] = str(fan_name).lower() not in ("off", "none", "closed")
         else:
             data["vacuuming"] = data["clean_type"] == "dry"

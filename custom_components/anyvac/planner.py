@@ -1,0 +1,308 @@
+"""Server-side clean planning (kontrakt v2, docs/14 §3.7).
+
+The card sends an INTENT (rooms + mode + optional restrictions/settings) to
+``anyvac.clean``; everything the card used to compute client-side — capability
+detection, LPT assignment, segment resolution, dry→wet gating, per-room pinning —
+is built here from the coordinator's own data. The output is the same task list
+format the proven ``run_job`` executor consumes, so execution semantics are
+identical to the field-tested card plans.
+
+Room keys are Roborock-app room names (canon rule 5); internal matching against
+the robot maps goes through ``segment_id``.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr, entity_registry as er
+
+from .const import ROBOROCK_DOMAIN
+
+_LOGGER = logging.getLogger(__name__)
+
+# Weight used for LPT balancing when no learned estimate exists yet. Minimum load
+# per room is 1 so a fresh install still round-robins instead of collapsing onto
+# the first capable robot (same rule as the card's _assignByCap).
+DEFAULT_ROOM_MIN = 15.0
+
+
+def vacuum_entity_for_duid(hass: HomeAssistant, duid: str) -> str | None:
+    """vacuum.* entity of the Roborock device with this duid (device registry)."""
+    device = dr.async_get(hass).async_get_device(identifiers={(ROBOROCK_DOMAIN, duid)})
+    if device is None:
+        return None
+    for ent in er.async_entries_for_device(er.async_get(hass), device.id):
+        if ent.domain == "vacuum" and not ent.disabled_by:
+            return ent.entity_id
+    return None
+
+
+def duid_for_entity(hass: HomeAssistant, entity_id: str) -> str | None:
+    """Roborock duid for any entity belonging to the vacuum's device."""
+    ent = er.async_get(hass).async_get(entity_id)
+    if ent is None or not ent.device_id:
+        return None
+    device = dr.async_get(hass).async_get(ent.device_id)
+    if device is None:
+        return None
+    for domain, ident in device.identifiers:
+        if domain == ROBOROCK_DOMAIN:
+            return ident
+    return None
+
+
+def selects_for_duid(hass: HomeAssistant, duid: str) -> dict[str, str]:
+    """Mop-related select entities of the device: {mop_mode, mop_intensity}."""
+    out: dict[str, str] = {}
+    device = dr.async_get(hass).async_get_device(identifiers={(ROBOROCK_DOMAIN, duid)})
+    if device is None:
+        return out
+    for ent in er.async_entries_for_device(er.async_get(hass), device.id):
+        if ent.domain != "select" or ent.disabled_by:
+            continue
+        key = ent.translation_key or ""
+        if key in ("mop_mode", "mop_intensity"):
+            out.setdefault(key, ent.entity_id)
+            continue
+        # Fallback for entity-id based matching when no translation key is set.
+        for k in ("mop_mode", "mop_intensity"):
+            if k in ent.entity_id:
+                out.setdefault(k, ent.entity_id)
+    return out
+
+
+class CleanPlanner:
+    """Builds an executable task plan from a clean intent."""
+
+    def __init__(self, hass: HomeAssistant, coordinator: Any) -> None:
+        self.hass = hass
+        self.coord = coordinator
+        devices = coordinator.data or {}
+        # Per-duid room-name -> segment_id map (what each robot can actually clean).
+        self.segments: dict[str, dict[str, int]] = {}
+        for duid, dev in devices.items():
+            segs: dict[str, int] = {}
+            for r in dev.data.get("rooms", []):
+                if r.get("name") is not None and r.get("segment_id") is not None:
+                    segs[str(r["name"])] = int(r["segment_id"])
+            self.segments[duid] = segs
+        self.entity_of: dict[str, str | None] = {
+            duid: vacuum_entity_for_duid(hass, duid) for duid in devices
+        }
+        self.duid_of_entity: dict[str, str] = {
+            ent: duid for duid, ent in self.entity_of.items() if ent
+        }
+        self.devices = devices
+
+    # -- capabilities & estimates ------------------------------------------------
+
+    def _capable(self, duid: str, kind: str) -> bool:
+        """Intrinsic capability: everyone vacuums; wet needs an electronic water box."""
+        if kind == "dry":
+            return True
+        sig = (self.devices[duid].data.get("mop_signal")) or {}
+        return sig.get("water_box_mode") is not None or bool(sig.get("water_mode_name"))
+
+    def _estimate(self, duid: str, room: str, kind: str) -> float | None:
+        rec = ((self.coord.rooms_estimate.get(duid)) or {}).get(room) or {}
+        val = rec.get(kind) or rec.get("dry") or rec.get("wet")
+        return float(val) if val else None
+
+    def _resolve_duid(self, ref: str) -> str | None:
+        """Accept either a duid or any entity id of the vacuum."""
+        if ref in self.devices:
+            return ref
+        return self.duid_of_entity.get(ref) or duid_for_entity(self.hass, ref)
+
+    def _allowed(self, kind: str, vacuums: Any) -> set[str]:
+        """Apply the optional vacuum restriction (flat list or {dry: [], wet: []})."""
+        refs: list[str] | None = None
+        if isinstance(vacuums, dict):
+            refs = vacuums.get(kind)
+        elif isinstance(vacuums, list) and vacuums:
+            refs = vacuums
+        if not refs:
+            return set(self.devices)
+        out: set[str] = set()
+        for ref in refs:
+            duid = self._resolve_duid(str(ref))
+            if duid:
+                out.add(duid)
+        return out
+
+    # -- assignment ----------------------------------------------------------------
+
+    def assign(
+        self,
+        rooms: list[str],
+        kind: str,
+        vacuums: Any = None,
+        pin: dict[str, str] | None = None,
+    ) -> tuple[dict[str, list[str]], list[str]]:
+        """LPT greedy: biggest room first → least-loaded capable owner (mirrors the
+        card's proven _assignByCap). ``pin`` {room: vacuum} overrides the choice when
+        the pinned robot knows the room and is capable of the kind; otherwise that
+        room falls back to normal assignment. Returns (assignment, unassigned)."""
+        allowed = self._allowed(kind, vacuums)
+        cands = [d for d in self.devices if d in allowed and self._capable(d, kind)]
+        out: dict[str, list[str]] = {}
+        load: dict[str, float] = {d: 0.0 for d in cands}
+        unassigned: list[str] = []
+
+        def est_max(room: str) -> float:
+            vals = [v for d in cands if (v := self._estimate(d, room, kind))]
+            return max(vals) if vals else DEFAULT_ROOM_MIN
+
+        pins = pin or {}
+        for room in sorted(rooms, key=est_max, reverse=True):
+            owners = [d for d in cands if room in self.segments.get(d, {})]
+            pref = pins.get(room)
+            if pref:
+                pduid = self._resolve_duid(str(pref))
+                if pduid and pduid in cands and room in self.segments.get(pduid, {}):
+                    owners = [pduid]
+                else:
+                    _LOGGER.warning(
+                        "AnyVac clean: pin %s -> %s not applicable for %s pass; "
+                        "falling back to automatic assignment",
+                        room,
+                        pref,
+                        kind,
+                    )
+            if not owners:
+                unassigned.append(room)
+                continue
+            best = min(owners, key=lambda d: load.get(d, 0.0))
+            out.setdefault(best, []).append(room)
+            load[best] = load.get(best, 0.0) + max(
+                self._estimate(best, room, kind) or DEFAULT_ROOM_MIN, 1.0
+            )
+        return out, unassigned
+
+    # -- task building ---------------------------------------------------------------
+
+    def _settings_calls(
+        self, duid: str, kind: str, settings: dict[str, Any]
+    ) -> tuple[list[dict[str, str]], str | None]:
+        """Pre-clean selects + fan speed for one vacuum and kind. A dry pass forces
+        the mop intensity off (when the robot has that select), so a wet-capable
+        robot genuinely cleans dry — same rule the card applied."""
+        sels = selects_for_duid(self.hass, duid)
+        selects: list[dict[str, str]] = []
+        if kind == "wet":
+            if sels.get("mop_mode") and settings.get("mop_mode"):
+                selects.append(
+                    {"entity_id": sels["mop_mode"], "option": str(settings["mop_mode"])}
+                )
+            if sels.get("mop_intensity") and settings.get("mop_intensity"):
+                selects.append(
+                    {
+                        "entity_id": sels["mop_intensity"],
+                        "option": str(settings["mop_intensity"]),
+                    }
+                )
+        elif sels.get("mop_intensity"):
+            selects.append({"entity_id": sels["mop_intensity"], "option": "off"})
+        return selects, settings.get("fan_speed")
+
+    def build_tasks(
+        self,
+        rooms: list[str],
+        mode: str,
+        vacuums: Any = None,
+        pin: dict[str, str] | None = None,
+        settings: dict[str, Any] | None = None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Build the run_job task list + a human-readable plan summary.
+
+        Dry tasks start immediately. Wet tasks gate on the dry robot's per-room
+        ``anyvac_room_done`` (matched by duid + room name) and — when the same robot
+        also runs a dry pass — on its own session finishing. Repeat is passed to the
+        firmware in ``app_segment_clean`` (no dock-restart hacks, docs/14 §3.8).
+        """
+        settings = settings or {}
+        tasks: list[dict[str, Any]] = []
+        plan: dict[str, Any] = {"dry": {}, "wet": {}, "unassigned": {}}
+
+        dry_assign: dict[str, list[str]] = {}
+        if mode in ("dry", "both"):
+            dry_assign, dry_un = self.assign(rooms, "dry", vacuums, pin)
+            if dry_un:
+                plan["unassigned"]["dry"] = dry_un
+        room_dry_duid: dict[str, str] = {}
+        for i, (duid, rms) in enumerate(dry_assign.items()):
+            entity = self.entity_of.get(duid)
+            if not entity:
+                _LOGGER.warning("AnyVac clean: no vacuum entity for duid %s; skipping", duid)
+                continue
+            kind_settings = settings.get("dry") or {}
+            selects, fan = self._settings_calls(duid, "dry", kind_settings)
+            segs = [self.segments[duid][r] for r in rms]
+            repeat = max(1, int(kind_settings.get("repeat") or 1))
+            tasks.append(
+                {
+                    "id": f"dry{i}",
+                    "vacuum": entity,
+                    "selects": selects,
+                    "fan_speed": fan,
+                    "service": "vacuum.send_command",
+                    "service_data": {
+                        "entity_id": entity,
+                        "command": "app_segment_clean",
+                        "params": [{"segments": segs, "repeat": repeat}],
+                    },
+                }
+            )
+            plan["dry"][entity] = list(rms)
+            for r in rms:
+                room_dry_duid[r] = duid
+
+        if mode in ("wet", "both"):
+            wet_assign, wet_un = self.assign(rooms, "wet", vacuums, pin)
+            if wet_un:
+                plan["unassigned"]["wet"] = wet_un
+            for j, (duid, rms) in enumerate(wet_assign.items()):
+                entity = self.entity_of.get(duid)
+                if not entity:
+                    _LOGGER.warning(
+                        "AnyVac clean: no vacuum entity for duid %s; skipping", duid
+                    )
+                    continue
+                kind_settings = settings.get("wet") or {}
+                selects, fan = self._settings_calls(duid, "wet", kind_settings)
+                segs = [self.segments[duid][r] for r in rms]
+                repeat = max(1, int(kind_settings.get("repeat") or 1))
+                after: list[dict[str, Any]] = []
+                if mode == "both":
+                    # Release the wet pass per room done by the DRY robot; a
+                    # both-capable robot additionally waits for its own dry session.
+                    after = [
+                        {"duid": room_dry_duid[r], "room": r}
+                        for r in rms
+                        if r in room_dry_duid
+                    ]
+                    if duid in dry_assign:
+                        after.append({"duid": duid})
+                tasks.append(
+                    {
+                        "id": f"wet{j}",
+                        "vacuum": entity,
+                        "selects": selects,
+                        "fan_speed": fan,
+                        "service": "vacuum.send_command",
+                        "service_data": {
+                            "entity_id": entity,
+                            "command": "app_segment_clean",
+                            "params": [{"segments": segs, "repeat": repeat}],
+                        },
+                        "after": after,
+                    }
+                )
+                plan["wet"][entity] = list(rms)
+
+        if not plan["unassigned"]:
+            plan.pop("unassigned")
+        return tasks, plan

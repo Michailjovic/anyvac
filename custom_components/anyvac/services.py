@@ -1,25 +1,23 @@
-"""AnyVac orchestration service: ``anyvac.run_job``.
+"""AnyVac services (kontrakt v2, docs/14 §5).
 
-The card builds an orchestration PLAN (it has the config, capabilities and per-room
-estimates) and hands it to this service as a list of tasks. The service executes the
-plan SERVER-SIDE — so it survives the dashboard being closed — and gates each task on
-the real-time ``anyvac_room_done`` / ``anyvac_clean_finished`` signals. That is how a
-wet robot is released to follow a dry robot per room without colliding.
+Public command interface for the card (and automations):
 
-A task::
+- ``anyvac.clean``      — clean intent: rooms + mode (+ vacuums / pin / settings).
+                          The backend plans (capability, LPT, pinning), builds the
+                          gated task list and executes it server-side.
+- ``anyvac.plan``       — the same planner, response-only (assignment preview).
+- ``anyvac.goto``       — pin & go; click as PERCENT of the map image, mm math here.
+- ``anyvac.zone_clean`` — zone clean; corners as percent, mm math here.
+- ``anyvac.cancel``     — tear down running jobs and send the started robots home.
+- ``anyvac.select_rooms`` / ``anyvac.set_layers`` / ``anyvac.reset_learning`` — state.
+- ``anyvac.run_job``    — INTERNAL executor (docs/14 §5: undocumented); kept
+                          registered for the transition period while the card still
+                          builds v1 plans, removed from docs in Fáze 3.
 
-    {
-        "id": "t2",                                  # optional, defaults to index
-        "vacuum": "vacuum.s8_maxv",                  # entity used for set_fan_speed
-        "selects": [{"entity_id": "select.x", "option": "off"}],  # pre-clean selects (mop)
-        "fan_speed": "max",                          # optional set_fan_speed before
-        "service": "vacuum.clean_area",              # the clean command to call
-        "service_data": {"entity_id": "...", "cleaning_area_id": [...]},
-        "after": [{"duid": "...", "room": "Kitchen"}]  # wait for these (room omitted = whole session)
-    }
-
-Tasks with no ``after`` run immediately; the rest run when every one of their
-conditions has been satisfied by an event.
+Execution model (proven in the field by the card-built v1 plans): a job is a list
+of tasks; a task with no ``after`` runs immediately, the rest run when all their
+``anyvac_room_done`` / ``anyvac_clean_finished`` conditions have fired. Starting a
+new job cancels the previous one (docs/13 C6 — no double-driving robots).
 """
 
 from __future__ import annotations
@@ -29,16 +27,37 @@ from typing import Any
 
 import voluptuous as vol
 
-from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.event import async_call_later
 
 from .const import DOMAIN
+from .planner import CleanPlanner, duid_for_entity, vacuum_entity_for_duid
 
 _LOGGER = logging.getLogger(__name__)
 
 SERVICE_RUN_JOB = "run_job"
 SERVICE_SELECT_ROOMS = "select_rooms"
 SERVICE_SET_LAYERS = "set_layers"
+SERVICE_RESET_LEARNING = "reset_learning"
+SERVICE_CLEAN = "clean"
+SERVICE_PLAN = "plan"
+SERVICE_GOTO = "goto"
+SERVICE_ZONE_CLEAN = "zone_clean"
+SERVICE_CANCEL = "cancel"
+
+ALL_SERVICES = (
+    SERVICE_RUN_JOB,
+    SERVICE_SELECT_ROOMS,
+    SERVICE_SET_LAYERS,
+    SERVICE_RESET_LEARNING,
+    SERVICE_CLEAN,
+    SERVICE_PLAN,
+    SERVICE_GOTO,
+    SERVICE_ZONE_CLEAN,
+    SERVICE_CANCEL,
+)
+
 JOB_TIMEOUT_SECONDS = 3 * 3600  # safety: tear down a stuck job after 3 h
 
 RUN_JOB_SCHEMA = vol.Schema({vol.Required("tasks"): [dict]})
@@ -56,7 +75,6 @@ SET_LAYERS_SCHEMA = vol.Schema(
         vol.Optional("wet"): bool,
     }
 )
-SERVICE_RESET_LEARNING = "reset_learning"
 RESET_LEARNING_SCHEMA = vol.Schema(
     {
         vol.Optional("duid"): str,
@@ -66,6 +84,75 @@ RESET_LEARNING_SCHEMA = vol.Schema(
         vol.Optional("baselines", default=True): bool,
     }
 )
+
+_SETTINGS_KIND_SCHEMA = vol.Schema(
+    {
+        vol.Optional("fan_speed"): str,
+        vol.Optional("mop_mode"): str,
+        vol.Optional("mop_intensity"): str,
+        vol.Optional("repeat"): vol.All(vol.Coerce(int), vol.Range(min=1, max=3)),
+    }
+)
+CLEAN_SCHEMA = vol.Schema(
+    {
+        vol.Required("rooms"): [str],
+        vol.Optional("mode", default="dry"): vol.In(["dry", "wet", "both"]),
+        vol.Optional("vacuums"): vol.Any(
+            [str],
+            vol.Schema({vol.Optional("dry"): [str], vol.Optional("wet"): [str]}),
+        ),
+        vol.Optional("pin"): {str: str},
+        vol.Optional("settings"): vol.Schema(
+            {
+                vol.Optional("dry"): _SETTINGS_KIND_SCHEMA,
+                vol.Optional("wet"): _SETTINGS_KIND_SCHEMA,
+            }
+        ),
+    }
+)
+GOTO_SCHEMA = vol.Schema(
+    {
+        vol.Optional("entity_id"): str,
+        vol.Optional("duid"): str,
+        vol.Required("x_pct"): vol.All(vol.Coerce(float), vol.Range(min=0, max=100)),
+        vol.Required("y_pct"): vol.All(vol.Coerce(float), vol.Range(min=0, max=100)),
+    }
+)
+ZONE_CLEAN_SCHEMA = vol.Schema(
+    {
+        vol.Optional("entity_id"): str,
+        vol.Optional("duid"): str,
+        vol.Required("x1_pct"): vol.All(vol.Coerce(float), vol.Range(min=0, max=100)),
+        vol.Required("y1_pct"): vol.All(vol.Coerce(float), vol.Range(min=0, max=100)),
+        vol.Required("x2_pct"): vol.All(vol.Coerce(float), vol.Range(min=0, max=100)),
+        vol.Required("y2_pct"): vol.All(vol.Coerce(float), vol.Range(min=0, max=100)),
+        vol.Optional("repeat", default=1): vol.All(vol.Coerce(int), vol.Range(min=1, max=3)),
+    }
+)
+CANCEL_SCHEMA = vol.Schema({vol.Optional("return_to_base", default=True): bool})
+
+
+def _coordinators(hass: HomeAssistant) -> list[Any]:
+    """All AnyVac coordinators (in practice one config entry)."""
+    out = []
+    for entry in hass.config_entries.async_entries(DOMAIN):
+        coord = getattr(entry, "runtime_data", None)
+        if coord is not None:
+            out.append(coord)
+    return out
+
+
+def _active_jobs(hass: HomeAssistant) -> list[_JobRunner]:
+    return hass.data.setdefault(DOMAIN, {}).setdefault("jobs", [])
+
+
+def _cancel_jobs(hass: HomeAssistant) -> set[str]:
+    """Tear down all running jobs; returns the vacuums whose tasks were started."""
+    started: set[str] = set()
+    for job in list(_active_jobs(hass)):
+        started |= job.started_vacuums
+        job.finish()
+    return started
 
 
 class _JobRunner:
@@ -78,10 +165,14 @@ class _JobRunner:
         }
         self.pending: set[str] = set(self.tasks)
         self.done: set[tuple[Any, Any]] = set()
+        # Vacuums whose clean command was actually dispatched — the set anyvac.cancel
+        # sends home (a never-started robot has nothing to return from).
+        self.started_vacuums: set[str] = set()
         self._unsub: list = []
         self._cancel_timeout = None
 
     async def start(self) -> None:
+        _active_jobs(self.hass).append(self)
         self._unsub.append(
             self.hass.bus.async_listen(f"{DOMAIN}_room_done", self._on_room_done)
         )
@@ -108,29 +199,44 @@ class _JobRunner:
                 except Exception as err:  # noqa: BLE001 - one bad task must not wedge the job
                     _LOGGER.warning("AnyVac run_job: task %s failed: %s", tid, err)
         if not self.pending:
-            self._finish()
+            self.finish()
 
     async def _run_task(self, task: dict[str, Any]) -> None:
+        # Pre-clean settings are best-effort: an unknown select option must not
+        # abort the clean command itself.
         for sel in task.get("selects") or []:
-            await self.hass.services.async_call(
-                "select",
-                "select_option",
-                {"entity_id": sel["entity_id"], "option": sel["option"]},
-                blocking=True,
-            )
+            try:
+                await self.hass.services.async_call(
+                    "select",
+                    "select_option",
+                    {"entity_id": sel["entity_id"], "option": sel["option"]},
+                    blocking=True,
+                )
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning(
+                    "AnyVac run_job: select %s -> %s failed: %s",
+                    sel.get("entity_id"),
+                    sel.get("option"),
+                    err,
+                )
         if task.get("fan_speed") and task.get("vacuum"):
-            await self.hass.services.async_call(
-                "vacuum",
-                "set_fan_speed",
-                {"entity_id": task["vacuum"], "fan_speed": task["fan_speed"]},
-                blocking=True,
-            )
+            try:
+                await self.hass.services.async_call(
+                    "vacuum",
+                    "set_fan_speed",
+                    {"entity_id": task["vacuum"], "fan_speed": task["fan_speed"]},
+                    blocking=True,
+                )
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning("AnyVac run_job: set_fan_speed failed: %s", err)
         service = task.get("service")
         if service and "." in service:
             domain, name = service.split(".", 1)
             await self.hass.services.async_call(
                 domain, name, dict(task.get("service_data") or {}), blocking=True
             )
+            if task.get("vacuum"):
+                self.started_vacuums.add(task["vacuum"])
 
     async def _on_room_done(self, event) -> None:
         self.done.add((event.data.get("duid"), event.data.get("room")))
@@ -147,69 +253,157 @@ class _JobRunner:
                 "AnyVac run_job: %d task(s) never became ready; cleaning up.",
                 len(self.pending),
             )
-        self._finish()
+        self.finish()
 
-    def _finish(self) -> None:
+    def finish(self) -> None:
+        """Stop listening and deregister (idempotent)."""
         for unsub in self._unsub:
             unsub()
         self._unsub = []
         if self._cancel_timeout is not None:
             self._cancel_timeout()
             self._cancel_timeout = None
+        jobs = _active_jobs(self.hass)
+        if self in jobs:
+            jobs.remove(self)
 
 
-def async_register_services(hass: HomeAssistant) -> None:
+async def _start_job(hass: HomeAssistant, tasks: list[dict[str, Any]]) -> None:
+    """Cancel any previous job (docs/13 C6: no parallel double-driving) and run."""
+    _cancel_jobs(hass)
+    runner = _JobRunner(hass, tasks)
+    await runner.start()
+
+
+def _resolve_target_duid(hass: HomeAssistant, call: ServiceCall) -> str:
+    duid = call.data.get("duid")
+    if not duid and call.data.get("entity_id"):
+        duid = duid_for_entity(hass, call.data["entity_id"])
+    if not duid:
+        raise HomeAssistantError(
+            "anyvac: provide either 'duid' or 'entity_id' of the target vacuum"
+        )
+    return duid
+
+
+def _mm_for(hass: HomeAssistant, duid: str, x_pct: float, y_pct: float) -> tuple[int, int]:
+    for coord in _coordinators(hass):
+        mm = coord.pct_to_mm(duid, x_pct, y_pct)
+        if mm is not None:
+            return mm
+    raise HomeAssistantError(
+        f"anyvac: no map/calibration available for vacuum '{duid}' — cannot convert "
+        "map percentages to coordinates"
+    )
+
+
+def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one registrar
     """Register the AnyVac services (idempotent)."""
-    if not hass.services.has_service(DOMAIN, SERVICE_RUN_JOB):
 
-        async def _handle_run_job(call: ServiceCall) -> None:
-            runner = _JobRunner(hass, list(call.data["tasks"]))
-            await runner.start()
+    async def _handle_run_job(call: ServiceCall) -> None:
+        await _start_job(hass, list(call.data["tasks"]))
 
-        hass.services.async_register(
-            DOMAIN, SERVICE_RUN_JOB, _handle_run_job, schema=RUN_JOB_SCHEMA
+    async def _handle_select_rooms(call: ServiceCall) -> None:
+        rooms = list(call.data.get("rooms", []))
+        mode = call.data.get("mode", "set")
+        for coord in _coordinators(hass):
+            coord.set_selection(rooms, mode)
+
+    async def _handle_set_layers(call: ServiceCall) -> None:
+        for coord in _coordinators(hass):
+            coord.set_layers(call.data.get("dry"), call.data.get("wet"))
+
+    async def _handle_reset_learning(call: ServiceCall) -> None:
+        for coord in _coordinators(hass):
+            coord.reset_learning(
+                duid=call.data.get("duid"),
+                room=call.data.get("room"),
+                kind=call.data.get("kind"),
+                estimates=call.data.get("estimates", True),
+                baselines=call.data.get("baselines", True),
+            )
+
+    def _build(call: ServiceCall) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        coords = _coordinators(hass)
+        if not coords:
+            raise HomeAssistantError("anyvac: integration is not set up")
+        planner = CleanPlanner(hass, coords[0])
+        tasks, plan = planner.build_tasks(
+            rooms=[str(r) for r in call.data["rooms"]],
+            mode=call.data.get("mode", "dry"),
+            vacuums=call.data.get("vacuums"),
+            pin=call.data.get("pin"),
+            settings=call.data.get("settings"),
+        )
+        return tasks, plan
+
+    async def _handle_clean(call: ServiceCall) -> None:
+        tasks, plan = _build(call)
+        if not tasks:
+            raise HomeAssistantError(
+                "anyvac.clean: no capable vacuum found for the requested rooms/mode "
+                f"(plan: {plan})"
+            )
+        _LOGGER.info("AnyVac clean: %s", plan)
+        await _start_job(hass, tasks)
+
+    async def _handle_plan(call: ServiceCall) -> dict[str, Any]:
+        tasks, plan = _build(call)
+        return {"plan": plan, "tasks": tasks}
+
+    async def _handle_goto(call: ServiceCall) -> None:
+        duid = _resolve_target_duid(hass, call)
+        x, y = _mm_for(hass, duid, call.data["x_pct"], call.data["y_pct"])
+        entity = call.data.get("entity_id") or vacuum_entity_for_duid(hass, duid)
+        if not entity:
+            raise HomeAssistantError(f"anyvac.goto: no vacuum entity for duid '{duid}'")
+        await hass.services.async_call(
+            "vacuum",
+            "send_command",
+            {"entity_id": entity, "command": "app_goto_target", "params": [x, y]},
+            blocking=True,
         )
 
-    if not hass.services.has_service(DOMAIN, SERVICE_SELECT_ROOMS):
-
-        async def _handle_select_rooms(call: ServiceCall) -> None:
-            rooms = list(call.data.get("rooms", []))
-            mode = call.data.get("mode", "set")
-            for entry in hass.config_entries.async_entries(DOMAIN):
-                coord = getattr(entry, "runtime_data", None)
-                if coord is not None:
-                    coord.set_selection(rooms, mode)
-
-        hass.services.async_register(
-            DOMAIN, SERVICE_SELECT_ROOMS, _handle_select_rooms, schema=SELECT_ROOMS_SCHEMA
+    async def _handle_zone_clean(call: ServiceCall) -> None:
+        duid = _resolve_target_duid(hass, call)
+        ax, ay = _mm_for(hass, duid, call.data["x1_pct"], call.data["y1_pct"])
+        bx, by = _mm_for(hass, duid, call.data["x2_pct"], call.data["y2_pct"])
+        entity = call.data.get("entity_id") or vacuum_entity_for_duid(hass, duid)
+        if not entity:
+            raise HomeAssistantError(
+                f"anyvac.zone_clean: no vacuum entity for duid '{duid}'"
+            )
+        zone = [min(ax, bx), min(ay, by), max(ax, bx), max(ay, by), call.data["repeat"]]
+        await hass.services.async_call(
+            "vacuum",
+            "send_command",
+            {"entity_id": entity, "command": "app_zoned_clean", "params": [zone]},
+            blocking=True,
         )
 
-    if not hass.services.has_service(DOMAIN, SERVICE_SET_LAYERS):
+    async def _handle_cancel(call: ServiceCall) -> None:
+        started = _cancel_jobs(hass)
+        if call.data.get("return_to_base", True) and started:
+            await hass.services.async_call(
+                "vacuum",
+                "return_to_base",
+                {"entity_id": sorted(started)},
+                blocking=False,
+            )
 
-        async def _handle_set_layers(call: ServiceCall) -> None:
-            for entry in hass.config_entries.async_entries(DOMAIN):
-                coord = getattr(entry, "runtime_data", None)
-                if coord is not None:
-                    coord.set_layers(call.data.get("dry"), call.data.get("wet"))
-
-        hass.services.async_register(
-            DOMAIN, SERVICE_SET_LAYERS, _handle_set_layers, schema=SET_LAYERS_SCHEMA
-        )
-
-    if not hass.services.has_service(DOMAIN, SERVICE_RESET_LEARNING):
-
-        async def _handle_reset_learning(call: ServiceCall) -> None:
-            for entry in hass.config_entries.async_entries(DOMAIN):
-                coord = getattr(entry, "runtime_data", None)
-                if coord is not None:
-                    coord.reset_learning(
-                        duid=call.data.get("duid"),
-                        room=call.data.get("room"),
-                        kind=call.data.get("kind"),
-                        estimates=call.data.get("estimates", True),
-                        baselines=call.data.get("baselines", True),
-                    )
-
-        hass.services.async_register(
-            DOMAIN, SERVICE_RESET_LEARNING, _handle_reset_learning, schema=RESET_LEARNING_SCHEMA
-        )
+    registrations: list[tuple[str, Any, vol.Schema, SupportsResponse]] = [
+        (SERVICE_RUN_JOB, _handle_run_job, RUN_JOB_SCHEMA, SupportsResponse.NONE),
+        (SERVICE_SELECT_ROOMS, _handle_select_rooms, SELECT_ROOMS_SCHEMA, SupportsResponse.NONE),
+        (SERVICE_SET_LAYERS, _handle_set_layers, SET_LAYERS_SCHEMA, SupportsResponse.NONE),
+        (SERVICE_RESET_LEARNING, _handle_reset_learning, RESET_LEARNING_SCHEMA, SupportsResponse.NONE),
+        (SERVICE_CLEAN, _handle_clean, CLEAN_SCHEMA, SupportsResponse.NONE),
+        (SERVICE_PLAN, _handle_plan, CLEAN_SCHEMA, SupportsResponse.ONLY),
+        (SERVICE_GOTO, _handle_goto, GOTO_SCHEMA, SupportsResponse.NONE),
+        (SERVICE_ZONE_CLEAN, _handle_zone_clean, ZONE_CLEAN_SCHEMA, SupportsResponse.NONE),
+        (SERVICE_CANCEL, _handle_cancel, CANCEL_SCHEMA, SupportsResponse.NONE),
+    ]
+    for name, handler, schema, supports in registrations:
+        if not hass.services.has_service(DOMAIN, name):
+            hass.services.async_register(
+                DOMAIN, name, handler, schema=schema, supports_response=supports
+            )

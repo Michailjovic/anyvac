@@ -4,6 +4,68 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.0] - 2026-07-04
+
+Fáze 2 of the backend-first canon (docs/14 §5): contract v2 on the backend. The card
+is intentionally unchanged — v1 (mm) attributes are published in parallel until the
+Fáze 3 frontend switch.
+
+### Added
+
+- **px-space geometry (docs/14 §3.6):** the sensor now additionally publishes
+  `schema_version: 2`, `vacuum_position_px`, `charger_px`, `path_dry_px`,
+  `path_wet_px` and `rooms[].bbox_px` — all in rendered-map-image pixels, computed
+  from the parser's calibration points via an exact 3-point affine solve (validated
+  against live S6 data with an exact round-trip). mm never needs to leave the
+  backend again; the mm attributes remain for the v1 card.
+- **`anyvac.clean`** — clean INTENT service: `rooms` + `mode` (dry/wet/both),
+  optional `vacuums` restriction (flat list or `{dry: [...], wet: [...]}`), per-room
+  pinning `pin: {room: vacuum}` (overrides the planner when the pinned robot knows
+  the room and is capable), and `settings: {dry/wet: {fan_speed, mop_mode,
+  mop_intensity, repeat}}`. The backend plans server-side: intrinsic capability
+  detection (wet = electronic water box present), LPT assignment weighted by the
+  learned per-vacuum estimates, segment resolution via `segment_id`, dry→wet gating
+  on per-room `anyvac_room_done`, dry passes force the mop intensity off, repeat
+  goes to the firmware inside `app_segment_clean` (no dock-restart hacks, §3.8).
+  Mirrors the field-proven card planner 1:1, executed by the same job runner.
+- **`anyvac.plan`** — response-only preview: returns the planned assignment
+  (`{dry: {vacuum: rooms}, wet: {...}, unassigned}`) and the task list without
+  executing anything.
+- **`anyvac.goto` / `anyvac.zone_clean`** — pin & go and zone cleaning with
+  coordinates as PERCENT of the map image (`x_pct`/`y_pct`); pct→px→mm conversion
+  happens in the backend (inverse of the calibration affine). Target vacuum by
+  `entity_id` or `duid` (resolved through the device registry).
+- **`anyvac.cancel`** — tears down all running jobs and (by default) sends the
+  robots whose tasks were already dispatched back to the dock. Starting a new
+  `anyvac.clean`/`run_job` now also cancels the previous job first (docs/13 C6 —
+  no more parallel jobs double-driving the same robots).
+- **`pipeline_ok` + `pipeline_error` attributes** (docs/13 B6): the piggyback
+  pipeline health is now visible on every sensor, not only in the log.
+
+### Changed
+
+- `anyvac.run_job` is now an INTERNAL executor under `anyvac.clean` (docs/14 §5);
+  it stays registered for the v1 card transition and disappears from docs in Fáze 3.
+- Pre-clean setting calls (mop selects, fan speed) are best-effort: an unknown
+  select option logs a warning instead of aborting the clean command.
+- Vacuum entity / mop select entities are resolved server-side from the device &
+  entity registries (no card-provided entity plumbing needed in v2).
+
+## [0.17.3] - 2026-07-04
+
+### Fixed
+
+- **Stale live data after docking:** `rooms_progress` kept showing residual
+  percentages collected during the drive home (e.g. "Kitchen 9 %" on S6 after the
+  2026-07-03 validation run) until the next session started. The per-room session
+  accumulators are now cleared right after session-end calibration and baseline
+  learning consume them.
+- **`transit` / `vacuuming` flags are session-gated:** a docked robot reported
+  `transit: true` (charging is a transit state) and `vacuuming: true` (last fan
+  speed still set) forever after a clean. Both now read `false` whenever
+  `in_cleaning` is false; all internal consumers already conditioned on it, so
+  this is purely an observability fix.
+
 ## [0.17.2] - 2026-07-03
 
 ### Added

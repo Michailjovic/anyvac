@@ -80,6 +80,8 @@ class AnyVacMapSensor(CoordinatorEntity[AnyVacCoordinator], SensorEntity):
             "path_points", "mop_path_points", "calib_debug", "selected_rooms",
             "rooms_progress", "path_dry", "path_dry_points", "path_wet",
             "status_state", "transit", "vacuuming", "view_layers", "debug_map",
+            "schema_version", "vacuum_position_px", "charger_px", "path_dry_px",
+            "path_wet_px", "pipeline_ok", "pipeline_error",
         }
     )
 
@@ -87,7 +89,6 @@ class AnyVacMapSensor(CoordinatorEntity[AnyVacCoordinator], SensorEntity):
         """Initialize the sensor."""
         super().__init__(coordinator)
         self._duid = duid
-        device = coordinator.data[duid]
         self._attr_unique_id = f"{duid}_anyvac_map"
         # Attach to the existing Roborock device so the entity shows up there.
         self._attr_device_info = {
