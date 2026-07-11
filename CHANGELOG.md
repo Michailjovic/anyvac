@@ -4,6 +4,27 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.0] - 2026-07-11
+
+Phase B (backend part) of the responsive rebuild (docs/18 §7e): shared per-room
+vacuum pins.
+
+### Added
+
+- **`anyvac.pin_room`** — `{room, vacuum?}`: pin a room to a specific vacuum
+  (entity_id or duid); omit `vacuum` to unpin. Pins are stored on the coordinator
+  (persisted across restarts) and shared across devices/browsers like the room
+  selection.
+- **`room_pins` sensor attribute** — the current pins, published on every AnyVac
+  map sensor next to `selected_rooms` (excluded from the recorder).
+- **Planner default pins:** `anyvac.clean` / `anyvac.plan` use the stored pins when
+  the call has no explicit `pin` parameter (an explicit `pin` wins outright). The
+  existing pin semantics apply — a pin only holds when the pinned robot knows the
+  room and is capable of the pass kind, otherwise assignment falls back with a
+  warning.
+- **One-shot lifecycle:** a room's pin is auto-cleared when that room's clean
+  finishes (same lifecycle as the selection auto-clear).
+
 ## [0.18.0] - 2026-07-04
 
 Fáze 2 of the backend-first canon (docs/14 §5): contract v2 on the backend. The card

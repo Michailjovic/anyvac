@@ -9,7 +9,8 @@ Public command interface for the card (and automations):
 - ``anyvac.goto``       — pin & go; click as PERCENT of the map image, mm math here.
 - ``anyvac.zone_clean`` — zone clean; corners as percent, mm math here.
 - ``anyvac.cancel``     — tear down running jobs and send the started robots home.
-- ``anyvac.select_rooms`` / ``anyvac.set_layers`` / ``anyvac.reset_learning`` — state.
+- ``anyvac.select_rooms`` / ``anyvac.pin_room`` / ``anyvac.set_layers`` /
+  ``anyvac.reset_learning`` — state.
 - ``anyvac.run_job``    — INTERNAL executor (docs/14 §5: undocumented); kept
                           registered for the transition period while the card still
                           builds v1 plans, removed from docs in Fáze 3.
@@ -38,6 +39,7 @@ _LOGGER = logging.getLogger(__name__)
 
 SERVICE_RUN_JOB = "run_job"
 SERVICE_SELECT_ROOMS = "select_rooms"
+SERVICE_PIN_ROOM = "pin_room"
 SERVICE_SET_LAYERS = "set_layers"
 SERVICE_RESET_LEARNING = "reset_learning"
 SERVICE_CLEAN = "clean"
@@ -49,6 +51,7 @@ SERVICE_CANCEL = "cancel"
 ALL_SERVICES = (
     SERVICE_RUN_JOB,
     SERVICE_SELECT_ROOMS,
+    SERVICE_PIN_ROOM,
     SERVICE_SET_LAYERS,
     SERVICE_RESET_LEARNING,
     SERVICE_CLEAN,
@@ -67,6 +70,13 @@ SELECT_ROOMS_SCHEMA = vol.Schema(
         vol.Optional("mode", default="set"): vol.In(
             ["set", "add", "remove", "toggle", "clear"]
         ),
+    }
+)
+PIN_ROOM_SCHEMA = vol.Schema(
+    {
+        vol.Required("room"): str,
+        # Vacuum entity_id or duid; omitted/empty = unpin the room.
+        vol.Optional("vacuum"): vol.Any(str, None),
     }
 )
 SET_LAYERS_SCHEMA = vol.Schema(
@@ -309,6 +319,10 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
         for coord in _coordinators(hass):
             coord.set_selection(rooms, mode)
 
+    async def _handle_pin_room(call: ServiceCall) -> None:
+        for coord in _coordinators(hass):
+            coord.set_room_pin(call.data["room"], call.data.get("vacuum"))
+
     async def _handle_set_layers(call: ServiceCall) -> None:
         for coord in _coordinators(hass):
             coord.set_layers(call.data.get("dry"), call.data.get("wet"))
@@ -328,11 +342,16 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
         if not coords:
             raise HomeAssistantError("anyvac: integration is not set up")
         planner = CleanPlanner(hass, coords[0])
+        # Stored per-room pins (anyvac.pin_room, docs/18 §7e) are the default;
+        # an explicit `pin` parameter on the call wins outright.
+        pin = call.data.get("pin")
+        if not pin:
+            pin = coords[0].room_pins or None
         tasks, plan = planner.build_tasks(
             rooms=[str(r) for r in call.data["rooms"]],
             mode=call.data.get("mode", "dry"),
             vacuums=call.data.get("vacuums"),
-            pin=call.data.get("pin"),
+            pin=pin,
             settings=call.data.get("settings"),
         )
         return tasks, plan
@@ -394,6 +413,7 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
     registrations: list[tuple[str, Any, vol.Schema, SupportsResponse]] = [
         (SERVICE_RUN_JOB, _handle_run_job, RUN_JOB_SCHEMA, SupportsResponse.NONE),
         (SERVICE_SELECT_ROOMS, _handle_select_rooms, SELECT_ROOMS_SCHEMA, SupportsResponse.NONE),
+        (SERVICE_PIN_ROOM, _handle_pin_room, PIN_ROOM_SCHEMA, SupportsResponse.NONE),
         (SERVICE_SET_LAYERS, _handle_set_layers, SET_LAYERS_SCHEMA, SupportsResponse.NONE),
         (SERVICE_RESET_LEARNING, _handle_reset_learning, RESET_LEARNING_SCHEMA, SupportsResponse.NONE),
         (SERVICE_CLEAN, _handle_clean, CLEAN_SCHEMA, SupportsResponse.NONE),

@@ -405,6 +405,13 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # devices and fed to the orchestrator. Persisted across restarts.
         self._sel_store: Store = Store(hass, 1, f"{DOMAIN}_selection")
         self._selected_rooms: set[str] = set()
+        # Per-room vacuum pins (docs/18 §7e): the user's "clean THIS room with THAT
+        # robot" overrides, {room_name: vacuum entity_id or duid}. Shared across
+        # devices like the selection; the planner uses them as the default `pin`
+        # (an explicit `pin` parameter on anyvac.clean wins). Auto-cleared per room
+        # when that room's clean finishes. Persisted across restarts.
+        self._pins_store: Store = Store(hass, 1, f"{DOMAIN}_room_pins")
+        self._room_pins: dict[str, str] = {}
         # Live per-room elapsed cleaning seconds this session (for the debug progress
         # gauge's time-ratio) + last poll timestamp to measure the per-poll delta.
         self._room_elapsed: dict[str, dict[str, float]] = {}
@@ -540,6 +547,21 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         if wet is not None:
             self._view_layers["wet"] = bool(wet)
         self._layers_store.async_delay_save(lambda: dict(self._view_layers), 2)
+        self.async_update_listeners()
+
+    @property
+    def room_pins(self) -> dict[str, str]:
+        """Per-room vacuum pins {room_name: vacuum ref} (docs/18 §7e)."""
+        return dict(self._room_pins)
+
+    def set_room_pin(self, room: str, vacuum: str | None = None) -> None:
+        """Pin a room to a vacuum (anyvac.pin_room); vacuum None/empty = unpin."""
+        room = str(room)
+        if vacuum:
+            self._room_pins[room] = str(vacuum)
+        else:
+            self._room_pins.pop(room, None)
+        self._pins_store.async_delay_save(lambda: dict(self._room_pins), 2)
         self.async_update_listeners()
 
     def set_selection(self, rooms: list[str], mode: str = "set") -> None:
@@ -895,6 +917,12 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             if rooms and self._selected_rooms & set(rooms):
                 self._selected_rooms -= set(rooms)
                 self._sel_store.async_delay_save(lambda: sorted(self._selected_rooms), 2)
+            # Pins are one-shot user overrides — clear them with the finished rooms
+            # (docs/18 §7e), same lifecycle as the selection auto-clear above.
+            if rooms and any(r in self._room_pins for r in rooms):
+                for r in rooms:
+                    self._room_pins.pop(r, None)
+                self._pins_store.async_delay_save(lambda: dict(self._room_pins), 2)
             self._session_rooms[duid] = set()
             # Clear the live per-room session accumulators NOW (calibration + baseline
             # learning above already consumed them). Without this, rooms_progress kept
@@ -912,6 +940,9 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         sel = await self._sel_store.async_load()
         if isinstance(sel, list):
             self._selected_rooms = {str(r) for r in sel}
+        pins = await self._pins_store.async_load()
+        if isinstance(pins, dict):
+            self._room_pins = {str(k): str(v) for k, v in pins.items() if v}
         lay = await self._layers_store.async_load()
         if isinstance(lay, dict):
             self._view_layers = {
