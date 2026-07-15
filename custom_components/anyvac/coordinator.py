@@ -93,6 +93,25 @@ def _decimate(points: list[Any], max_points: int) -> list[Any]:
     return points[::step]
 
 
+def _decimate_segments(segments: list[list[Any]], max_points: int) -> list[list[Any]]:
+    """Down-sample each segment independently, preserving the segment breaks.
+
+    Budget is split across segments proportional to their length so long segments
+    keep more detail. Never merges/reorders across segments — that would recreate
+    the exact straight-line-across-a-gap bug this segmentation exists to avoid.
+    """
+    total = sum(len(s) for s in segments)
+    if total <= max_points or max_points <= 0:
+        return segments
+    out: list[list[Any]] = []
+    for seg in segments:
+        if not seg:
+            continue
+        budget = max(1, round(len(seg) / total * max_points))
+        out.append(_decimate(seg, budget))
+    return out
+
+
 def _solve_affine(calib: Any) -> tuple[float, float, float, float, float, float] | None:
     """Solve the 2D affine transform mm→px from the parser's calibration points.
 
@@ -434,8 +453,21 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # Segmented DRY trace (docs/14 §3.9): the parser's ``path`` is the robot's FULL
         # trajectory (transit, mop-wash trips and goto included), so it must not be shown
         # as the "dry" layer directly. Only points recorded while actively cleaning and
-        # not in a TRANSIT state are appended here. {duid: [ {x, y}, ... ]}.
-        self._dry_path: dict[str, list[dict[str, float]]] = {}
+        # not in a TRANSIT state are appended here.
+        # Stored as a LIST OF SEGMENTS (not one flat list): every time the gate closes
+        # (transit / mop-wash / not-vacuuming) and reopens, a NEW segment starts. A flat
+        # list would splice the last kept point before a gap directly to the first kept
+        # point after it, and the card's single <polyline> would draw a straight line
+        # across the gap — visible as spurious diagonal streaks once a session has
+        # covered more than one room (bug found 2026-07-15: finished traces looked like
+        # scribbles while the live in-progress trace still looked clean).
+        # {duid: [ [ {x, y}, ... ], [ {x, y}, ... ], ... ]}.
+        self._dry_path: dict[str, list[list[dict[str, float]]]] = {}
+        # Whether the gate was open on the immediately preceding poll, per vacuum — tells
+        # `_attribute_points` whether new points continue the last segment or must start
+        # a fresh one. Not the same as "new points arrived": a poll with the gate open but
+        # zero new points (robot paused, suction still on) must NOT start a new segment.
+        self._dry_path_open: dict[str, bool] = {}
         # Pipeline observability (docs/13 B6): warn (once) when a previously seen vacuum
         # stops yielding map data — the roborock internals may have changed.
         self._known_duids: set[str] = set()
@@ -655,6 +687,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     rc[layer] = set()
                 if layer == "dry":
                     self._dry_path[duid] = []
+                    self._dry_path_open[duid] = False
             new_by_layer[layer] = full[start:]
             seen[layer] = len(full)
 
@@ -667,8 +700,17 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # / goto driving and mop-only passes must not render (or count) as the dry layer.
         # The wet layer needs no segmentation: the parser's mop_path is recorded only
         # while the mop is actually down.
-        if cleaning and not transit and vacuuming and new_by_layer["dry"]:
-            self._dry_path.setdefault(duid, []).extend(new_by_layer["dry"])
+        # Gate just closed→open (or first points ever): start a NEW segment so the gap
+        # left by the excluded points is never bridged by a straight line. Gate stayed
+        # open across this poll (even one with zero new points, e.g. a paused robot):
+        # keep extending the current segment.
+        gate_open = cleaning and not transit and vacuuming
+        if gate_open and new_by_layer["dry"]:
+            segs = self._dry_path.setdefault(duid, [])
+            if not self._dry_path_open.get(duid):
+                segs.append([])
+            segs[-1].extend(new_by_layer["dry"])
+        self._dry_path_open[duid] = gate_open
 
         if not cleaning or transit:
             return
@@ -798,6 +840,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 self._room_cells[duid] = {}
                 self._path_seen[duid] = {"dry": 0, "wet": 0}
                 self._dry_path[duid] = []
+                self._dry_path_open[duid] = False
                 self._session_start[duid] = dt_util.utcnow()
                 self.hass.bus.async_fire(
                     f"{DOMAIN}_clean_started",
@@ -1167,9 +1210,13 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     # Typed trace layers (docs/14 §3.9): path_dry = trajectory segmented
                     # to actual cleaning (no transit / mop-wash driving); path_wet = the
                     # mop trace. ``path`` (full trajectory) stays for backward compat.
-                    dry = self._dry_path.get(device.duid, [])
-                    device.data["path_dry"] = _decimate(dry, PATH_MAX_POINTS)
-                    device.data["path_dry_points"] = len(dry)
+                    # path_dry is a LIST OF SEGMENTS — each a contiguous run of points
+                    # with no excluded (transit/mop-wash) gap inside it — so the card can
+                    # draw one polyline per segment instead of bridging gaps with a
+                    # straight line (bug found 2026-07-15, see docs/14 §3.9 note above).
+                    dry_segs = self._dry_path.get(device.duid, [])
+                    device.data["path_dry"] = _decimate_segments(dry_segs, PATH_MAX_POINTS)
+                    device.data["path_dry_points"] = sum(len(s) for s in dry_segs)
                     device.data["path_wet"] = device.data.get("mop_path")
                     device.data["duid"] = device.duid
                     device.data["calib_debug"] = self._last_calib.get(device.duid)
@@ -1183,8 +1230,12 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                             device.data.get("vacuum_position"), aff
                         )
                         device.data["charger_px"] = _px_point(device.data.get("charger"), aff)
+                        # Segment-preserving px conversion: one sub-list per contiguous
+                        # dry run (drop segments that yield zero valid px points).
                         device.data["path_dry_px"] = [
-                            q for p in device.data.get("path_dry") or [] if (q := _px_point(p, aff))
+                            seg_px
+                            for seg in (device.data.get("path_dry") or [])
+                            if (seg_px := [q for p in seg if (q := _px_point(p, aff))])
                         ]
                         device.data["path_wet_px"] = [
                             q for p in device.data.get("path_wet") or [] if (q := _px_point(p, aff))

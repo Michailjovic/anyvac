@@ -4,6 +4,21 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.1] - 2026-07-15
+
+### Fixed
+
+- **Finished dry trace looked like a scribble** — `path_dry`/`path_dry_px` was a
+  single flat point list. Excluding transit/mop-wash points (docs/14 §3.9) leaves
+  gaps in the trajectory; the card drew it as one `<polyline>`, so the point right
+  before a gap got joined to the point right after it with a straight line. A live,
+  still-single-room trace never hit a gap and looked correct; a finished multi-room
+  session had one spurious diagonal line per room transition / mop-wash trip,
+  reading as chaos next to the clean in-progress trace. `path_dry`/`path_dry_px`
+  are now a **list of contiguous segments** — a new segment starts whenever the
+  dry gate (`cleaning and not transit and vacuuming`) closes and reopens — so a
+  gap is never bridged. `path_dry_points` now sums across segments.
+
 ## [0.19.0] - 2026-07-11
 
 Phase B (backend part) of the responsive rebuild (docs/18 §7e): shared per-room
