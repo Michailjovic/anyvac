@@ -4,6 +4,36 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.50.0] - 2026-07-15
+
+Sequence-aware orchestration (docs/19). Ships in lockstep with `anyvac-card`
+0.50.0 (the consolidated meta bar + landscape cockpit rebuild).
+
+### Added
+
+- **`room_sequence` coordinator state** — `{room_name: 1-based position}`,
+  mirroring the room order configured in the Roborock app. Field-confirmed:
+  the app's configured sequence is always dominant regardless of what order
+  HA sends segment ids in, so this is recorded as ground truth rather than
+  something the backend tries to control. Persisted across restarts and
+  shared across dashboards, following the same pattern as `room_pins` /
+  `view_layers`.
+- **`anyvac.set_room_sequence`** — `{rooms: [key, ...]}`: replaces the whole
+  sequence; position in the list = the sequence number. The card's new Maps
+  tab reorder list calls this on every drag-drop.
+- **`room_sequence` sensor attribute** — published on every AnyVac map
+  sensor (excluded from the recorder), read by the card's editor.
+- **Sequence-aware ETA in `anyvac.plan` / `anyvac.clean`** (`CleanPlanner._estimate_timeline`) —
+  per-robot cumulative dry time is now computed in the app's configured
+  sequence order (falling back to the end of the queue, flagged in the new
+  `unsequenced` plan field, for any room without a configured position), and
+  each room's wet pass is gated on that specific room's dry-finish time
+  rather than waiting for the whole dry batch. Response now includes
+  `eta_min`, `timeline` (per-room dry/wet finish times), and `unsequenced`.
+- **`tests/test_planner_timeline.py`** — first pytest suite for this
+  integration (5 tests covering single/multi-robot timelines, missing
+  sequence fallback, empty plans, and the no-estimate-yet default).
+
 ## [0.19.1] - 2026-07-15
 
 ### Fixed

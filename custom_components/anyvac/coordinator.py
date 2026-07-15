@@ -431,6 +431,17 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # when that room's clean finishes. Persisted across restarts.
         self._pins_store: Store = Store(hass, 1, f"{DOMAIN}_room_pins")
         self._room_pins: dict[str, str] = {}
+        # Room cleaning sequence (docs/19): the order configured in the Roborock app,
+        # which is dominant regardless of what order HA sends segment ids in — the
+        # firmware always visits rooms in this order (confirmed in the field across
+        # thousands of cleans). We don't control it, we just need to KNOW it so the
+        # planner can predict per-room dry-finish / wet-start timing instead of
+        # guessing. {room_name: 1-based position}. Backend-owned (not card config)
+        # for the same reason as room_pins: it's a physical fact, not a per-dashboard
+        # preference, and multiple cards/browsers would otherwise duplicate it.
+        # Persisted across restarts.
+        self._seq_store: Store = Store(hass, 1, f"{DOMAIN}_room_sequence")
+        self._room_sequence: dict[str, int] = {}
         # Live per-room elapsed cleaning seconds this session (for the debug progress
         # gauge's time-ratio) + last poll timestamp to measure the per-poll delta.
         self._room_elapsed: dict[str, dict[str, float]] = {}
@@ -594,6 +605,21 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         else:
             self._room_pins.pop(room, None)
         self._pins_store.async_delay_save(lambda: dict(self._room_pins), 2)
+        self.async_update_listeners()
+
+    @property
+    def room_sequence(self) -> dict[str, int]:
+        """Room cleaning order {room_name: 1-based position} (docs/19)."""
+        return dict(self._room_sequence)
+
+    def set_room_sequence(self, rooms: list[str]) -> None:
+        """Replace the whole sequence (anyvac.set_room_sequence) — the card sends the
+        complete reordered room list; position in the list = the sequence number.
+        A room omitted from a later call keeps whatever position it last had only if
+        it's still present in the new list; rooms not in ``rooms`` at all are dropped
+        from the map entirely (the editor always sends its full known room list)."""
+        self._room_sequence = {str(r): i + 1 for i, r in enumerate(rooms) if r}
+        self._seq_store.async_delay_save(lambda: dict(self._room_sequence), 2)
         self.async_update_listeners()
 
     def set_selection(self, rooms: list[str], mode: str = "set") -> None:
@@ -986,6 +1012,11 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         pins = await self._pins_store.async_load()
         if isinstance(pins, dict):
             self._room_pins = {str(k): str(v) for k, v in pins.items() if v}
+        seq = await self._seq_store.async_load()
+        if isinstance(seq, dict):
+            self._room_sequence = {
+                str(k): int(v) for k, v in seq.items() if isinstance(v, (int, float))
+            }
         lay = await self._layers_store.async_load()
         if isinstance(lay, dict):
             self._view_layers = {

@@ -82,6 +82,7 @@ class AnyVacMapSensor(CoordinatorEntity[AnyVacCoordinator], SensorEntity):
             "status_state", "transit", "vacuuming", "view_layers", "debug_map",
             "schema_version", "vacuum_position_px", "charger_px", "path_dry_px",
             "path_wet_px", "pipeline_ok", "pipeline_error", "room_pins",
+            "room_sequence",
         }
     )
 
@@ -123,6 +124,7 @@ class AnyVacMapSensor(CoordinatorEntity[AnyVacCoordinator], SensorEntity):
             "selected_rooms": self.coordinator.selected_rooms,
             "view_layers": self.coordinator.view_layers,
             "room_pins": self.coordinator.room_pins,
+            "room_sequence": self.coordinator.room_sequence,
         }
 
 

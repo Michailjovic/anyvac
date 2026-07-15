@@ -10,7 +10,7 @@ Public command interface for the card (and automations):
 - ``anyvac.zone_clean`` — zone clean; corners as percent, mm math here.
 - ``anyvac.cancel``     — tear down running jobs and send the started robots home.
 - ``anyvac.select_rooms`` / ``anyvac.pin_room`` / ``anyvac.set_layers`` /
-  ``anyvac.reset_learning`` — state.
+  ``anyvac.set_room_sequence`` / ``anyvac.reset_learning`` — state.
 - ``anyvac.run_job``    — INTERNAL executor (docs/14 §5: undocumented); kept
                           registered for the transition period while the card still
                           builds v1 plans, removed from docs in Fáze 3.
@@ -41,6 +41,7 @@ SERVICE_RUN_JOB = "run_job"
 SERVICE_SELECT_ROOMS = "select_rooms"
 SERVICE_PIN_ROOM = "pin_room"
 SERVICE_SET_LAYERS = "set_layers"
+SERVICE_SET_ROOM_SEQUENCE = "set_room_sequence"
 SERVICE_RESET_LEARNING = "reset_learning"
 SERVICE_CLEAN = "clean"
 SERVICE_PLAN = "plan"
@@ -53,6 +54,7 @@ ALL_SERVICES = (
     SERVICE_SELECT_ROOMS,
     SERVICE_PIN_ROOM,
     SERVICE_SET_LAYERS,
+    SERVICE_SET_ROOM_SEQUENCE,
     SERVICE_RESET_LEARNING,
     SERVICE_CLEAN,
     SERVICE_PLAN,
@@ -83,6 +85,14 @@ SET_LAYERS_SCHEMA = vol.Schema(
     {
         vol.Optional("dry"): bool,
         vol.Optional("wet"): bool,
+    }
+)
+SET_ROOM_SEQUENCE_SCHEMA = vol.Schema(
+    {
+        # Full ordered room-name list (position = 1-based sequence number). The
+        # editor always sends its complete known room list on reorder — this
+        # replaces the whole stored sequence, it does not merge.
+        vol.Required("rooms"): [str],
     }
 )
 RESET_LEARNING_SCHEMA = vol.Schema(
@@ -327,6 +337,11 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
         for coord in _coordinators(hass):
             coord.set_layers(call.data.get("dry"), call.data.get("wet"))
 
+    async def _handle_set_room_sequence(call: ServiceCall) -> None:
+        rooms = [str(r) for r in call.data.get("rooms", [])]
+        for coord in _coordinators(hass):
+            coord.set_room_sequence(rooms)
+
     async def _handle_reset_learning(call: ServiceCall) -> None:
         for coord in _coordinators(hass):
             coord.reset_learning(
@@ -415,6 +430,7 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
         (SERVICE_SELECT_ROOMS, _handle_select_rooms, SELECT_ROOMS_SCHEMA, SupportsResponse.NONE),
         (SERVICE_PIN_ROOM, _handle_pin_room, PIN_ROOM_SCHEMA, SupportsResponse.NONE),
         (SERVICE_SET_LAYERS, _handle_set_layers, SET_LAYERS_SCHEMA, SupportsResponse.NONE),
+        (SERVICE_SET_ROOM_SEQUENCE, _handle_set_room_sequence, SET_ROOM_SEQUENCE_SCHEMA, SupportsResponse.NONE),
         (SERVICE_RESET_LEARNING, _handle_reset_learning, RESET_LEARNING_SCHEMA, SupportsResponse.NONE),
         (SERVICE_CLEAN, _handle_clean, CLEAN_SCHEMA, SupportsResponse.NONE),
         (SERVICE_PLAN, _handle_plan, CLEAN_SCHEMA, SupportsResponse.ONLY),

@@ -182,6 +182,76 @@ class CleanPlanner:
             )
         return out, unassigned
 
+    # -- timing estimate (docs/19) ---------------------------------------------------
+
+    def _estimate_timeline(
+        self,
+        dry_assign: dict[str, list[str]],
+        wet_assign: dict[str, list[str]],
+    ) -> dict[str, Any]:
+        """Sequence-aware completion estimate.
+
+        The Roborock app's configured room order is dominant regardless of what
+        order HA sends segment ids in — the firmware always visits rooms in that
+        order (confirmed in the field across thousands of cleans, docs/19). We
+        don't control it, we just need to KNOW it: `coordinator.room_sequence` is
+        the user-maintained {room: 1-based position}. Rooms missing a position
+        sort after all sequenced ones (stable, so ties keep assignment order) —
+        the plan's ``unsequenced`` list flags them so the card can warn.
+
+        Replaces the old client-side estimate, which summed
+        ``max(any vacuum's room estimate)`` per room with no notion of sequence,
+        parallelism or dry→wet gating — for a room needing both passes it took
+        ``max(dry, wet)`` instead of ``dry + wet``, i.e. assumed a simultaneous
+        start that never happens.
+
+        Gating mirrors the REAL runtime gate (``anyvac_room_done`` is per room,
+        not "wait for the whole dry batch"): a wet room's start is the specific
+        dry-assigning robot's cumulative time up to (and including) that room,
+        not that robot's total dry session.
+        """
+        seq = self.coord.room_sequence or {}
+        unsequenced: set[str] = set()
+
+        def ordered(rooms: list[str]) -> list[str]:
+            def key(r: str) -> float:
+                if r not in seq:
+                    unsequenced.add(r)
+                return seq.get(r, float("inf"))
+            return sorted(rooms, key=key)
+
+        dry_robot_finish: dict[str, float] = {}
+        room_dry_finish: dict[str, float] = {}
+        for duid, rooms in dry_assign.items():
+            t = 0.0
+            for room in ordered(rooms):
+                t += self._estimate(duid, room, "dry") or DEFAULT_ROOM_MIN
+                room_dry_finish[room] = t
+            dry_robot_finish[duid] = t
+
+        wet_robot_finish: dict[str, float] = {}
+        room_wet_finish: dict[str, float] = {}
+        for duid, rooms in wet_assign.items():
+            own_dry_finish = dry_robot_finish.get(duid, 0.0) if duid in dry_assign else 0.0
+            t = 0.0
+            for room in ordered(rooms):
+                gate = room_dry_finish.get(room, 0.0)
+                start = max(t, gate, own_dry_finish)
+                t = start + (self._estimate(duid, room, "wet") or DEFAULT_ROOM_MIN)
+                room_wet_finish[room] = t
+            wet_robot_finish[duid] = t
+
+        eta = max(
+            [f for d, f in dry_robot_finish.items() if d not in wet_assign] +
+            list(wet_robot_finish.values()),
+            default=0.0,
+        )
+        return {
+            "eta_min": round(eta),
+            "timeline": {"dry": room_dry_finish, "wet": room_wet_finish},
+            "unsequenced": sorted(unsequenced),
+        }
+
     # -- task building ---------------------------------------------------------------
 
     def _settings_calls(
@@ -228,6 +298,7 @@ class CleanPlanner:
         plan: dict[str, Any] = {"dry": {}, "wet": {}, "unassigned": {}}
 
         dry_assign: dict[str, list[str]] = {}
+        wet_assign: dict[str, list[str]] = {}
         if mode in ("dry", "both"):
             dry_assign, dry_un = self.assign(rooms, "dry", vacuums, pin)
             if dry_un:
@@ -305,4 +376,5 @@ class CleanPlanner:
 
         if not plan["unassigned"]:
             plan.pop("unassigned")
+        plan.update(self._estimate_timeline(dry_assign, wet_assign))
         return tasks, plan
