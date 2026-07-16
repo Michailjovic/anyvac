@@ -4,6 +4,44 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.51.0] - 2026-07-16
+
+Fáze 4 kánonu (docs/14), part 1: pytest coverage for the coordinator's core
+pipeline, plus plan-scope transit labeling (docs/17 §1.3). No card change
+required — pairs with `anyvac-card` 0.65.0.
+
+### Added
+
+- **Plan-scope transit labeling** — `AnyVacCoordinator.set_job_rooms(duid,
+  rooms)` records the room-name scope of the currently-running orchestrated
+  job per vacuum; `_attribute_points` now reroutes any point landing outside
+  that scope into a new `_transit_cells` bucket instead of `_room_cells`,
+  even when the vacuum's raw state is NOT a `TRANSIT_STATE` (a robot
+  genuinely "cleaning" per firmware state while driving through an
+  unselected room on the way to a selected one — the one case the existing
+  state-based transit gate cannot see). Stored for debug visibility only
+  ("ukládat, ale nepočítat"): never feeds calibration, coverage, or elapsed
+  time. Exposed on the map sensor as `transit_cells`
+  (`{room_name: cell_count}` or `null`). Wired from `services.py`'s
+  `_JobRunner`, which applies the scope (union of a vacuum's dry + wet
+  assignment from the plan) on job start and clears it on finish/cancel —
+  `anyvac.run_job`'s raw task lists deliberately do NOT carry this (docs/17
+  explicitly rules out bolting it on there separately).
+
+### Tests
+
+- New `tests/test_coordinator_pipeline.py` (5 tests): a mid-clean mop wash
+  freezing coverage/elapsed-time attribution and room-done detection without
+  losing the still-genuinely-cleaning time either side of it; a drive-through
+  room correctly rejected at calibration ("not completed (transit only?)")
+  despite having attributed cells; a single session calibrating multiple
+  rooms independently (docs/16 continuous calibration); plan-scope transit
+  labeling catching a drive-through the state-only gate misses; and two
+  independently-owned vacuums sharing one coordinator without their per-duid
+  learned estimates/sessions cross-contaminating (while documenting that
+  `_history`'s cross-vacuum-by-room-name design is a deliberate, unchanged
+  tradeoff for a genuine two-household name collision).
+
 ## [0.50.0] - 2026-07-15
 
 Sequence-aware orchestration (docs/19). Ships in lockstep with `anyvac-card`

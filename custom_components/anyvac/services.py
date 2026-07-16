@@ -178,7 +178,12 @@ def _cancel_jobs(hass: HomeAssistant) -> set[str]:
 class _JobRunner:
     """Executes a plan of gated vacuum tasks, server-side."""
 
-    def __init__(self, hass: HomeAssistant, tasks: list[dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        tasks: list[dict[str, Any]],
+        job_rooms: dict[str, set[str]] | None = None,
+    ) -> None:
         self.hass = hass
         self.tasks: dict[str, dict[str, Any]] = {
             str(t.get("id", i)): t for i, t in enumerate(tasks)
@@ -188,11 +193,19 @@ class _JobRunner:
         # Vacuums whose clean command was actually dispatched — the set anyvac.cancel
         # sends home (a never-started robot has nothing to return from).
         self.started_vacuums: set[str] = set()
+        # Plan-scope transit labeling (docs/17 §1.3): {duid: room-name scope}, applied
+        # to every known coordinator on start() and cleared on finish() — only
+        # anyvac.clean's planned jobs carry this (run_job's raw task lists don't know
+        # room scope, and docs/17 explicitly says not to bolt it on there separately).
+        self.job_rooms: dict[str, set[str]] = job_rooms or {}
         self._unsub: list = []
         self._cancel_timeout = None
 
     async def start(self) -> None:
         _active_jobs(self.hass).append(self)
+        for duid, rooms in self.job_rooms.items():
+            for coord in _coordinators(self.hass):
+                coord.set_job_rooms(duid, rooms)
         self._unsub.append(
             self.hass.bus.async_listen(f"{DOMAIN}_room_done", self._on_room_done)
         )
@@ -283,15 +296,24 @@ class _JobRunner:
         if self._cancel_timeout is not None:
             self._cancel_timeout()
             self._cancel_timeout = None
+        # Clear this job's plan-scope (docs/17 §1.3) on every path that ends a job —
+        # completion, cancellation, and the timeout safety net all funnel through here.
+        for duid in self.job_rooms:
+            for coord in _coordinators(self.hass):
+                coord.set_job_rooms(duid, None)
         jobs = _active_jobs(self.hass)
         if self in jobs:
             jobs.remove(self)
 
 
-async def _start_job(hass: HomeAssistant, tasks: list[dict[str, Any]]) -> None:
+async def _start_job(
+    hass: HomeAssistant,
+    tasks: list[dict[str, Any]],
+    job_rooms: dict[str, set[str]] | None = None,
+) -> None:
     """Cancel any previous job (docs/13 C6: no parallel double-driving) and run."""
     _cancel_jobs(hass)
-    runner = _JobRunner(hass, tasks)
+    runner = _JobRunner(hass, tasks, job_rooms)
     await runner.start()
 
 
@@ -352,6 +374,24 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
                 baselines=call.data.get("baselines", True),
             )
 
+    def _job_rooms_from_plan(plan: dict[str, Any]) -> dict[str, set[str]]:
+        """Plan-scope transit labeling (docs/17 §1.3): per-duid room scope for the
+        job about to run — the union of a vacuum's dry + wet assignment, so a
+        both-capable robot's wet-only rooms aren't flagged transit during its dry
+        pass and vice versa. `plan["dry"]`/`plan["wet"]` are keyed by entity_id
+        (the planner's own output shape); resolved to duid here since that's what
+        the coordinator's per-poll pipeline keys everything by."""
+        by_entity: dict[str, set[str]] = {}
+        for kind in ("dry", "wet"):
+            for entity, rooms in (plan.get(kind) or {}).items():
+                by_entity.setdefault(entity, set()).update(rooms)
+        out: dict[str, set[str]] = {}
+        for entity, rooms in by_entity.items():
+            duid = duid_for_entity(hass, entity)
+            if duid:
+                out[duid] = rooms
+        return out
+
     def _build(call: ServiceCall) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         coords = _coordinators(hass)
         if not coords:
@@ -379,7 +419,7 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
                 f"(plan: {plan})"
             )
         _LOGGER.info("AnyVac clean: %s", plan)
-        await _start_job(hass, tasks)
+        await _start_job(hass, tasks, _job_rooms_from_plan(plan))
 
     async def _handle_plan(call: ServiceCall) -> dict[str, Any]:
         tasks, plan = _build(call)

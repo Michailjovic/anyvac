@@ -446,6 +446,21 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # gauge's time-ratio) + last poll timestamp to measure the per-poll delta.
         self._room_elapsed: dict[str, dict[str, float]] = {}
         self._last_poll: dict[str, datetime] = {}
+        # Plan-scope transit labeling (docs/17 §1.3): room-name scope of the currently
+        # running orchestrated job (anyvac.clean), PER VACUUM — set by services.py's
+        # _JobRunner when a job starts, cleared when it finishes/cancels. Not persisted
+        # (a job-in-progress does not survive a restart anyway). None/absent = no active
+        # job scope known for that duid (manual/native/degraded runs) — attribution then
+        # falls back to today's state-only TRANSIT_STATES gating, unchanged.
+        self._job_rooms: dict[str, set[str]] = {}
+        # Cells seen this session while OUTSIDE the active job's room scope — driven
+        # through on the way to an actually-scoped room, not really "cleaning" that
+        # room for THIS job even though the vacuum's raw state says "cleaning" (no
+        # TRANSIT_STATE involved, so the state-based gate alone would miss it).
+        # Stored for debug visibility only ("ukládat, ale nepočítat", docs/17 §1):
+        # never feeds `_room_cells`/`_room_elapsed`, so it can never poison
+        # calibration/coverage. {duid: {room_name: set[(cx, cy)]}}.
+        self._transit_cells: dict[str, dict[str, set[tuple[int, int]]]] = {}
         # Per-room spatial coverage: visited grid cells, accumulated ONLY for the room the
         # robot is currently confirmed to be cleaning (so transit / mop-wash trips through
         # other rooms are not counted). Dry (vacuum) and wet (mop) are tracked separately.
@@ -622,6 +637,18 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         self._seq_store.async_delay_save(lambda: dict(self._room_sequence), 2)
         self.async_update_listeners()
 
+    def set_job_rooms(self, duid: str, rooms: set[str] | None) -> None:
+        """Plan-scope transit labeling (docs/17 §1.3) — called by services.py's
+        _JobRunner when an orchestrated job (anyvac.clean) starts/finishes for this
+        vacuum. `rooms` = the full room-name scope of the job for this duid (union of
+        its dry + wet assignment); `None` clears it. Not persisted and does not touch
+        `async_update_listeners()` — this is a side-channel for the next poll's
+        `_attribute_points`, not user-facing sensor state."""
+        if rooms is None:
+            self._job_rooms.pop(duid, None)
+        else:
+            self._job_rooms[duid] = set(rooms)
+
     def set_selection(self, rooms: list[str], mode: str = "set") -> None:
         """Mutate the shared room selection. mode: set / add / remove / toggle / clear."""
         names = {str(r) for r in rooms}
@@ -755,6 +782,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             return
 
         cells_all = self._room_cells.setdefault(duid, {})
+        job_rooms = self._job_rooms.get(duid)
         weights: dict[str, int] = {}
         for layer, _dkey in layers:
             for p in new_by_layer[layer]:
@@ -764,6 +792,16 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     continue
                 for nm, lx, ly, hx, hy in boxes:
                     if lx <= x <= hx and ly <= y <= hy:
+                        cell = (int((x - lx) // COVERAGE_CELL_MM), int((y - ly) // COVERAGE_CELL_MM))
+                        if job_rooms is not None and nm not in job_rooms:
+                            # Plan-scope transit (docs/17 §1.3): driven through a room
+                            # outside THIS job's scope — the raw state still says
+                            # "cleaning" (no TRANSIT_STATE), so the state-only gate
+                            # above would miss it. Store for debug visibility only;
+                            # never touches weights/cells_all, so it can neither
+                            # skew elapsed-time attribution nor poison calibration.
+                            self._transit_cells.setdefault(duid, {}).setdefault(nm, set()).add(cell)
+                            break
                         # Time weighting comes from the trajectory ("dry" source layer =
                         # the robot's movement) regardless of the clean type; the DRY
                         # COVERAGE however only accrues while actually vacuuming, so a
@@ -773,7 +811,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                             if not vacuuming:
                                 break
                         cset = cells_all.setdefault(nm, {"dry": set(), "wet": set()}).setdefault(layer, set())
-                        cset.add((int((x - lx) // COVERAGE_CELL_MM), int((y - ly) // COVERAGE_CELL_MM)))
+                        cset.add(cell)
                         break
 
         if last is None:
@@ -864,6 +902,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 self._session_clean_type.pop(duid, None)
                 self._room_elapsed[duid] = {}
                 self._room_cells[duid] = {}
+                self._transit_cells[duid] = {}
                 self._path_seen[duid] = {"dry": 0, "wet": 0}
                 self._dry_path[duid] = []
                 self._dry_path_open[duid] = False
@@ -999,6 +1038,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             # home through it) until the NEXT session started — stale gauges on the card.
             self._room_elapsed[duid] = {}
             self._room_cells[duid] = {}
+            self._transit_cells[duid] = {}
         self._was_cleaning[duid] = cleaning
 
     async def _async_setup(self) -> None:
@@ -1251,6 +1291,16 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     device.data["path_wet"] = device.data.get("mop_path")
                     device.data["duid"] = device.duid
                     device.data["calib_debug"] = self._last_calib.get(device.duid)
+                    # Plan-scope transit debug exposure (docs/17 §1.3): distinct cells seen
+                    # this session per room while OUTSIDE the active job's scope — "stored,
+                    # not counted" (docs/17 §1). None (not an empty dict) when nothing has
+                    # been seen, so the card/dev-tools can tell "no active job scope or
+                    # nothing out-of-scope yet" apart from "this feature is unavailable".
+                    transit = {
+                        room: len(cells)
+                        for room, cells in (self._transit_cells.get(device.duid) or {}).items()
+                    }
+                    device.data["transit_cells"] = transit or None
                     # Kontrakt v2 (docs/14 §3.6 + §5): geometry additionally in rendered
                     # image PIXELS so the card never has to do mm math again. The mm
                     # attributes stay in parallel until Fáze 3 removes the card's use.
