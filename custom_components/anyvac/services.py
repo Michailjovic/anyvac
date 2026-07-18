@@ -31,6 +31,7 @@ import voluptuous as vol
 from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.event import async_call_later
+from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
 from .planner import CleanPlanner, duid_for_entity, vacuum_entity_for_duid
@@ -64,6 +65,18 @@ ALL_SERVICES = (
 )
 
 JOB_TIMEOUT_SECONDS = 3 * 3600  # safety: tear down a stuck job after 3 h
+
+# docs/23: adaptive threshold batching for a pool task's progressive dispatch.
+# If another of the robot's rooms is estimated ready within this many minutes,
+# wait for it (one dock trip covers both) instead of dispatching immediately
+# with just what's ready now. Never learned/tuned from real data (unlike the
+# per-room time estimates, docs/16) — a fixed starting point, revisit from
+# field experience.
+BATCH_WAIT_THRESHOLD_MIN = 3.0
+# Hard cap on how long a ready batch can be held back waiting for a "soon"
+# room, measured from the moment it FIRST had something ready to send — a bad
+# estimate must never stall a batch indefinitely.
+BATCH_WAIT_CAP_MIN = 6.0
 
 RUN_JOB_SCHEMA = vol.Schema({vol.Required("tasks"): [dict]})
 SELECT_ROOMS_SCHEMA = vol.Schema(
@@ -185,9 +198,20 @@ class _JobRunner:
         job_rooms: dict[str, set[str]] | None = None,
     ) -> None:
         self.hass = hass
-        self.tasks: dict[str, dict[str, Any]] = {
-            str(t.get("id", i)): t for i, t in enumerate(tasks)
-        }
+        # docs/23: a task carrying a "pool" key is a progressive-dispatch pool
+        # task (built by planner.py for a wet-capable robot with 2+ rooms in a
+        # "both" job) — it goes through `_dispatch_pools()`, not the plain
+        # static all-or-nothing `after`-gated path below.
+        self.tasks: dict[str, dict[str, Any]] = {}
+        self.pool_tasks: dict[str, dict[str, Any]] = {}
+        for i, t in enumerate(tasks):
+            tid = str(t.get("id", i))
+            if "pool" in t:
+                pt = dict(t)
+                pt["dispatched"] = set()
+                self.pool_tasks[tid] = pt
+            else:
+                self.tasks[tid] = t
         self.pending: set[str] = set(self.tasks)
         self.done: set[tuple[Any, Any]] = set()
         # Vacuums whose clean command was actually dispatched — the set anyvac.cancel
@@ -200,9 +224,19 @@ class _JobRunner:
         self.job_rooms: dict[str, set[str]] = job_rooms or {}
         self._unsub: list = []
         self._cancel_timeout = None
+        # docs/23: progressive pool-task dispatch state. `pool_busy` maps a duid
+        # to the pool task id it's currently running a batch for (absent = free).
+        # `_pool_first_ready` marks when a task's ready-set first became
+        # non-empty, so the wait-vs-go decision's cap (BATCH_WAIT_CAP_MIN) has a
+        # fixed reference point instead of restarting the clock on every event.
+        self.pool_busy: dict[str, str] = {}
+        self._pool_first_ready: dict[str, Any] = {}
+        self._pool_wait_cancel: dict[str, Any] = {}
+        self._start_time: Any = None
 
     async def start(self) -> None:
         _active_jobs(self.hass).append(self)
+        self._start_time = dt_util.utcnow()
         for duid, rooms in self.job_rooms.items():
             for coord in _coordinators(self.hass):
                 coord.set_job_rooms(duid, rooms)
@@ -216,12 +250,18 @@ class _JobRunner:
             self.hass, JOB_TIMEOUT_SECONDS, self._on_timeout
         )
         await self._dispatch_ready()
+        await self._dispatch_pools()
+        self._maybe_finish()
 
     def _met(self, task: dict[str, Any]) -> bool:
         for cond in task.get("after") or []:
             if (cond.get("duid"), cond.get("room")) not in self.done:
                 return False
         return True
+
+    def _maybe_finish(self) -> None:
+        if not self.pending and not self.pool_tasks:
+            self.finish()
 
     async def _dispatch_ready(self) -> None:
         for tid in list(self.pending):
@@ -231,8 +271,103 @@ class _JobRunner:
                     await self._run_task(self.tasks[tid])
                 except Exception as err:  # noqa: BLE001 - one bad task must not wedge the job
                     _LOGGER.warning("AnyVac run_job: task %s failed: %s", tid, err)
-        if not self.pending:
-            self.finish()
+
+    # -- docs/23: progressive pool-task dispatch ---------------------------------
+
+    async def _dispatch_pools(self) -> None:
+        """Advance every pool task by one step: dispatch a batch if one is due,
+        or (re-)schedule a short wait for a room that's estimated to be ready
+        soon (§3 adaptive threshold — see docs/23). Safe to call repeatedly;
+        each call re-evaluates from scratch (any previously scheduled recheck
+        for a task is cancelled and replaced or resolved into a dispatch)."""
+        for tid, pt in list(self.pool_tasks.items()):
+            dispatched: set[str] = pt["dispatched"]
+            remaining = {r: m for r, m in pt["pool"].items() if r not in dispatched}
+            if not remaining:
+                continue  # fully dispatched; closes out via _on_finished
+            duid = pt["duid"]
+            if self.pool_busy.get(duid):
+                continue  # robot mid-batch (this task or another pool task)
+            own_gate = pt.get("own_gate")
+            if own_gate and (own_gate.get("duid"), own_gate.get("room")) not in self.done:
+                continue  # both-capable robot: own dry session not done yet
+            ready = [
+                r for r, m in remaining.items()
+                if (m["gate"].get("duid"), m["gate"].get("room")) in self.done
+            ]
+            cancel = self._pool_wait_cancel.pop(tid, None)
+            if cancel is not None:
+                cancel()  # re-deciding fresh below, whatever it was waiting for is moot
+            if not ready:
+                continue  # nothing ready yet; the next event re-enters this method
+            if tid not in self._pool_first_ready:
+                self._pool_first_ready[tid] = dt_util.utcnow()
+            not_ready = [r for r in remaining if r not in ready]
+            elapsed_min = (dt_util.utcnow() - self._pool_first_ready[tid]).total_seconds() / 60
+            if not_ready and elapsed_min < BATCH_WAIT_CAP_MIN:
+                soonest = min(remaining[r]["eta_min"] for r in not_ready)
+                now_min = (dt_util.utcnow() - self._start_time).total_seconds() / 60
+                wait_needed = soonest - now_min
+                if 0 < wait_needed <= BATCH_WAIT_THRESHOLD_MIN:
+                    self._pool_wait_cancel[tid] = async_call_later(
+                        self.hass, wait_needed * 60, self._make_pool_recheck(tid)
+                    )
+                    continue
+            await self._dispatch_pool_batch(tid, pt, ready)
+
+    def _make_pool_recheck(self, tid: str):
+        async def _cb(_now: Any) -> None:
+            self._pool_wait_cancel.pop(tid, None)
+            await self._dispatch_pools()
+            self._maybe_finish()
+        return _cb
+
+    async def _dispatch_pool_batch(self, tid: str, pt: dict[str, Any], rooms: list[str]) -> None:
+        pt["dispatched"].update(rooms)
+        self._pool_first_ready.pop(tid, None)  # reset for this pool's NEXT batch, if any
+        entity = pt["vacuum"]
+        for sel in pt.get("selects") or []:
+            try:
+                await self.hass.services.async_call(
+                    "select",
+                    "select_option",
+                    {"entity_id": sel["entity_id"], "option": sel["option"]},
+                    blocking=True,
+                )
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning(
+                    "AnyVac run_job: select %s -> %s failed: %s",
+                    sel.get("entity_id"), sel.get("option"), err,
+                )
+        if pt.get("fan_speed"):
+            try:
+                await self.hass.services.async_call(
+                    "vacuum",
+                    "set_fan_speed",
+                    {"entity_id": entity, "fan_speed": pt["fan_speed"]},
+                    blocking=True,
+                )
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning("AnyVac run_job: set_fan_speed failed: %s", err)
+        segs = [pt["pool"][r]["segment"] for r in rooms]
+        try:
+            await self.hass.services.async_call(
+                "vacuum",
+                "send_command",
+                {
+                    "entity_id": entity,
+                    "command": "app_segment_clean",
+                    "params": [{"segments": segs, "repeat": pt.get("repeat", 1)}],
+                },
+                blocking=True,
+            )
+        except Exception as err:  # noqa: BLE001 - one bad batch must not wedge the job
+            _LOGGER.warning(
+                "AnyVac run_job: pool task %s batch %s failed: %s", tid, rooms, err
+            )
+            return  # dispatch itself failed — don't mark the robot busy/started
+        self.started_vacuums.add(entity)
+        self.pool_busy[pt["duid"]] = tid
 
     async def _run_task(self, task: dict[str, Any]) -> None:
         # Pre-clean settings are best-effort: an unknown select option must not
@@ -274,17 +409,29 @@ class _JobRunner:
     async def _on_room_done(self, event) -> None:
         self.done.add((event.data.get("duid"), event.data.get("room")))
         await self._dispatch_ready()
+        await self._dispatch_pools()
+        self._maybe_finish()
 
     async def _on_finished(self, event) -> None:
         # Whole-session completion satisfies a condition with the room omitted.
-        self.done.add((event.data.get("duid"), None))
+        duid = event.data.get("duid")
+        self.done.add((duid, None))
+        # docs/23: if this was a pool task's batch finishing, the robot is free
+        # again — clear it and close out the task if that was its last batch.
+        tid = self.pool_busy.pop(duid, None)
+        if tid is not None:
+            pt = self.pool_tasks.get(tid)
+            if pt is not None and not (set(pt["pool"]) - pt["dispatched"]):
+                self.pool_tasks.pop(tid, None)
         await self._dispatch_ready()
+        await self._dispatch_pools()
+        self._maybe_finish()
 
     def _on_timeout(self, _now) -> None:
-        if self.pending:
+        if self.pending or self.pool_tasks:
             _LOGGER.warning(
-                "AnyVac run_job: %d task(s) never became ready; cleaning up.",
-                len(self.pending),
+                "AnyVac run_job: %d static + %d pool task(s) never became ready; cleaning up.",
+                len(self.pending), len(self.pool_tasks),
             )
         self.finish()
 
@@ -296,6 +443,9 @@ class _JobRunner:
         if self._cancel_timeout is not None:
             self._cancel_timeout()
             self._cancel_timeout = None
+        for cancel in self._pool_wait_cancel.values():
+            cancel()
+        self._pool_wait_cancel = {}
         # Clear this job's plan-scope (docs/17 §1.3) on every path that ends a job —
         # completion, cancellation, and the timeout safety net all funnel through here.
         for duid in self.job_rooms:

@@ -292,6 +292,15 @@ class CleanPlanner:
         ``anyvac_room_done`` (matched by duid + room name) and — when the same robot
         also runs a dry pass — on its own session finishing. Repeat is passed to the
         firmware in ``app_segment_clean`` (no dock-restart hacks, docs/14 §3.8).
+
+        docs/23 (2026-07-18): a wet-capable robot with 2+ assigned rooms in a
+        ``both`` job gets a **pool task** instead of one static all-or-nothing
+        task, so ``_JobRunner`` can dispatch a first batch as soon as SOME of
+        its rooms are ready rather than waiting for all of them — a single
+        wet-capable robot covering both a quick room and a slow one no longer
+        sits idle until the slow one catches up. A robot with just one room
+        (or a standalone ``wet`` job with no dry gating at all) has nothing to
+        stagger and keeps the plain static task.
         """
         settings = settings or {}
         tasks: list[dict[str, Any]] = []
@@ -331,10 +340,16 @@ class CleanPlanner:
             for r in rms:
                 room_dry_duid[r] = duid
 
+        timeline: dict[str, Any] | None = None
         if mode in ("wet", "both"):
             wet_assign, wet_un = self.assign(rooms, "wet", vacuums, pin)
             if wet_un:
                 plan["unassigned"]["wet"] = wet_un
+            # docs/23: the pool tasks' per-room `eta_min` hint needs the
+            # dry-finish timeline, so compute it now (right after wet_assign is
+            # known) instead of at the very end — reused below for `plan.update`.
+            timeline = self._estimate_timeline(dry_assign, wet_assign)
+            room_dry_finish = timeline["timeline"]["dry"]
             for j, (duid, rms) in enumerate(wet_assign.items()):
                 entity = self.entity_of.get(duid)
                 if not entity:
@@ -344,37 +359,65 @@ class CleanPlanner:
                     continue
                 kind_settings = settings.get("wet") or {}
                 selects, fan = self._settings_calls(duid, "wet", kind_settings)
-                segs = [self.segments[duid][r] for r in rms]
                 repeat = max(1, int(kind_settings.get("repeat") or 1))
-                after: list[dict[str, Any]] = []
-                if mode == "both":
-                    # Release the wet pass per room done by the DRY robot; a
-                    # both-capable robot additionally waits for its own dry session.
-                    after = [
-                        {"duid": room_dry_duid[r], "room": r}
+                own_gate = {"duid": duid} if duid in dry_assign else None
+
+                if mode == "both" and len(rms) >= 2:
+                    # Pool task (docs/23): per-room gate + a timing hint for the
+                    # wait-vs-go decision, no single all-or-nothing `after` list.
+                    pool = {
+                        r: {
+                            "gate": {"duid": room_dry_duid[r], "room": r},
+                            "eta_min": room_dry_finish.get(r, 0.0),
+                            "segment": self.segments[duid][r],
+                        }
                         for r in rms
                         if r in room_dry_duid
-                    ]
-                    if duid in dry_assign:
-                        after.append({"duid": duid})
-                tasks.append(
-                    {
-                        "id": f"wet{j}",
-                        "vacuum": entity,
-                        "selects": selects,
-                        "fan_speed": fan,
-                        "service": "vacuum.send_command",
-                        "service_data": {
-                            "entity_id": entity,
-                            "command": "app_segment_clean",
-                            "params": [{"segments": segs, "repeat": repeat}],
-                        },
-                        "after": after,
                     }
-                )
+                    tasks.append(
+                        {
+                            "id": f"wet{j}",
+                            "vacuum": entity,
+                            "duid": duid,
+                            "pool": pool,
+                            "selects": selects,
+                            "fan_speed": fan,
+                            "repeat": repeat,
+                            "own_gate": own_gate,
+                        }
+                    )
+                else:
+                    segs = [self.segments[duid][r] for r in rms]
+                    after: list[dict[str, Any]] = []
+                    if mode == "both":
+                        # Release the wet pass per room done by the DRY robot; a
+                        # both-capable robot additionally waits for its own dry
+                        # session (single-room case — no benefit to pooling).
+                        after = [
+                            {"duid": room_dry_duid[r], "room": r}
+                            for r in rms
+                            if r in room_dry_duid
+                        ]
+                        if own_gate:
+                            after.append(own_gate)
+                    tasks.append(
+                        {
+                            "id": f"wet{j}",
+                            "vacuum": entity,
+                            "selects": selects,
+                            "fan_speed": fan,
+                            "service": "vacuum.send_command",
+                            "service_data": {
+                                "entity_id": entity,
+                                "command": "app_segment_clean",
+                                "params": [{"segments": segs, "repeat": repeat}],
+                            },
+                            "after": after,
+                        }
+                    )
                 plan["wet"][entity] = list(rms)
 
         if not plan["unassigned"]:
             plan.pop("unassigned")
-        plan.update(self._estimate_timeline(dry_assign, wet_assign))
+        plan.update(timeline or self._estimate_timeline(dry_assign, wet_assign))
         return tasks, plan

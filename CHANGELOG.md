@@ -4,6 +4,61 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.66.5] - 2026-07-18
+
+Progressive dispatch for multi-room wet passes (docs/23), synced to
+`anyvac-card` 0.66.5. Found in the field: an orchestrated "Both" clean on 3
+rooms (2 fast dry rooms on one robot, 1 slow on another; a single wet-capable
+robot assigned all 3) left the wet robot idle even after both fast rooms'
+dry passes were long done — it wouldn't move until the slow room finished
+too, because a wet-capable robot's rooms were always one atomic
+all-or-nothing task. Dry cleaning needs no such change (confirmed) — this is
+wet-only.
+
+### Added
+
+- **Pool tasks** — `CleanPlanner.build_tasks()` now builds a *pool task*
+  instead of a static task for a wet-capable robot with 2+ rooms in a
+  `both` job: a per-room gate + an `eta_min` timing hint
+  (`_estimate_timeline`'s per-room dry-finish estimate, docs/19), no single
+  combined `after` list. A robot with just one room, or a standalone `wet`
+  job with no dry pass to gate against at all, keeps the existing static
+  task unchanged — nothing to stagger there.
+- **Adaptive threshold batching** — `_JobRunner._dispatch_pools()`: when a
+  pool task has some rooms with a genuinely met gate (real
+  `anyvac_room_done` event, never an estimate alone) and the robot is free,
+  it checks whether another of its rooms is estimated ready "soon"
+  (`BATCH_WAIT_THRESHOLD_MIN` = 3 min). If so it waits (one recheck
+  scheduled via `async_call_later`) to fold both into one dock trip —
+  naturally reproducing the old "one big batch for the whole apartment"
+  behavior when rooms finish close together. If not, it dispatches
+  immediately with whatever's ready. A hard cap (`BATCH_WAIT_CAP_MIN` = 6
+  min, measured from the first moment something was ready) forces a
+  dispatch even if a promised "soon" room never actually arrives — a bad
+  estimate costs at most one extra dock trip, never a wrong/early command.
+  Dispatch itself is always gated by the real event, the estimate is only a
+  wait-vs-go hint. A second batch for the same robot can only go out after
+  its `anyvac_clean_finished` for the first — sending a new
+  `app_segment_clean` mid-clean discards whatever the robot is doing
+  (confirmed hard constraint, docs/23 §2).
+- Neither constant is learned yet (unlike per-room time estimates, docs/16)
+  — fixed starting points, revisit from field experience.
+
+### Tests
+
+- New `tests/test_planner_pool_tasks.py` (4 tests): multi-room wet robot
+  gets a pool task with correct per-room gates/segments/eta hints;
+  single-room and standalone-`wet`-mode robots keep the static task
+  (regression guard); a both-capable robot's pool task carries its own
+  dry-session gate.
+- New `tests/test_job_runner_pool.py` (4 tests): two close-together rooms
+  batch into one dispatch; a fast+slow pair splits into two dispatches with
+  the second withheld until the robot's own `anyvac_clean_finished`; a bad
+  estimate is forced out by the wait cap (fires the actual scheduled
+  recheck callback, not just the decision math); a plain static task (no
+  `pool` key) bypasses the pool machinery entirely and dispatches
+  immediately as before.
+
 ## [0.51.0] - 2026-07-16
 
 Fáze 4 kánonu (docs/14), part 1: pytest coverage for the coordinator's core
