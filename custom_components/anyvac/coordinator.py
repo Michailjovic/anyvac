@@ -84,13 +84,82 @@ def _point(p: Any) -> dict[str, float] | None:
     return out
 
 
+# Ramer-Douglas-Peucker tolerance, in mm — a point is dropped only if it's within
+# this distance of the straight line between its kept neighbours. Well under a
+# room-scale feature and under the robot's own positioning precision, so this
+# never causes a visible shape change; it just removes points that were adding
+# no information (near-collinear runs). Fixed, not derived from max_points: the
+# goal is "don't distort geometry", not "hit an exact point count" — max_points
+# below is a separate hard safety cap for pathological (very long) sessions.
+_RDP_EPSILON_MM = 20.0
+# Guard against RDP's rare worst-case (near O(n^2) for adversarially-shaped
+# input): pre-thin anything absurdly large with a cheap stride pass first, so
+# RDP itself never has to chew through more than this many points at once.
+_RDP_PRETHIN_MAX = 4000
+
+
+def _rdp_simplify(points: list[dict[str, float]], epsilon: float) -> list[dict[str, float]]:
+    """Ramer-Douglas-Peucker trajectory simplification, iterative (stack-based,
+    so a long straight run can't blow the recursion limit). Keeps a point only
+    if it deviates from the straight line between its surviving neighbours by
+    more than ``epsilon`` — unlike naive every-Nth-point stride decimation, this
+    barely touches straight sweeps (which need almost no points to represent
+    exactly) and preserves turns (where real information/curvature lives)."""
+    n = len(points)
+    if n < 3:
+        return points
+    keep = bytearray(n)
+    keep[0] = keep[-1] = 1
+    eps2 = epsilon * epsilon
+    stack = [(0, n - 1)]
+    while stack:
+        start, end = stack.pop()
+        if end <= start + 1:
+            continue
+        p0, p1 = points[start], points[end]
+        dx, dy = p1["x"] - p0["x"], p1["y"] - p0["y"]
+        seg_len2 = dx * dx + dy * dy
+        max_dist2 = -1.0
+        max_idx = start
+        for i in range(start + 1, end):
+            p = points[i]
+            if seg_len2 > 0:
+                t = ((p["x"] - p0["x"]) * dx + (p["y"] - p0["y"]) * dy) / seg_len2
+                t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+                projx, projy = p0["x"] + t * dx, p0["y"] + t * dy
+            else:
+                projx, projy = p0["x"], p0["y"]
+            ddx, ddy = p["x"] - projx, p["y"] - projy
+            dist2 = ddx * ddx + ddy * ddy
+            if dist2 > max_dist2:
+                max_dist2 = dist2
+                max_idx = i
+        if max_dist2 > eps2:
+            keep[max_idx] = 1
+            stack.append((start, max_idx))
+            stack.append((max_idx, end))
+    return [p for p, k in zip(points, keep) if k]
+
+
 def _decimate(points: list[Any], max_points: int) -> list[Any]:
-    """Down-sample a list to at most ``max_points`` entries, keeping shape."""
+    """Down-sample a list to at most ``max_points`` entries, preserving shape.
+
+    Shape-preserving RDP simplification (see ``_rdp_simplify``) does the real
+    work; ``max_points`` is a hard safety cap for pathological cases (a very
+    long / multi-hour session), applied as a last-resort uniform stride on top
+    of the already-simplified points — in the common case RDP alone lands
+    comfortably under the cap and this second pass is a no-op.
+    """
     n = len(points)
     if n <= max_points or max_points <= 0:
         return points
-    step = (n + max_points - 1) // max_points
-    return points[::step]
+    pre = points[:: max(1, n // _RDP_PRETHIN_MAX)] if n > _RDP_PRETHIN_MAX else points
+    simplified = _rdp_simplify(pre, _RDP_EPSILON_MM)
+    m = len(simplified)
+    if m <= max_points:
+        return simplified
+    step = (m + max_points - 1) // max_points
+    return simplified[::step]
 
 
 def _decimate_segments(segments: list[list[Any]], max_points: int) -> list[list[Any]]:

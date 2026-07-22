@@ -4,6 +4,49 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.67.0] - 2026-07-22
+
+Fixed path trace quality (synced to `anyvac-card` 0.67.0). Found live: a user
+report ("looks great during cleaning, gets rewritten to something jagged
+after") turned out not to be a rewrite at all — `path_dry`/`path`/`mop_path`
+were re-simplified from the FULL accumulated trajectory on every poll with a
+fixed, too-small point budget, so the same trace looked progressively worse
+as a session ran longer and more raw points piled up against the same cap.
+
+### Fixed
+
+- **Path simplification now shape-preserving.** `_decimate` (coordinator.py)
+  used naive every-Nth-point stride sampling, which disproportionately
+  destroys turns (where points cluster) while barely touching long straight
+  sweeps. Replaced with Ramer-Douglas-Peucker (`_rdp_simplify`, `_RDP_EPSILON_MM
+  = 20mm` — below the robot's own positioning precision, so never a visible
+  distortion): a point is dropped only if it doesn't meaningfully change the
+  line's shape. `max_points` remains a hard safety cap for pathological (very
+  long) sessions, now applied as a uniform-stride fallback on the
+  already-simplified points rather than the primary algorithm.
+- **`PATH_MAX_POINTS` raised 400 → 2000.** The original comment's rationale
+  ("keep the recorder reasonable") is stale — these map attributes are
+  already `unrecorded`; the only real constraint is live payload size, and a
+  few thousand `{x,y}` points is negligible over a 30s poll. Live field data
+  (2026-07-22): a real full-apartment dry session had ~3000 raw points against
+  the old 400 cap — an ~8x thinning. With both fixes, that same session now
+  simplifies to well under 100 points with corners intact (benchmarked: real
+  sweep-pattern data 3000 → 31 points in ~8ms; adversarial dense-zigzag worst
+  case 6000 → ~1900 points in ~100ms — comfortably inside a 30s poll even
+  across 3 vacuums).
+
+### Tests
+
+- New `tests/test_path_decimation.py` (6 tests): a straight run collapses to
+  its two endpoints; a sharp corner survives simplification; the hard
+  `max_points` cap is still respected even for pathological zigzag input
+  where simplification alone barely helps; a realistic two-leg trajectory at
+  today's field-observed scale (3000 points) simplifies via RDP (not the
+  naive-stride fallback) with the corner intact; already-small inputs pass
+  through untouched; `_decimate_segments`'s per-segment independence (no
+  merging across an excluded transit/mop-wash gap, docs/14 §3.9) is
+  unchanged.
+
 ## [0.66.5] - 2026-07-18
 
 Progressive dispatch for multi-room wet passes (docs/23), synced to
