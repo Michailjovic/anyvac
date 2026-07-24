@@ -4,6 +4,35 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.74.0] - 2026-07-24
+
+Synced to `anyvac-card` 0.74.0 — new dock control feature (docs/25 §7 field
+follow-up).
+
+### Added
+
+- `dock_status` attribute on the map sensor: `dust_collection_status`,
+  `auto_dust_collection`, `water_shortage_status`, `wash_phase`,
+  `wash_ready`, `dock_error_status`, `dock_type` — all read from the SAME
+  `properties_api.status` object already fetched every poll for
+  `mop_signal` (docs/26 §1 vrstva A, zero new calls/risk). Coarse status
+  flags only — Roborock's API doesn't expose fine-grained tank fill
+  percentages (verified against python-roborock's `DeviceProp`/
+  `DockSummary` dataclasses).
+- Three new services: `anyvac.dock_empty` (`app_start_collect_dust`),
+  `anyvac.dock_wash` (`app_start_wash`) — both documented, confirmed
+  commands (docs/26 §3) — and `anyvac.dock_dry` (`app_set_dryer_status`,
+  `{"status": 1}`). `app_set_dryer_status` is present in python-roborock's
+  `RoborockCommand` enum but undocumented; no other "start drying now"
+  command exists there (`app_get/set_dryer_setting` only configure the
+  scheduled duration). Verified live 2026-07-24 against the user's real S8
+  MaxV Ultra (start then stop) — both accepted without error, same
+  verification method as docs/26 (no response payload either way for
+  action/set commands, matching that document's noted limitation). All
+  three resolve their target vacuum the same way `anyvac.goto`/
+  `anyvac.zone_clean` do (`entity_id` or `duid`) — no coordinates, no map
+  math, just a raw dock command.
+
 ## [0.67.0] - 2026-07-22
 
 Fixed path trace quality (synced to `anyvac-card` 0.67.0). Found live: a user

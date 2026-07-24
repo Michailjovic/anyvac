@@ -49,6 +49,9 @@ SERVICE_PLAN = "plan"
 SERVICE_GOTO = "goto"
 SERVICE_ZONE_CLEAN = "zone_clean"
 SERVICE_CANCEL = "cancel"
+SERVICE_DOCK_EMPTY = "dock_empty"
+SERVICE_DOCK_WASH = "dock_wash"
+SERVICE_DOCK_DRY = "dock_dry"
 
 ALL_SERVICES = (
     SERVICE_RUN_JOB,
@@ -62,6 +65,9 @@ ALL_SERVICES = (
     SERVICE_GOTO,
     SERVICE_ZONE_CLEAN,
     SERVICE_CANCEL,
+    SERVICE_DOCK_EMPTY,
+    SERVICE_DOCK_WASH,
+    SERVICE_DOCK_DRY,
 )
 
 JOB_TIMEOUT_SECONDS = 3 * 3600  # safety: tear down a stuck job after 3 h
@@ -163,6 +169,15 @@ ZONE_CLEAN_SCHEMA = vol.Schema(
     }
 )
 CANCEL_SCHEMA = vol.Schema({vol.Optional("return_to_base", default=True): bool})
+# docs/25 §7 field follow-up (2026-07-24): dock sheet actions (empty/wash/dry).
+# All three are dock-only self-maintenance commands — no coordinates, same target
+# resolution as goto/zone_clean (entity_id or duid).
+DOCK_ACTION_SCHEMA = vol.Schema(
+    {
+        vol.Optional("entity_id"): str,
+        vol.Optional("duid"): str,
+    }
+)
 
 
 def _coordinators(hass: HomeAssistant) -> list[Any]:
@@ -605,6 +620,38 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
             blocking=True,
         )
 
+    async def _dock_command(call: ServiceCall, command: str, params: Any = None) -> None:
+        """Shared plumbing for the three dock actions below — resolve the target
+        vacuum the same way goto/zone_clean do, send a raw dock command (no
+        coordinates, no map math)."""
+        duid = _resolve_target_duid(hass, call)
+        entity = call.data.get("entity_id") or vacuum_entity_for_duid(hass, duid)
+        if not entity:
+            raise HomeAssistantError(f"anyvac: no vacuum entity for duid '{duid}'")
+        data: dict[str, Any] = {"entity_id": entity, "command": command}
+        if params is not None:
+            data["params"] = params
+        await hass.services.async_call("vacuum", "send_command", data, blocking=True)
+
+    async def _handle_dock_empty(call: ServiceCall) -> None:
+        # app_start_collect_dust — documented, confirmed command (docs/26 §3).
+        await _dock_command(call, "app_start_collect_dust")
+
+    async def _handle_dock_wash(call: ServiceCall) -> None:
+        # app_start_wash — documented, confirmed command (docs/26 §3).
+        await _dock_command(call, "app_start_wash")
+
+    async def _handle_dock_dry(call: ServiceCall) -> None:
+        # app_set_dryer_status — found in python-roborock's RoborockCommand enum
+        # (roborock_typing.py) but NOT in its documented command list; no other
+        # dedicated "start drying now" command exists there (app_get/set_dryer_setting
+        # only configure the scheduled duration). Verified live 2026-07-24 against the
+        # user's real S8 MaxV Ultra (Developer Tools → vacuum.send_command, params
+        # {"status": 1} then {"status": 0}) — both accepted without error, mirroring
+        # the docs/26 verification method (no response payload to inspect either way,
+        # same limitation noted there for action/set commands).
+        await _dock_command(call, "app_set_dryer_status", {"status": 1})
+
     async def _handle_cancel(call: ServiceCall) -> None:
         started = _cancel_jobs(hass)
         if call.data.get("return_to_base", True) and started:
@@ -627,6 +674,9 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
         (SERVICE_GOTO, _handle_goto, GOTO_SCHEMA, SupportsResponse.NONE),
         (SERVICE_ZONE_CLEAN, _handle_zone_clean, ZONE_CLEAN_SCHEMA, SupportsResponse.NONE),
         (SERVICE_CANCEL, _handle_cancel, CANCEL_SCHEMA, SupportsResponse.NONE),
+        (SERVICE_DOCK_EMPTY, _handle_dock_empty, DOCK_ACTION_SCHEMA, SupportsResponse.NONE),
+        (SERVICE_DOCK_WASH, _handle_dock_wash, DOCK_ACTION_SCHEMA, SupportsResponse.NONE),
+        (SERVICE_DOCK_DRY, _handle_dock_dry, DOCK_ACTION_SCHEMA, SupportsResponse.NONE),
     ]
     for name, handler, schema, supports in registrations:
         if not hass.services.has_service(DOMAIN, name):

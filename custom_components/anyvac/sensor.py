@@ -82,7 +82,7 @@ class AnyVacMapSensor(CoordinatorEntity[AnyVacCoordinator], SensorEntity):
             "status_state", "transit", "vacuuming", "view_layers", "debug_map",
             "schema_version", "vacuum_position_px", "charger_px", "path_dry_px",
             "path_wet_px", "pipeline_ok", "pipeline_error", "room_pins",
-            "room_sequence",
+            "room_sequence", "dock_status",
         }
     )
 

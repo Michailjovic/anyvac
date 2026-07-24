@@ -1508,6 +1508,22 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             "water_box_carriage_status": _s("water_box_carriage_status"),
             "is_water_box_carriage_attached": _s("is_water_box_carriage_attached"),
         }
+        # Dock status (docs/26 §1 vrstva A — same `properties_api.status` object
+        # already read above for mop_signal, zero new polls/risk). Backs the new
+        # portrait footer's Dock sheet (docs/25 §7 field follow-up, 2026-07-24):
+        # coarse status flags only (Roborock's API doesn't expose fine-grained
+        # tank fill percentages — verified against python-roborock's `DeviceProp`/
+        # `DockSummary` dataclasses, which carry dust_collection_mode/wash_towel_mode/
+        # smart_wash_params but no tank-level field).
+        data["dock_status"] = {
+            "dust_collection_status": _s("dust_collection_status"),
+            "auto_dust_collection": _s("auto_dust_collection"),
+            "water_shortage_status": _s("water_shortage_status"),
+            "wash_phase": _s("wash_phase"),
+            "wash_ready": _s("wash_ready"),
+            "dock_error_status": _s("dock_error_status"),
+            "dock_type": _s("dock_type"),
+        }
         # Dry/wet: "wet" only when a water level is active AND the mop carriage is
         # actually attached (docs/13 B2 — water set + mop pad removed used to record a
         # dry clean as wet). Unknown attachment (None) keeps the water-mode verdict.
