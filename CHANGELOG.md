@@ -4,6 +4,29 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.76.0] - 2026-07-24
+
+Synced to `anyvac-card` 0.76.0 — two more dock actions (docs/25 §10 second
+follow-up).
+
+### Added
+
+- `anyvac.dock_pump` — sends `app_empty_rinse_tank_water` (undocumented
+  `RoborockCommand`, drains the mop-rinse basin). Confirmed live against
+  the user's S8 MaxV Ultra: matches the manufacturer app's "Pump" action.
+- `anyvac.dock_self_clean` — sends `app_amethyst_self_check` (undocumented
+  `RoborockCommand`; "amethyst" appears to be Roborock's internal codename
+  for the Fill&Drain plumbing accessory). Confirmed live against the
+  user's S8 MaxV Ultra: matches the manufacturer app's "Dock and
+  Fill&Drain Element Self-Cleaning" action.
+
+Both follow the exact same `_dock_command` plumbing as `dock_empty`/
+`dock_wash`/`dock_dry` (`services.py`) — raw `vacuum.send_command`, target
+resolution shared with `goto`/`zone_clean`. No new coordinator/sensor
+changes. No command found for the app's third Dock Maintenance item
+("Fill&Drain Element Drain" — drains the accessory's own built-in sewage
+tank); not implemented.
+
 ## [0.74.0] - 2026-07-24
 
 Synced to `anyvac-card` 0.74.0 — new dock control feature (docs/25 §7 field

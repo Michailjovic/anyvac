@@ -52,6 +52,8 @@ SERVICE_CANCEL = "cancel"
 SERVICE_DOCK_EMPTY = "dock_empty"
 SERVICE_DOCK_WASH = "dock_wash"
 SERVICE_DOCK_DRY = "dock_dry"
+SERVICE_DOCK_PUMP = "dock_pump"
+SERVICE_DOCK_SELF_CLEAN = "dock_self_clean"
 
 ALL_SERVICES = (
     SERVICE_RUN_JOB,
@@ -68,6 +70,8 @@ ALL_SERVICES = (
     SERVICE_DOCK_EMPTY,
     SERVICE_DOCK_WASH,
     SERVICE_DOCK_DRY,
+    SERVICE_DOCK_PUMP,
+    SERVICE_DOCK_SELF_CLEAN,
 )
 
 JOB_TIMEOUT_SECONDS = 3 * 3600  # safety: tear down a stuck job after 3 h
@@ -652,6 +656,34 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
         # same limitation noted there for action/set commands).
         await _dock_command(call, "app_set_dryer_status", {"status": 1})
 
+    async def _handle_dock_pump(call: ServiceCall) -> None:
+        # app_empty_rinse_tank_water — found in python-roborock's RoborockCommand
+        # enum, not in its documented list. Maps to the manufacturer app's "Pump"
+        # action under Dock Maintenance ("drain the remaining water from the
+        # cleaning sink") — this is the mop-rinse basin every dock has, distinct
+        # from the optional Fill&Drain plumbing accessory's own sewage tank.
+        # Verified live 2026-07-24 against the user's real S8 MaxV Ultra
+        # (Developer Tools → vacuum.send_command, no params) — pump audibly ran,
+        # matched the app's "Pump" action per the user's own comparison.
+        await _dock_command(call, "app_empty_rinse_tank_water")
+
+    async def _handle_dock_self_clean(call: ServiceCall) -> None:
+        # app_amethyst_self_check — found in python-roborock's RoborockCommand
+        # enum ("amethyst" appears to be Roborock's internal codename for the
+        # Fill&Drain plumbing accessory). Maps to the manufacturer app's "Dock
+        # and Fill&Drain Element Self-Cleaning" action ("flushes the cleaning
+        # sink and the built-in sewage tank for the fill&drain element; performs
+        # a self-check on the element") — the wording match ("self-check on the
+        # element") is what pointed at this command. Verified live 2026-07-24
+        # against the user's real S8 MaxV Ultra (Developer Tools →
+        # vacuum.send_command, no params) — confirmed by the user as exactly the
+        # action they wanted. Only meaningful on vacuums with the Fill&Drain
+        # plumbing accessory installed (S8 MaxV Ultra here); shown unconditionally
+        # like the other dock actions, matching existing precedent (docs/26 §3 —
+        # dock actions aren't gated on detected hardware, since HA/firmware has
+        # no documented way to report which dock accessories are installed).
+        await _dock_command(call, "app_amethyst_self_check")
+
     async def _handle_cancel(call: ServiceCall) -> None:
         started = _cancel_jobs(hass)
         if call.data.get("return_to_base", True) and started:
@@ -677,6 +709,8 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
         (SERVICE_DOCK_EMPTY, _handle_dock_empty, DOCK_ACTION_SCHEMA, SupportsResponse.NONE),
         (SERVICE_DOCK_WASH, _handle_dock_wash, DOCK_ACTION_SCHEMA, SupportsResponse.NONE),
         (SERVICE_DOCK_DRY, _handle_dock_dry, DOCK_ACTION_SCHEMA, SupportsResponse.NONE),
+        (SERVICE_DOCK_PUMP, _handle_dock_pump, DOCK_ACTION_SCHEMA, SupportsResponse.NONE),
+        (SERVICE_DOCK_SELF_CLEAN, _handle_dock_self_clean, DOCK_ACTION_SCHEMA, SupportsResponse.NONE),
     ]
     for name, handler, schema, supports in registrations:
         if not hass.services.has_service(DOMAIN, name):
