@@ -563,6 +563,15 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # a fresh one. Not the same as "new points arrived": a poll with the gate open but
         # zero new points (robot paused, suction still on) must NOT start a new segment.
         self._dry_path_open: dict[str, bool] = {}
+        # Wet (mop) trace, segmented the same shape as `_dry_path` (docs/27) — needed so
+        # cross-sortie stitching (below) can bridge a dock trip with a new segment instead
+        # of a straight line, same as dry. Unlike dry, wet needs no semantic gate: the
+        # parser's `mop_path` already only contains points while the mop is physically
+        # down, so a poll with new wet points always continues (or opens) the current
+        # segment; `_wet_path_open` is only forced closed at a genuine job/session
+        # boundary (never mid-sortie), so a slow mop pass never gets fragmented.
+        self._wet_path: dict[str, list[list[dict[str, float]]]] = {}
+        self._wet_path_open: dict[str, bool] = {}
         # Pipeline observability (docs/13 B6): warn (once) when a previously seen vacuum
         # stops yielding map data — the roborock internals may have changed.
         self._known_duids: set[str] = set()
@@ -807,9 +816,21 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 start = 0
                 for rc in self._room_cells.get(duid, {}).values():
                     rc[layer] = set()
+                # Cross-sortie stitching (docs/27): a mid-job sortie restart (robot back
+                # from a dock trip, next pool-dispatch batch) must NOT wipe the
+                # already-drawn trace — only close the current segment so the next points
+                # start a new one. Outside an active job (degraded mode / manual per-vacuum
+                # start / raw run_job), this IS a genuinely new, unrelated session, so the
+                # old behaviour (wipe) stands.
+                job_scoped = duid in self._job_rooms
                 if layer == "dry":
-                    self._dry_path[duid] = []
+                    if not job_scoped:
+                        self._dry_path[duid] = []
                     self._dry_path_open[duid] = False
+                else:
+                    if not job_scoped:
+                        self._wet_path[duid] = []
+                    self._wet_path_open[duid] = False
             new_by_layer[layer] = full[start:]
             seen[layer] = len(full)
 
@@ -820,8 +841,6 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # Segmented dry trace (docs/14 §3.9): append the new trajectory points only when
         # the robot is genuinely cleaning AND vacuuming (suction on) — transit / mop-wash
         # / goto driving and mop-only passes must not render (or count) as the dry layer.
-        # The wet layer needs no segmentation: the parser's mop_path is recorded only
-        # while the mop is actually down.
         # Gate just closed→open (or first points ever): start a NEW segment so the gap
         # left by the excluded points is never bridged by a straight line. Gate stayed
         # open across this poll (even one with zero new points, e.g. a paused robot):
@@ -833,6 +852,16 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 segs.append([])
             segs[-1].extend(new_by_layer["dry"])
         self._dry_path_open[duid] = gate_open
+
+        # Wet trace (docs/27): no semantic gate needed (see `_wet_path_open` docstring in
+        # __init__) — a new segment opens whenever `_wet_path_open` was forced closed by a
+        # job/session boundary above; otherwise new points just extend the open segment.
+        if new_by_layer["wet"]:
+            wsegs = self._wet_path.setdefault(duid, [])
+            if not self._wet_path_open.get(duid):
+                wsegs.append([])
+            wsegs[-1].extend(new_by_layer["wet"])
+            self._wet_path_open[duid] = True
 
         if not cleaning or transit:
             return
@@ -973,8 +1002,15 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 self._room_cells[duid] = {}
                 self._transit_cells[duid] = {}
                 self._path_seen[duid] = {"dry": 0, "wet": 0}
-                self._dry_path[duid] = []
+                # Cross-sortie stitching (docs/27): same job-scope guard as the lazy
+                # reset detection in `_attribute_points` — don't wipe the trace for a
+                # sortie restart that's part of the same orchestrated job, only close
+                # the current segment so it isn't bridged with a straight line.
+                if duid not in self._job_rooms:
+                    self._dry_path[duid] = []
+                    self._wet_path[duid] = []
                 self._dry_path_open[duid] = False
+                self._wet_path_open[duid] = False
                 self._session_start[duid] = dt_util.utcnow()
                 self.hass.bus.async_fire(
                     f"{DOMAIN}_clean_started",
@@ -1350,14 +1386,18 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     # Typed trace layers (docs/14 §3.9): path_dry = trajectory segmented
                     # to actual cleaning (no transit / mop-wash driving); path_wet = the
                     # mop trace. ``path`` (full trajectory) stays for backward compat.
-                    # path_dry is a LIST OF SEGMENTS — each a contiguous run of points
-                    # with no excluded (transit/mop-wash) gap inside it — so the card can
-                    # draw one polyline per segment instead of bridging gaps with a
-                    # straight line (bug found 2026-07-15, see docs/14 §3.9 note above).
+                    # Both are LISTS OF SEGMENTS — each a contiguous run of points with no
+                    # excluded gap inside it — so the card draws one polyline per segment
+                    # instead of bridging gaps with a straight line (dry: bug found
+                    # 2026-07-15, docs/14 §3.9; wet: cross-sortie stitching, docs/27 —
+                    # a dock trip between two dispatches of the same orchestrated job must
+                    # not draw as a straight line either).
                     dry_segs = self._dry_path.get(device.duid, [])
                     device.data["path_dry"] = _decimate_segments(dry_segs, PATH_MAX_POINTS)
                     device.data["path_dry_points"] = sum(len(s) for s in dry_segs)
-                    device.data["path_wet"] = device.data.get("mop_path")
+                    wet_segs = self._wet_path.get(device.duid, [])
+                    device.data["path_wet"] = _decimate_segments(wet_segs, PATH_MAX_POINTS)
+                    device.data["path_wet_points"] = sum(len(s) for s in wet_segs)
                     device.data["duid"] = device.duid
                     device.data["calib_debug"] = self._last_calib.get(device.duid)
                     # Plan-scope transit debug exposure (docs/17 §1.3): distinct cells seen
@@ -1381,14 +1421,17 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                         )
                         device.data["charger_px"] = _px_point(device.data.get("charger"), aff)
                         # Segment-preserving px conversion: one sub-list per contiguous
-                        # dry run (drop segments that yield zero valid px points).
+                        # run (drop segments that yield zero valid px points). Both dry
+                        # and wet are segmented (docs/27) — same shape, same conversion.
                         device.data["path_dry_px"] = [
                             seg_px
                             for seg in (device.data.get("path_dry") or [])
                             if (seg_px := [q for p in seg if (q := _px_point(p, aff))])
                         ]
                         device.data["path_wet_px"] = [
-                            q for p in device.data.get("path_wet") or [] if (q := _px_point(p, aff))
+                            seg_px
+                            for seg in (device.data.get("path_wet") or [])
+                            if (seg_px := [q for p in seg if (q := _px_point(p, aff))])
                         ]
                         for room in device.data.get("rooms", []):
                             p0 = _px_point({"x": room.get("x0"), "y": room.get("y0")}, aff)

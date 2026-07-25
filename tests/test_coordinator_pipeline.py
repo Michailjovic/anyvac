@@ -109,6 +109,8 @@ def _new_coordinator(monkeypatch: pytest.MonkeyPatch, clock: _Clock) -> AnyVacCo
     coord._cov_baseline = {}
     coord._dry_path = {}
     coord._dry_path_open = {}
+    coord._wet_path = {}
+    coord._wet_path_open = {}
     coord._known_duids = set()
     coord._pipeline_warned = False
     coord._view_layers = {"dry": True, "wet": False}
@@ -490,3 +492,76 @@ def test_two_households_share_one_coordinator(
     # finished last, so its timestamp wins).
     assert list(coord._history.keys()) == ["Hall"]
     assert coord._history["Hall"]["dry"] == clock.now.isoformat()
+
+
+def test_path_stitches_across_job_sorties(monkeypatch: pytest.MonkeyPatch, clock: _Clock) -> None:
+    """Docs/27: a robot that docks and re-departs mid-JOB (progressive dispatch,
+    docs/23 — a pool task's second batch) must keep its dry AND wet trace from
+    the first sortie instead of wiping it, so the card can draw the whole
+    orchestrated job as one continuous pass. The job boundary is `set_job_rooms`
+    (docs/17 §1.3), not the `in_cleaning` transition — `_JobRunner` sets it once
+    at job start and clears it once at job finish/cancel, regardless of how many
+    sorties happen in between."""
+    coord = _new_coordinator(monkeypatch, clock)
+    duid = "d6"
+    coord.set_job_rooms(duid, {"Hall"})
+
+    # Sortie 1: one dry + one wet point.
+    _poll(coord, _device(
+        duid, vacuum_room_name="Hall",
+        _path_dry=[{"x": 100, "y": 100}], _path_wet=[{"x": 100, "y": 100}],
+    ))
+    assert coord._dry_path[duid] == [[{"x": 100, "y": 100}]]
+    assert coord._wet_path[duid] == [[{"x": 100, "y": 100}]]
+
+    # Sortie 1 ends (dock trip between pool-dispatch batches) — the job itself
+    # is still running (`_job_rooms` untouched, only `_JobRunner.finish()` at
+    # the whole job's end would clear it).
+    clock.advance(minutes=5)
+    _poll(coord, _device(duid, in_cleaning=False))
+    assert coord._dry_path[duid] == [[{"x": 100, "y": 100}]]  # untouched by session-end
+    assert coord._wet_path[duid] == [[{"x": 100, "y": 100}]]
+
+    # Sortie 2 starts: the robot's own raw arrays restart near-empty (real
+    # firmware behaviour) — here just a single new point each layer. Must
+    # become a NEW segment appended to the existing trace, not a wipe.
+    clock.advance(minutes=1)
+    _poll(coord, _device(
+        duid, vacuum_room_name="Hall",
+        _path_dry=[{"x": 200, "y": 100}], _path_wet=[{"x": 200, "y": 100}],
+    ))
+    assert coord._dry_path[duid] == [[{"x": 100, "y": 100}], [{"x": 200, "y": 100}]]
+    assert coord._wet_path[duid] == [[{"x": 100, "y": 100}], [{"x": 200, "y": 100}]]
+
+    # Coverage/calibration state is a separate, already-validated system
+    # (docs/16) — `_room_elapsed` must keep resetting per sortie exactly as
+    # before (it's zeroed at session start, then re-earns time from THIS
+    # poll's own delta only); docs/27 only changes the visual trace's
+    # lifetime. A non-reset would show accumulated time from both sorties
+    # merged into one continuous span instead of sortie 2 starting fresh.
+    assert coord._session_start[duid] == clock.now
+
+
+def test_path_resets_across_sorties_without_job_scope(
+    monkeypatch: pytest.MonkeyPatch, clock: _Clock
+) -> None:
+    """Regression pojistka: outside an active job (degraded mode / manual
+    per-vacuum start / raw `anyvac.run_job`), a sortie restart is a genuinely
+    new, unrelated session — today's wipe-on-restart behaviour must stand."""
+    coord = _new_coordinator(monkeypatch, clock)
+    duid = "d7"
+    # No set_job_rooms() call — same sequence as the stitching test above.
+
+    _poll(coord, _device(
+        duid, vacuum_room_name="Hall",
+        _path_dry=[{"x": 100, "y": 100}], _path_wet=[{"x": 100, "y": 100}],
+    ))
+    clock.advance(minutes=5)
+    _poll(coord, _device(duid, in_cleaning=False))
+    clock.advance(minutes=1)
+    _poll(coord, _device(
+        duid, vacuum_room_name="Hall",
+        _path_dry=[{"x": 200, "y": 100}], _path_wet=[{"x": 200, "y": 100}],
+    ))
+    assert coord._dry_path[duid] == [[{"x": 200, "y": 100}]]
+    assert coord._wet_path[duid] == [[{"x": 200, "y": 100}]]

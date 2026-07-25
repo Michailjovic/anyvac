@@ -4,6 +4,45 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.78.0] - 2026-07-25
+
+Synced to `anyvac-card` 0.78.0 (docs/27 — trace stitching across a job's
+sorties).
+
+### Changed
+
+User report: orchestrated whole-home cleans (progressive dispatch, docs/23)
+make a wet-capable robot leave the dock multiple times for one job, and the
+map never showed the accumulated result — every sortie restart wiped the
+dry trace and the wet trace was never persisted at all (it was read live
+from the parser's current `mop_path` each poll).
+
+- Dry/wet trace lifetime is now tied to the orchestrated JOB
+  (`set_job_rooms` None↔rooms transition, docs/17 §1.3 — set once by
+  `_JobRunner.start()`, cleared once by `finish()`) instead of the
+  `in_cleaning` session transition. A sortie restart mid-job now closes the
+  current trace segment and starts a new one instead of wiping the trace;
+  outside an active job (degraded mode, manual per-vacuum start, raw
+  `anyvac.run_job`) behaviour is unchanged — a sortie is still the whole
+  clean there.
+- New `_wet_path`/`_wet_path_open` coordinator state gives the wet (mop)
+  trace the same segmented, persisted shape `path_dry` already had — no
+  semantic gate needed (the parser's `mop_path` already only contains
+  points while the mop is down), a new segment only opens at a job/session
+  boundary so a slow mop pass is never fragmented mid-run.
+- `path_wet`/`path_wet_px` change shape from a flat point list to a list of
+  segments (matches `path_dry`/`path_dry_px`) — card updated in lockstep
+  (`anyvac-card` 0.78.0).
+- Coverage/calibration state (`_room_cells`, `_transit_cells`,
+  `_room_elapsed`, docs/16) is untouched — still resets per sortie exactly
+  as before; this change only affects the visual trace's lifetime.
+- 2 new tests in `tests/test_coordinator_pipeline.py`: cross-sortie
+  stitching under an active job scope, and a regression pojistka proving
+  the degraded-mode (no job scope) wipe-on-restart behaviour still holds.
+  26/26 tests green.
+
+Spec: `docs/27-slouceni-trasy-napric-vyjezdy.md`.
+
 ## [0.76.0] - 2026-07-24
 
 Synced to `anyvac-card` 0.76.0 — two more dock actions (docs/25 §10 second
