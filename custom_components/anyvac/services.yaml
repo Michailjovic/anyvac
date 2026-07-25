@@ -1,0 +1,432 @@
+clean:
+  name: Clean
+  description: >-
+    Send a clean intent (rooms + mode) to the AnyVac planner. The backend
+    resolves capability, load-balances rooms across capable vacuums (LPT),
+    resolves per-room pins, and runs the resulting job server-side
+    (dry -> wet gating, repeat, mop settings). This is the service the card's
+    Start button calls.
+  fields:
+    rooms:
+      name: Rooms
+      description: >-
+        Room names to clean, as configured in the Roborock app (not HA area
+        names).
+      required: true
+      example: '["Kitchen", "Bedroom"]'
+      selector:
+        object:
+    mode:
+      name: Mode
+      description: Which pass(es) to run.
+      default: dry
+      selector:
+        select:
+          options:
+            - dry
+            - wet
+            - both
+    vacuums:
+      name: Vacuums
+      description: >-
+        Restrict which vacuums may be used. Either a flat list of vacuum
+        entity_ids/duids (applies to both passes), or an object with
+        separate `dry`/`wet` lists. Omit to allow every vacuum the
+        integration knows about.
+      example: '{"dry": ["vacuum.s6_kitchen"], "wet": ["vacuum.s8_maxv_ultra"]}'
+      selector:
+        object:
+    pin:
+      name: Pin override
+      description: >-
+        Per-call override of the stored room pins (see `anyvac.pin_room`).
+        Object keyed by room name, each value an object with optional
+        `dry`/`wet` vacuum entity_id/duid. Rooms not listed here fall back
+        to the stored pins, then to automatic assignment.
+      example: '{"Bedroom": {"dry": "vacuum.s6_kitchen"}}'
+      selector:
+        object:
+    settings:
+      name: Settings
+      description: >-
+        Per-pass mop/fan settings, e.g. `{"dry": {"fan_speed": "max"},
+        "wet": {"mop_intensity": "high", "repeat": 2}}`. Applies only to
+        the pass(es) the given `mode` actually runs.
+      example: '{"wet": {"mop_intensity": "high", "repeat": 2}}'
+      selector:
+        object:
+
+plan:
+  name: Plan (preview)
+  description: >-
+    Same planner as `anyvac.clean`, but response-only — returns the
+    assignment/ETA preview without starting anything. Used by the card for
+    the live plan preview; also useful from automations/scripts that just
+    want to inspect the plan.
+  fields:
+    rooms:
+      name: Rooms
+      description: >-
+        Room names to plan, as configured in the Roborock app.
+      required: true
+      example: '["Kitchen", "Bedroom"]'
+      selector:
+        object:
+    mode:
+      name: Mode
+      description: Which pass(es) to plan.
+      default: dry
+      selector:
+        select:
+          options:
+            - dry
+            - wet
+            - both
+    vacuums:
+      name: Vacuums
+      description: >-
+        Restrict which vacuums may be used — same shape as `anyvac.clean`.
+      selector:
+        object:
+    pin:
+      name: Pin override
+      description: >-
+        Per-call override of the stored room pins — same shape as
+        `anyvac.clean`.
+      selector:
+        object:
+    settings:
+      name: Settings
+      description: Per-pass mop/fan settings — same shape as `anyvac.clean`.
+      selector:
+        object:
+
+goto:
+  name: Pin & go
+  description: >-
+    Send a vacuum to a single point on its map, given as a percentage of
+    the map image (the integration converts to real coordinates).
+  fields:
+    entity_id:
+      name: Vacuum
+      description: Vacuum to send. Omit if `duid` is given instead.
+      selector:
+        entity:
+          domain: vacuum
+    duid:
+      name: Vacuum (duid)
+      description: Roborock device id, as an alternative to `entity_id`.
+      selector:
+        text:
+    x_pct:
+      name: X (%)
+      description: Target X position as a percentage of the map image width.
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 0.1
+          unit_of_measurement: "%"
+    y_pct:
+      name: Y (%)
+      description: Target Y position as a percentage of the map image height.
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 0.1
+          unit_of_measurement: "%"
+
+zone_clean:
+  name: Zone clean
+  description: >-
+    Clean a rectangular zone, given as two opposite corners in percent of
+    the map image (the integration converts to real coordinates).
+  fields:
+    entity_id:
+      name: Vacuum
+      description: Vacuum to send. Omit if `duid` is given instead.
+      selector:
+        entity:
+          domain: vacuum
+    duid:
+      name: Vacuum (duid)
+      description: Roborock device id, as an alternative to `entity_id`.
+      selector:
+        text:
+    x1_pct:
+      name: X1 (%)
+      description: First corner X, percent of map image width.
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 0.1
+          unit_of_measurement: "%"
+    y1_pct:
+      name: Y1 (%)
+      description: First corner Y, percent of map image height.
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 0.1
+          unit_of_measurement: "%"
+    x2_pct:
+      name: X2 (%)
+      description: Opposite corner X, percent of map image width.
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 0.1
+          unit_of_measurement: "%"
+    y2_pct:
+      name: Y2 (%)
+      description: Opposite corner Y, percent of map image height.
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 0.1
+          unit_of_measurement: "%"
+    repeat:
+      name: Repeat
+      description: Number of passes over the zone.
+      default: 1
+      selector:
+        number:
+          min: 1
+          max: 3
+          step: 1
+
+cancel:
+  name: Cancel
+  description: Tear down any running AnyVac job(s) and stop the vacuums involved.
+  fields:
+    return_to_base:
+      name: Return to base
+      description: Send the started vacuums home after cancelling.
+      default: true
+      selector:
+        boolean:
+
+select_rooms:
+  name: Select rooms
+  description: >-
+    Change the shared room selection used by the card's dock (which rooms
+    are queued to clean). Mainly for the card itself; rarely useful from
+    automations.
+  fields:
+    rooms:
+      name: Rooms
+      description: Room names to apply `mode` to.
+      example: '["Kitchen", "Bedroom"]'
+      selector:
+        object:
+    mode:
+      name: Mode
+      description: How to apply `rooms` to the current selection.
+      default: set
+      selector:
+        select:
+          options:
+            - set
+            - add
+            - remove
+            - toggle
+            - clear
+
+pin_room:
+  name: Pin room
+  description: >-
+    Override which vacuum cleans a room for a given pass (dry or wet),
+    independently of the automatic load-balanced assignment. The pin is
+    shared across every dashboard/browser and auto-clears once that pass
+    of the room is actually cleaned.
+  fields:
+    room:
+      name: Room
+      description: Room name to pin, as configured in the Roborock app.
+      required: true
+      selector:
+        text:
+    kind:
+      name: Pass
+      description: >-
+        Which pass this pin applies to. Omit together with `vacuum` to
+        unpin the room entirely (both passes); omit `vacuum` alone with a
+        `kind` set to unpin just that one pass.
+      selector:
+        select:
+          options:
+            - dry
+            - wet
+    vacuum:
+      name: Vacuum
+      description: >-
+        Vacuum entity_id or duid to pin the room to. Leave empty to unpin
+        (see `kind`).
+      selector:
+        entity:
+          domain: vacuum
+
+set_layers:
+  name: Set map layers
+  description: >-
+    Set the shared dry/wet path visibility on the map (synced across every
+    dashboard/browser).
+  fields:
+    dry:
+      name: Dry path visible
+      selector:
+        boolean:
+    wet:
+      name: Wet path visible
+      selector:
+        boolean:
+
+set_room_sequence:
+  name: Set room sequence
+  description: >-
+    Replace the stored room cleaning order (used for sequence-aware ETA).
+    Sends the complete ordered room list — position in the list is the
+    1-based sequence number; this replaces the whole stored sequence, it
+    does not merge.
+  fields:
+    rooms:
+      name: Rooms
+      description: >-
+        Full ordered list of room names, in the order the Roborock app is
+        configured to clean them.
+      required: true
+      example: '["Hall", "Kitchen", "Bedroom"]'
+      selector:
+        object:
+
+reset_learning:
+  name: Reset learning
+  description: >-
+    Clear learned clean-time estimates and/or coverage baselines, e.g.
+    after moving furniture or resetting a robot's map. Without filters,
+    clears everything for every known vacuum/room/kind.
+  fields:
+    duid:
+      name: Vacuum (duid)
+      description: Limit to a single vacuum's device id. Omit for all vacuums.
+      selector:
+        text:
+    room:
+      name: Room
+      description: Limit to a single room name. Omit for all rooms.
+      selector:
+        text:
+    kind:
+      name: Pass
+      description: Limit to dry or wet. Omit for both.
+      selector:
+        select:
+          options:
+            - dry
+            - wet
+    estimates:
+      name: Clear time estimates
+      default: true
+      selector:
+        boolean:
+    baselines:
+      name: Clear coverage baselines
+      default: true
+      selector:
+        boolean:
+
+dock_empty:
+  name: Dock — empty dustbin
+  description: Start the dock's auto-empty (dust collection) cycle.
+  fields:
+    entity_id:
+      name: Vacuum
+      description: Vacuum whose dock to command. Omit if `duid` is given instead.
+      selector:
+        entity:
+          domain: vacuum
+    duid:
+      name: Vacuum (duid)
+      description: Roborock device id, as an alternative to `entity_id`.
+      selector:
+        text:
+
+dock_wash:
+  name: Dock — wash mop
+  description: Start the dock's mop-washing cycle.
+  fields:
+    entity_id:
+      name: Vacuum
+      description: Vacuum whose dock to command. Omit if `duid` is given instead.
+      selector:
+        entity:
+          domain: vacuum
+    duid:
+      name: Vacuum (duid)
+      description: Roborock device id, as an alternative to `entity_id`.
+      selector:
+        text:
+
+dock_dry:
+  name: Dock — dry mop
+  description: Start the dock's mop-drying cycle now.
+  fields:
+    entity_id:
+      name: Vacuum
+      description: Vacuum whose dock to command. Omit if `duid` is given instead.
+      selector:
+        entity:
+          domain: vacuum
+    duid:
+      name: Vacuum (duid)
+      description: Roborock device id, as an alternative to `entity_id`.
+      selector:
+        text:
+
+dock_pump:
+  name: Dock — pump
+  description: >-
+    Drain the remaining water from the dock's cleaning sink (the manufacturer
+    app's "Pump" action).
+  fields:
+    entity_id:
+      name: Vacuum
+      description: Vacuum whose dock to command. Omit if `duid` is given instead.
+      selector:
+        entity:
+          domain: vacuum
+    duid:
+      name: Vacuum (duid)
+      description: Roborock device id, as an alternative to `entity_id`.
+      selector:
+        text:
+
+dock_self_clean:
+  name: Dock — self-clean
+  description: >-
+    Flush the cleaning sink and the Fill&Drain element's built-in tank, and
+    run a self-check on it. Only meaningful on docks with the Fill&Drain
+    plumbing accessory installed.
+  fields:
+    entity_id:
+      name: Vacuum
+      description: Vacuum whose dock to command. Omit if `duid` is given instead.
+      selector:
+        entity:
+          domain: vacuum
+    duid:
+      name: Vacuum (duid)
+      description: Roborock device id, as an alternative to `entity_id`.
+      selector:
+        text:

@@ -4,6 +4,55 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.80.2] - 2026-07-25
+
+Synced to `anyvac-card` 0.80.2.
+
+### Added
+
+`services.yaml` for all public services (`clean`, `plan`, `goto`,
+`zone_clean`, `cancel`, `select_rooms`, `pin_room`, `set_layers`,
+`set_room_sequence`, `reset_learning`, `dock_empty`/`dock_wash`/`dock_dry`/
+`dock_pump`/`dock_self_clean`). `run_job` intentionally excluded — it's the
+internal executor (docs/14 §5, undocumented). Diagnosed from the HA log:
+`custom_components.anyvac` registers 16 services in Python but never shipped
+a `services.yaml`, so `Integration.has_services` was always `False` and HA's
+`async_get_all_descriptions` logged `ERROR: Failed to load services.yaml for
+integration: anyvac` every restart — a misleading message for a merely
+*missing* file (the older code path logs the same situation as a `WARNING:
+Unable to find services.yaml`), but a real gap: Developer Tools → Actions
+had no field docs/selectors for any AnyVac service. Validated against HA's
+own `_SERVICES_SCHEMA`/`_SERVICE_SCHEMA`/`_FIELD_SCHEMA`.
+
+### Fixed
+
+Room pins (`anyvac.pin_room`) are now per-pass instead of one flat vacuum
+per room — `coordinator.room_pins`/`set_room_pin` changed from
+`{room: vacuum}` to `{room: {"dry"/"wet": vacuum}}`. Same HA-log
+investigation surfaced a repeating `WARNING: AnyVac clean: pin X -> Y not
+applicable for Z pass; falling back to automatic assignment` — root cause:
+a fleet with no dual-capable robot (dry-only + wet-only, this user's real
+setup) pinning a room's dry pass silently overwrote its wet pin and vice
+versa, since both passes shared the single stored value. Every `both`-mode
+plan/clean for that room then hit the mismatched-pin fallback path.
+
+- `set_room_pin(room, vacuum=None, kind=None)`: `kind` omitted unpins the
+  room entirely (both passes, used when a room is deselected on the
+  dashboard); `kind` given with no/empty `vacuum` unpins just that pass.
+- `anyvac.pin_room` service gained an optional `kind: dry|wet` field.
+- `anyvac.clean`/`anyvac.plan`'s `pin` override field changed shape to match
+  the stored format: `{room: {dry?: vacuum, wet?: vacuum}}`.
+- `planner.CleanPlanner._pin_for_kind()` flattens the per-room map down to
+  a single kind before calling `assign()`, which is otherwise unchanged.
+- Persisted pin storage auto-migrates: a pre-upgrade flat `{room: vacuum}`
+  entry carries no kind info to migrate onto, so it's dropped (equivalent
+  to a one-time reset to automatic assignment for any room pinned at the
+  moment of upgrade) rather than guessed.
+- The room-finished auto-clear (docs/18 §7e) now clears only the pass that
+  actually just ran (from the session's evidence-based clean type), not the
+  whole room — a still-pending wet pin survives the dry robot finishing
+  first in a `both` job.
+
 ## [0.78.0] - 2026-07-25
 
 Synced to `anyvac-card` 0.78.0 (docs/27 — trace stitching across a job's

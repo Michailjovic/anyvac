@@ -135,6 +135,23 @@ class CleanPlanner:
 
     # -- assignment ----------------------------------------------------------------
 
+    @staticmethod
+    def _pin_for_kind(
+        pin: dict[str, dict[str, str]] | None, kind: str
+    ) -> dict[str, str]:
+        """Flatten the per-room {"dry"/"wet": vacuum} pin map (docs/18 §7e,
+        per-kind since 2026-07-25) down to a single kind's {room: vacuum},
+        the shape ``assign()`` expects. Dry and wet are resolved independently
+        so pinning one pass never overrides/clobbers the other."""
+        if not pin:
+            return {}
+        out: dict[str, str] = {}
+        for room, kinds in pin.items():
+            v = kinds.get(kind) if isinstance(kinds, dict) else None
+            if v:
+                out[room] = v
+        return out
+
     def assign(
         self,
         rooms: list[str],
@@ -283,7 +300,7 @@ class CleanPlanner:
         rooms: list[str],
         mode: str,
         vacuums: Any = None,
-        pin: dict[str, str] | None = None,
+        pin: dict[str, dict[str, str]] | None = None,
         settings: dict[str, Any] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Build the run_job task list + a human-readable plan summary.
@@ -309,7 +326,9 @@ class CleanPlanner:
         dry_assign: dict[str, list[str]] = {}
         wet_assign: dict[str, list[str]] = {}
         if mode in ("dry", "both"):
-            dry_assign, dry_un = self.assign(rooms, "dry", vacuums, pin)
+            dry_assign, dry_un = self.assign(
+                rooms, "dry", vacuums, self._pin_for_kind(pin, "dry")
+            )
             if dry_un:
                 plan["unassigned"]["dry"] = dry_un
         room_dry_duid: dict[str, str] = {}
@@ -342,7 +361,9 @@ class CleanPlanner:
 
         timeline: dict[str, Any] | None = None
         if mode in ("wet", "both"):
-            wet_assign, wet_un = self.assign(rooms, "wet", vacuums, pin)
+            wet_assign, wet_un = self.assign(
+                rooms, "wet", vacuums, self._pin_for_kind(pin, "wet")
+            )
             if wet_un:
                 plan["unassigned"]["wet"] = wet_un
             # docs/23: the pool tasks' per-room `eta_min` hint needs the

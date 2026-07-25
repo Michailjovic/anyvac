@@ -100,7 +100,11 @@ SELECT_ROOMS_SCHEMA = vol.Schema(
 PIN_ROOM_SCHEMA = vol.Schema(
     {
         vol.Required("room"): str,
-        # Vacuum entity_id or duid; omitted/empty = unpin the room.
+        # "dry" or "wet" — dry/wet pins are independent (2026-07-25). Omitted
+        # together with "vacuum" unpins the room entirely (both passes);
+        # given with no/empty "vacuum" unpins just that one pass.
+        vol.Optional("kind"): vol.In(["dry", "wet"]),
+        # Vacuum entity_id or duid; omitted/empty = unpin (see "kind").
         vol.Optional("vacuum"): vol.Any(str, None),
     }
 )
@@ -144,7 +148,11 @@ CLEAN_SCHEMA = vol.Schema(
             [str],
             vol.Schema({vol.Optional("dry"): [str], vol.Optional("wet"): [str]}),
         ),
-        vol.Optional("pin"): {str: str},
+        # Per-room, per-pass override — same shape as the coordinator's stored
+        # room_pins (2026-07-25): {room: {"dry"/"wet": vacuum entity_id/duid}}.
+        # A room omitted here falls back to the stored pin, then to automatic
+        # assignment.
+        vol.Optional("pin"): {str: vol.Schema({vol.Optional("dry"): str, vol.Optional("wet"): str})},
         vol.Optional("settings"): vol.Schema(
             {
                 vol.Optional("dry"): _SETTINGS_KIND_SCHEMA,
@@ -522,7 +530,9 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
 
     async def _handle_pin_room(call: ServiceCall) -> None:
         for coord in _coordinators(hass):
-            coord.set_room_pin(call.data["room"], call.data.get("vacuum"))
+            coord.set_room_pin(
+                call.data["room"], call.data.get("vacuum"), call.data.get("kind")
+            )
 
     async def _handle_set_layers(call: ServiceCall) -> None:
         for coord in _coordinators(hass):

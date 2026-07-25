@@ -493,13 +493,20 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # devices and fed to the orchestrator. Persisted across restarts.
         self._sel_store: Store = Store(hass, 1, f"{DOMAIN}_selection")
         self._selected_rooms: set[str] = set()
-        # Per-room vacuum pins (docs/18 §7e): the user's "clean THIS room with THAT
-        # robot" overrides, {room_name: vacuum entity_id or duid}. Shared across
-        # devices like the selection; the planner uses them as the default `pin`
-        # (an explicit `pin` parameter on anyvac.clean wins). Auto-cleared per room
-        # when that room's clean finishes. Persisted across restarts.
+        # Per-room, per-pass vacuum pins (docs/18 §7e, per-kind since 2026-07-25):
+        # the user's "clean THIS room's dry/wet pass with THAT robot" overrides,
+        # {room_name: {"dry": vacuum entity_id or duid, "wet": ...}}. dry and wet
+        # are independent — a fleet with no dual-capable robot (e.g. dry-only S6/S7
+        # + wet-only S8) needs to be able to hold both preferences for the same
+        # room at once, which a single flat {room: vacuum} value could not do: the
+        # last pin set always silently overwrote the other pass's, and the planner
+        # would fall back to automatic assignment (with a WARNING) for whichever
+        # pass no longer matched the stored vacuum every single time. Shared across
+        # devices like the selection; the planner uses this as the default `pin`
+        # (an explicit `pin` parameter on anyvac.clean wins). Each pass auto-clears
+        # once that pass of the room actually finishes. Persisted across restarts.
         self._pins_store: Store = Store(hass, 1, f"{DOMAIN}_room_pins")
-        self._room_pins: dict[str, str] = {}
+        self._room_pins: dict[str, dict[str, str]] = {}
         # Room cleaning sequence (docs/19): the order configured in the Roborock app,
         # which is dominant regardless of what order HA sends segment ids in — the
         # firmware always visits rooms in this order (confirmed in the field across
@@ -686,17 +693,32 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         self.async_update_listeners()
 
     @property
-    def room_pins(self) -> dict[str, str]:
-        """Per-room vacuum pins {room_name: vacuum ref} (docs/18 §7e)."""
-        return dict(self._room_pins)
+    def room_pins(self) -> dict[str, dict[str, str]]:
+        """Per-room, per-pass vacuum pins {room_name: {"dry"/"wet": vacuum ref}}
+        (docs/18 §7e; per-kind since 2026-07-25)."""
+        return {room: dict(kinds) for room, kinds in self._room_pins.items()}
 
-    def set_room_pin(self, room: str, vacuum: str | None = None) -> None:
-        """Pin a room to a vacuum (anyvac.pin_room); vacuum None/empty = unpin."""
+    def set_room_pin(
+        self, room: str, vacuum: str | None = None, kind: str | None = None
+    ) -> None:
+        """Pin a room's dry or wet pass to a vacuum (anyvac.pin_room).
+
+        ``kind`` omitted unpins the room entirely (both passes) — used when a
+        room is deselected on the dashboard, so there's always a simple way
+        back to fully automatic assignment. ``kind`` given with no/empty
+        ``vacuum`` unpins just that one pass, leaving the other untouched.
+        """
         room = str(room)
-        if vacuum:
-            self._room_pins[room] = str(vacuum)
-        else:
+        if kind is None:
             self._room_pins.pop(room, None)
+        elif vacuum:
+            self._room_pins.setdefault(room, {})[kind] = str(vacuum)
+        else:
+            kinds = self._room_pins.get(room)
+            if kinds is not None:
+                kinds.pop(kind, None)
+                if not kinds:
+                    self._room_pins.pop(room, None)
         self._pins_store.async_delay_save(lambda: dict(self._room_pins), 2)
         self.async_update_listeners()
 
@@ -1132,10 +1154,29 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 self._sel_store.async_delay_save(lambda: sorted(self._selected_rooms), 2)
             # Pins are one-shot user overrides — clear them with the finished rooms
             # (docs/18 §7e), same lifecycle as the selection auto-clear above.
+            # Per-kind since 2026-07-25: this session's evidence-based `ct` is a
+            # single "dry" or "wet" (never both — one physical robot session is
+            # one pass), so only the pass that actually just ran is cleared,
+            # leaving the other pass's pin (e.g. a still-pending wet pin while
+            # the dry robot finishes first in a "both" job) untouched. `ct`
+            # unknown (no settings signal captured) falls back to clearing the
+            # whole room, same as the old flat-pin behavior.
             if rooms and any(r in self._room_pins for r in rooms):
+                pins_changed = False
                 for r in rooms:
-                    self._room_pins.pop(r, None)
-                self._pins_store.async_delay_save(lambda: dict(self._room_pins), 2)
+                    kinds = self._room_pins.get(r)
+                    if not kinds:
+                        continue
+                    if ct in ("dry", "wet"):
+                        if kinds.pop(ct, None) is not None:
+                            pins_changed = True
+                            if not kinds:
+                                self._room_pins.pop(r, None)
+                    else:
+                        self._room_pins.pop(r, None)
+                        pins_changed = True
+                if pins_changed:
+                    self._pins_store.async_delay_save(lambda: dict(self._room_pins), 2)
             self._session_rooms[duid] = set()
             # Clear the live per-room session accumulators NOW (calibration + baseline
             # learning above already consumed them). Without this, rooms_progress kept
@@ -1156,7 +1197,22 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             self._selected_rooms = {str(r) for r in sel}
         pins = await self._pins_store.async_load()
         if isinstance(pins, dict):
-            self._room_pins = {str(k): str(v) for k, v in pins.items() if v}
+            # Per-kind format (2026-07-25+): {room: {"dry"/"wet": vacuum}}. A
+            # pre-migration flat {room: vacuum} entry carries no kind info to
+            # migrate onto — dropped rather than guessed, equivalent to a
+            # one-time reset to automatic assignment for any room pinned at
+            # the moment of upgrade (consistent with the pin's existing
+            # self-healing/one-shot lifecycle, docs/18 §7e).
+            migrated: dict[str, dict[str, str]] = {}
+            for k, v in pins.items():
+                if not isinstance(v, dict):
+                    continue
+                kinds = {
+                    kk: str(vv) for kk, vv in v.items() if kk in ("dry", "wet") and vv
+                }
+                if kinds:
+                    migrated[str(k)] = kinds
+            self._room_pins = migrated
         seq = await self._seq_store.async_load()
         if isinstance(seq, dict):
             self._room_sequence = {
