@@ -153,10 +153,14 @@ CLEAN_SCHEMA = vol.Schema(
         # A room omitted here falls back to the stored pin, then to automatic
         # assignment.
         vol.Optional("pin"): {str: vol.Schema({vol.Optional("dry"): str, vol.Optional("wet"): str})},
+        # Per-vacuum, per-pass settings — {"dry"/"wet": {vacuum entity_id/duid:
+        # {fan_speed, mop_mode, mop_intensity, repeat}}} (2026-07-26). Each
+        # vacuum doing a pass keeps its own preset; a vacuum with no entry for
+        # a pass it's assigned to just runs that pass with firmware defaults.
         vol.Optional("settings"): vol.Schema(
             {
-                vol.Optional("dry"): _SETTINGS_KIND_SCHEMA,
-                vol.Optional("wet"): _SETTINGS_KIND_SCHEMA,
+                vol.Optional("dry"): {str: _SETTINGS_KIND_SCHEMA},
+                vol.Optional("wet"): {str: _SETTINGS_KIND_SCHEMA},
             }
         ),
     }

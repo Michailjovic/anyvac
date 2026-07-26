@@ -4,6 +4,78 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.80.5] - 2026-07-26
+
+No card change — integration-only release (docs/27 correction).
+
+### Fixed
+
+A vacuum's dry/wet trace never got wiped again once it had run inside any
+orchestrated job at least once — reported mid-field-test: "path se
+neodmazává vůbec", S8 running the same whole-home job repeatedly kept
+accumulating trace segments forever instead of starting fresh each run.
+
+Root cause: docs/27's cross-sortie stitching guarded the wipe with
+`duid not in self._job_rooms` — true only outside any active job. But
+`_JobRunner.start()` calls `coord.set_job_rooms(duid, rooms)` at the start of
+EVERY `anyvac.clean` job, so the very first sortie of a brand new, unrelated
+job looks identical to a sortie restart within an ALREADY-running job: both
+just see `job_rooms` become truthy again. The guard could tell "job scoped
+vs. not" but not "same job vs. a new one" — so once a vacuum had ever run
+inside an orchestrated job, its trace stitched onto every future job forever.
+
+Fixed with a monotonic per-vacuum job id: `set_job_rooms(duid, rooms)` now
+stamps a fresh id on every start call; `_sortie_is_new_job()` (new) wipes only
+when the active job's id differs from the one the stored trace was last
+stamped with (or when there's no active job scope at all — unchanged
+behaviour for degraded mode / manual per-vacuum start / raw `run_job`). A
+sortie restart WITHIN the same job (progressive pool dispatch, dock trip
+between a dry and wet pass, docs/23) still stitches exactly as docs/27
+intended — only genuinely new jobs wipe now. Applied at both call sites that
+detect a sortie reset (`_attribute_points`'s lazy path-length check and
+`_track_and_emit`'s cleaning-just-started transition), sharing one `bool`
+per poll so a dry+wet reset in the same poll doesn't double-consume the
+check.
+
+Per-vacuum trace persistence across DIFFERENT vacuums (e.g. S6 finishing
+Living room, S7 cleaning it later in a separate job) is unaffected by this
+fix and is not considered a bug — each vacuum's own trace is independent and
+wipes only on its own next job start, so two vacuums' traces may legitimately
+overlap on the map when both have recently visited the same room.
+
+1 new test (`tests/test_coordinator_pipeline.py::test_path_wipes_on_a_
+genuinely_new_job`) — confirmed to fail against the pre-fix logic (exactly
+reproduces the reported symptom) and pass with the fix. 47/47 tests in
+`anyvac/tests/` green.
+
+## [0.80.4] - 2026-07-26
+
+Synced to `anyvac-card` 0.80.4.
+
+### Fixed
+
+Clean settings (fan_speed / mop_mode / mop_intensity / repeat) were a single
+object shared by every vacuum doing a given pass — `build_tasks()` read
+`settings.get("dry")`/`settings.get("wet")` once per `build_tasks()` call and
+reused it for every dry/wet-capable robot in the loop, so whichever vacuum's
+preset the card sent (effectively the first dry-capable entry) silently won
+for all of them. Field report: S7's `fan_speed: max_plus` preset was ignored,
+always running at `max` (S6's preset) instead.
+
+`settings` is now per-vacuum: `{"dry"/"wet": {vacuum_ref: {fan_speed,
+mop_mode, mop_intensity, repeat}}}`. New `CleanPlanner._settings_for_duid()`
+resolves one vacuum's own settings (by duid or any entity id of its device,
+mirroring `_pin_for_kind`'s resolution), used in `build_tasks()` in place of
+the old shared per-kind lookup. `CLEAN_SCHEMA`'s `settings` field and
+`services.yaml` updated to the new nested shape; the old flat
+`{kind: {...}}` payload (e.g. from `_startClean`'s previous single-vacuum
+call) is no longer accepted — the card release above updates both call sites
+to match. 4 new tests (`tests/test_planner_settings.py`): per-vacuum
+resolution by entity/duid, two same-kind vacuums keeping distinct fan_speed
+values in the same `build_tasks()` call, and a vacuum with no settings entry
+getting no override (not another vacuum's value). 46/46 tests in
+`anyvac/tests/` green.
+
 ## [0.80.3] - 2026-07-25
 
 Synced to `anyvac-card` 0.80.3 (no card change — integration-only release for

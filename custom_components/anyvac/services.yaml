@@ -49,10 +49,12 @@ clean:
     settings:
       name: Settings
       description: >-
-        Per-pass mop/fan settings, e.g. `{"dry": {"fan_speed": "max"},
-        "wet": {"mop_intensity": "high", "repeat": 2}}`. Applies only to
-        the pass(es) the given `mode` actually runs.
-      example: '{"wet": {"mop_intensity": "high", "repeat": 2}}'
+        Per-vacuum, per-pass mop/fan settings — object keyed by `dry`/`wet`,
+        each value an object keyed by vacuum entity_id/duid with that
+        vacuum's own `fan_speed`/`mop_mode`/`mop_intensity`/`repeat`. Each
+        vacuum doing a pass keeps its own settings; a vacuum with no entry
+        for a pass it's assigned to just runs it with firmware defaults.
+      example: '{"wet": {"vacuum.s8_maxv_ultra": {"mop_intensity": "high", "repeat": 2}}}'
       selector:
         object:
 
@@ -97,7 +99,8 @@ plan:
         object:
     settings:
       name: Settings
-      description: Per-pass mop/fan settings — same shape as `anyvac.clean`.
+      description: >-
+        Per-vacuum, per-pass mop/fan settings — same shape as `anyvac.clean`.
       selector:
         object:
 

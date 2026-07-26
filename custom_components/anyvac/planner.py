@@ -271,6 +271,24 @@ class CleanPlanner:
 
     # -- task building ---------------------------------------------------------------
 
+    def _settings_for_duid(
+        self, settings: dict[str, Any] | None, kind: str, duid: str
+    ) -> dict[str, Any]:
+        """Resolve one vacuum's settings for a pass from the per-vacuum
+        ``{kind: {vacuum_ref: {...}}}`` map (2026-07-26). Settings used to be a
+        single object shared by every vacuum doing that pass — whichever vacuum's
+        preset was picked client-side silently won for ALL vacuums of that kind
+        (e.g. S6's fan_speed overriding S7's). Each vacuum now gets its own entry,
+        resolved the same way pins/vacuum-restrictions are (duid or any entity id
+        of the device)."""
+        kind_settings = (settings or {}).get(kind)
+        if not isinstance(kind_settings, dict):
+            return {}
+        for ref, s in kind_settings.items():
+            if isinstance(s, dict) and self._resolve_duid(str(ref)) == duid:
+                return s
+        return {}
+
     def _settings_calls(
         self, duid: str, kind: str, settings: dict[str, Any]
     ) -> tuple[list[dict[str, str]], str | None]:
@@ -301,7 +319,7 @@ class CleanPlanner:
         mode: str,
         vacuums: Any = None,
         pin: dict[str, dict[str, str]] | None = None,
-        settings: dict[str, Any] | None = None,
+        settings: dict[str, dict[str, dict[str, Any]]] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Build the run_job task list + a human-readable plan summary.
 
@@ -309,6 +327,12 @@ class CleanPlanner:
         ``anyvac_room_done`` (matched by duid + room name) and — when the same robot
         also runs a dry pass — on its own session finishing. Repeat is passed to the
         firmware in ``app_segment_clean`` (no dock-restart hacks, docs/14 §3.8).
+
+        ``settings`` is ``{"dry"/"wet": {vacuum_ref: {fan_speed, mop_mode,
+        mop_intensity, repeat}}}`` — per-vacuum since 2026-07-26 (see
+        ``_settings_for_duid``), because a fleet with several same-kind vacuums
+        (e.g. two dry-only robots) needs each to keep its own preset rather than
+        one shared per pass.
 
         docs/23 (2026-07-18): a wet-capable robot with 2+ assigned rooms in a
         ``both`` job gets a **pool task** instead of one static all-or-nothing
@@ -337,7 +361,7 @@ class CleanPlanner:
             if not entity:
                 _LOGGER.warning("AnyVac clean: no vacuum entity for duid %s; skipping", duid)
                 continue
-            kind_settings = settings.get("dry") or {}
+            kind_settings = self._settings_for_duid(settings, "dry", duid)
             selects, fan = self._settings_calls(duid, "dry", kind_settings)
             segs = [self.segments[duid][r] for r in rms]
             repeat = max(1, int(kind_settings.get("repeat") or 1))
@@ -378,7 +402,7 @@ class CleanPlanner:
                         "AnyVac clean: no vacuum entity for duid %s; skipping", duid
                     )
                     continue
-                kind_settings = settings.get("wet") or {}
+                kind_settings = self._settings_for_duid(settings, "wet", duid)
                 selects, fan = self._settings_calls(duid, "wet", kind_settings)
                 repeat = max(1, int(kind_settings.get("repeat") or 1))
                 own_gate = {"duid": duid} if duid in dry_assign else None

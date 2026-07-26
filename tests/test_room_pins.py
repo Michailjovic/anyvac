@@ -205,6 +205,9 @@ def _pin_lifecycle_coordinator(clock_now: datetime) -> AnyVacCoordinator:
     coord._last_poll = {}
     coord._room_cells = {}
     coord._job_rooms = {}
+    coord._job_seq = 0
+    coord._job_id = {}
+    coord._path_job_id = {}
     coord._transit_cells = {}
     coord._path_seen = {}
     coord._cov_baseline = {}

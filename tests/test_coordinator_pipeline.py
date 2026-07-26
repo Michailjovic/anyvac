@@ -104,6 +104,9 @@ def _new_coordinator(monkeypatch: pytest.MonkeyPatch, clock: _Clock) -> AnyVacCo
     coord._last_poll = {}
     coord._room_cells = {}
     coord._job_rooms = {}
+    coord._job_seq = 0
+    coord._job_id = {}
+    coord._path_job_id = {}
     coord._transit_cells = {}
     coord._path_seen = {}
     coord._cov_baseline = {}
@@ -565,3 +568,60 @@ def test_path_resets_across_sorties_without_job_scope(
     ))
     assert coord._dry_path[duid] == [[{"x": 200, "y": 100}]]
     assert coord._wet_path[duid] == [[{"x": 200, "y": 100}]]
+
+
+def test_path_wipes_on_a_genuinely_new_job(monkeypatch: pytest.MonkeyPatch, clock: _Clock) -> None:
+    """Field bug (2026-07-26): `set_job_rooms` becomes truthy again the moment
+    ANY new `anyvac.clean` job starts — including a brand new, unrelated job
+    for a vacuum that already ran inside some earlier job. A bare
+    `duid in self._job_rooms` check (the pre-fix code) cannot tell that case
+    apart from a sortie restart WITHIN the same job, so the trace never got
+    wiped again once a vacuum had run inside any orchestrated job even once —
+    reported as S8's path never clearing across repeated whole-home runs.
+
+    `_sortie_is_new_job` fixes this with a monotonic job id: job A's sortie
+    restarts stitch (as `test_path_stitches_across_job_sorties` covers), but
+    job B — a completely separate `set_job_rooms` call after job A finished —
+    must wipe the trace on its own first sortie, exactly like the no-job-scope
+    case, not stitch onto job A's leftover trace."""
+    coord = _new_coordinator(monkeypatch, clock)
+    duid = "d8"
+
+    # Job A: one sortie, one point, then the job finishes (job_rooms cleared,
+    # mirroring _JobRunner.finish()) — the trace is left on screen per docs/27.
+    coord.set_job_rooms(duid, {"Hall"})
+    _poll(coord, _device(
+        duid, vacuum_room_name="Hall",
+        _path_dry=[{"x": 100, "y": 100}], _path_wet=[{"x": 100, "y": 100}],
+    ))
+    clock.advance(minutes=5)
+    _poll(coord, _device(duid, in_cleaning=False))
+    coord.set_job_rooms(duid, None)
+    assert coord._dry_path[duid] == [[{"x": 100, "y": 100}]]
+    assert coord._wet_path[duid] == [[{"x": 100, "y": 100}]]
+
+    # Job B: a brand new `anyvac.clean` call for the SAME vacuum/room, started
+    # some time later — a fresh `set_job_rooms` call, exactly like
+    # `_JobRunner.start()` issues for every new job regardless of what ran
+    # before. Its first sortie must wipe job A's leftover trace, not stitch a
+    # second segment onto it.
+    clock.advance(minutes=10)
+    coord.set_job_rooms(duid, {"Hall"})
+    _poll(coord, _device(
+        duid, vacuum_room_name="Hall",
+        _path_dry=[{"x": 900, "y": 900}], _path_wet=[{"x": 900, "y": 900}],
+    ))
+    assert coord._dry_path[duid] == [[{"x": 900, "y": 900}]]
+    assert coord._wet_path[duid] == [[{"x": 900, "y": 900}]]
+
+    # Job B's own second sortie (progressive dispatch) still stitches, same as
+    # job A's did — the fix doesn't turn off within-job stitching.
+    clock.advance(minutes=5)
+    _poll(coord, _device(duid, in_cleaning=False))
+    clock.advance(minutes=1)
+    _poll(coord, _device(
+        duid, vacuum_room_name="Hall",
+        _path_dry=[{"x": 950, "y": 900}], _path_wet=[{"x": 950, "y": 900}],
+    ))
+    assert coord._dry_path[duid] == [[{"x": 900, "y": 900}], [{"x": 950, "y": 900}]]
+    assert coord._wet_path[duid] == [[{"x": 900, "y": 900}], [{"x": 950, "y": 900}]]

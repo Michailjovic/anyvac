@@ -529,6 +529,21 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # job scope known for that duid (manual/native/degraded runs) — attribution then
         # falls back to today's state-only TRANSIT_STATES gating, unchanged.
         self._job_rooms: dict[str, set[str]] = {}
+        # Monotonic id of the currently active job per vacuum, and the id the
+        # STORED path currently belongs to (docs/27 follow-up, 2026-07-26). A
+        # `job_rooms` presence check alone cannot tell "still the same job's
+        # next sortie" apart from "a brand new job's first sortie" — both look
+        # identical (job_rooms just became truthy again) the moment a new
+        # `anyvac.clean` starts, which is exactly the confirmed field bug: the
+        # cross-sortie stitching from docs/27 accidentally also stitched
+        # across ENTIRELY SEPARATE job runs, so a vacuum's trace never got
+        # wiped again once it had run inside any orchestrated job at least
+        # once. `_job_id` increments on every `set_job_rooms(duid, rooms)`
+        # start call; comparing it against `_path_job_id` (see
+        # `_sortie_is_new_job`) is what actually distinguishes the two cases.
+        self._job_seq = 0
+        self._job_id: dict[str, int] = {}
+        self._path_job_id: dict[str, int | None] = {}
         # Cells seen this session while OUTSIDE the active job's room scope — driven
         # through on the way to an actually-scoped room, not really "cleaning" that
         # room for THIS job even though the vacuum's raw state says "cleaning" (no
@@ -747,7 +762,34 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         if rooms is None:
             self._job_rooms.pop(duid, None)
         else:
+            self._job_seq += 1
+            self._job_id[duid] = self._job_seq
             self._job_rooms[duid] = set(rooms)
+
+    def _sortie_is_new_job(self, duid: str) -> bool:
+        """Cross-sortie path stitching (docs/27), corrected 2026-07-26: tells
+        the two path-wipe call sites below whether the sortie that's about to
+        start belongs to a job the stored trace hasn't seen yet.
+
+        True (wipe) when either: (a) no job scope is active right now — the
+        original pre-docs/27 case, manual/degraded/raw `run_job` starts, wiped
+        on every sortie as before; or (b) a job IS active, but its id differs
+        from the one the currently stored trace was last stamped with — a
+        genuinely NEW `anyvac.clean` job, whose id `set_job_rooms` assigned
+        fresh, distinct from whatever job (if any) the old trace belonged to.
+
+        False (keep, just close the segment) only when the active job's id
+        matches what the stored trace already belongs to — a sortie restart
+        WITHIN the same job (progressive pool dispatch, dock trip between a
+        dry and wet pass, docs/23), which is the one case docs/27 exists to
+        stitch instead of drawing a straight line across the dock trip.
+
+        Has the side effect of stamping the trace with the current job id, so
+        each detected sortie-reset must call this exactly once."""
+        current = self._job_id.get(duid) if duid in self._job_rooms else None
+        is_new = current is None or current != self._path_job_id.get(duid)
+        self._path_job_id[duid] = current
+        return is_new
 
     def set_selection(self, rooms: list[str], mode: str = "set") -> None:
         """Mutate the shared room selection. mode: set / add / remove / toggle / clear."""
@@ -831,6 +873,11 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
 
         # Slice out the new points per layer (handle a path reset) regardless of state.
         new_by_layer: dict[str, list[dict[str, float]]] = {}
+        # Computed lazily, at most once per poll, and reused across both layers below —
+        # `_sortie_is_new_job` stamps as a side effect, so calling it twice for the SAME
+        # sortie-reset event (dry and wet both reset together at every sortie boundary)
+        # would make the second call wrongly see "already stamped, not new".
+        sortie_wipe: bool | None = None
         for layer, dkey in layers:
             full = device.data.get(dkey) or []
             start = seen.get(layer, 0)
@@ -838,19 +885,20 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 start = 0
                 for rc in self._room_cells.get(duid, {}).values():
                     rc[layer] = set()
-                # Cross-sortie stitching (docs/27): a mid-job sortie restart (robot back
-                # from a dock trip, next pool-dispatch batch) must NOT wipe the
-                # already-drawn trace — only close the current segment so the next points
-                # start a new one. Outside an active job (degraded mode / manual per-vacuum
-                # start / raw run_job), this IS a genuinely new, unrelated session, so the
-                # old behaviour (wipe) stands.
-                job_scoped = duid in self._job_rooms
+                # Cross-sortie stitching (docs/27, job-id corrected 2026-07-26): a
+                # mid-job sortie restart (robot back from a dock trip, next
+                # pool-dispatch batch) must NOT wipe the already-drawn trace — only
+                # close the current segment so the next points start a new one. A
+                # genuinely NEW job (or no job scope at all — degraded mode / manual
+                # per-vacuum start / raw run_job) DOES wipe, same as before docs/27.
+                if sortie_wipe is None:
+                    sortie_wipe = self._sortie_is_new_job(duid)
                 if layer == "dry":
-                    if not job_scoped:
+                    if sortie_wipe:
                         self._dry_path[duid] = []
                     self._dry_path_open[duid] = False
                 else:
-                    if not job_scoped:
+                    if sortie_wipe:
                         self._wet_path[duid] = []
                     self._wet_path_open[duid] = False
             new_by_layer[layer] = full[start:]
@@ -1024,11 +1072,12 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 self._room_cells[duid] = {}
                 self._transit_cells[duid] = {}
                 self._path_seen[duid] = {"dry": 0, "wet": 0}
-                # Cross-sortie stitching (docs/27): same job-scope guard as the lazy
-                # reset detection in `_attribute_points` — don't wipe the trace for a
-                # sortie restart that's part of the same orchestrated job, only close
-                # the current segment so it isn't bridged with a straight line.
-                if duid not in self._job_rooms:
+                # Cross-sortie stitching (docs/27, job-id corrected 2026-07-26): same
+                # `_sortie_is_new_job` check as the lazy reset detection in
+                # `_attribute_points` — don't wipe the trace for a sortie restart within
+                # the SAME job, only close the current segment so it isn't bridged with
+                # a straight line; a genuinely new job (or no job scope) does wipe.
+                if self._sortie_is_new_job(duid):
                     self._dry_path[duid] = []
                     self._wet_path[duid] = []
                 self._dry_path_open[duid] = False
