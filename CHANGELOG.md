@@ -4,6 +4,49 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.80.6] - 2026-07-26
+
+No card change — integration-only release.
+
+### Fixed
+
+After a HA restart, a vacuum's dry trace showed nothing at all while its wet
+trace showed one giant undifferentiated blob instead of the last clean's real
+segmented shape. Reported: "vidím tam jen nějaký historický mop path"
+(clarified: the goal is for BOTH traces to survive a restart and keep
+showing the last clean exactly as it looked before, resetting only on a
+genuinely new job/sortie per the 0.80.5 fix above — never on the restart
+itself).
+
+Root cause: `_dry_path`/`_wet_path` (the segmented, already-gated trace) plus
+their bookkeeping (`_path_seen`, `_dry_path_open`/`_wet_path_open`) were pure
+in-memory state, never persisted. A restart wiped them to empty; the very
+first poll afterwards then re-diffed the robot's raw path buffers against a
+freshly-empty `_path_seen`, which for wet (no semantic gate) unconditionally
+dumped the robot's ENTIRE last-session raw mop path as one undifferentiated
+segment, and for dry produced nothing at all unless the robot happened to be
+actively vacuuming at that exact poll (its gate requires live state).
+
+Fixed with a new `Store` (`_paths_store`, `custom_components.anyvac_paths`),
+loaded in `_async_setup()` and saved (debounced, 5s) from `_attribute_points()`
+whenever the trace, its open/closed segment state, or a wipe/stitch decision
+actually changes this poll — not on every idle poll, to avoid writing to disk
+every `SCAN_INTERVAL` regardless of whether a vacuum is doing anything. The
+gate closing with no new points (e.g. the session-end poll) is also treated
+as a save-worthy change, not just new points landing — otherwise a restart
+right after a session ends but before the next sortie could reload with a
+segment incorrectly still marked "open". A genuinely new job/sortie
+(`_sortie_is_new_job`, 0.80.5) still wipes and persists the wipe immediately,
+independent of the restart-survival fix.
+
+3 new tests (`tests/test_path_persistence.py`): a completed clean's dry+wet
+trace round-trips unchanged through a simulated restart (fresh coordinator
+instance loading from the same backing store); a new job's wipe is persisted
+as empty rather than leaving a stale pre-wipe snapshot on "disk"; a direct
+`_paths_for_save()` → `_async_setup()` serialisation round-trip. Two of the
+three confirmed to fail when the load side of the fix is disabled (genuine
+regression tests, not tautologies). 50/50 tests in `anyvac/tests/` green.
+
 ## [0.80.5] - 2026-07-26
 
 No card change — integration-only release (docs/27 correction).

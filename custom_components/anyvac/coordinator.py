@@ -579,11 +579,19 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # covered more than one room (bug found 2026-07-15: finished traces looked like
         # scribbles while the live in-progress trace still looked clean).
         # {duid: [ [ {x, y}, ... ], [ {x, y}, ... ], ... ]}.
+        # Persisted across restarts since 2026-07-26 (see `_paths_store` below) —
+        # this is the user-visible "last clean" trace, not just live-session
+        # scratch state; a HA restart must not blank it or replace it with an
+        # unsegmented dump of the robot's own raw buffer (field report: dry
+        # showed nothing at all post-restart since its gate never reopens for
+        # an idle robot, wet showed one giant undifferentiated blob since it has
+        # no such gate — see `_paths_store`/`_paths_for_save` for the fix).
         self._dry_path: dict[str, list[list[dict[str, float]]]] = {}
         # Whether the gate was open on the immediately preceding poll, per vacuum — tells
         # `_attribute_points` whether new points continue the last segment or must start
         # a fresh one. Not the same as "new points arrived": a poll with the gate open but
         # zero new points (robot paused, suction still on) must NOT start a new segment.
+        # Persisted alongside `_dry_path` (same reason).
         self._dry_path_open: dict[str, bool] = {}
         # Wet (mop) trace, segmented the same shape as `_dry_path` (docs/27) — needed so
         # cross-sortie stitching (below) can bridge a dock trip with a new segment instead
@@ -592,8 +600,24 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # down, so a poll with new wet points always continues (or opens) the current
         # segment; `_wet_path_open` is only forced closed at a genuine job/session
         # boundary (never mid-sortie), so a slow mop pass never gets fragmented.
+        # Persisted alongside `_dry_path` (same reason).
         self._wet_path: dict[str, list[list[dict[str, float]]]] = {}
         self._wet_path_open: dict[str, bool] = {}
+        # Persistence for the four dicts above (2026-07-26 follow-up to docs/27):
+        # without this, a HA restart wiped the segmented trace entirely — the
+        # very next poll then re-diffed the robot's raw path buffers against a
+        # freshly-empty `_path_seen`, which (a) for wet unconditionally dumped
+        # the robot's ENTIRE last-session raw mop path as one undifferentiated
+        # blob (no semantic gate to stop it) and (b) for dry produced nothing at
+        # all unless the robot happened to be actively vacuuming at that exact
+        # poll (its gate requires live state). Net effect: "I only see some old
+        # mop path, no dry trace" after every restart — reported 2026-07-26.
+        # The fix persists our OWN already-gated/segmented trace + the bookkeeping
+        # needed to resume diffing correctly (`_path_seen`/open-flags), so a
+        # restart shows exactly the last clean as it looked before restart, and
+        # only a genuinely NEW job/sortie (`_sortie_is_new_job`) wipes it — never
+        # the restart itself.
+        self._paths_store: Store = Store(hass, 1, f"{DOMAIN}_paths")
         # Pipeline observability (docs/13 B6): warn (once) when a previously seen vacuum
         # stops yielding map data — the roborock internals may have changed.
         self._known_duids: set[str] = set()
@@ -916,22 +940,39 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # open across this poll (even one with zero new points, e.g. a paused robot):
         # keep extending the current segment.
         gate_open = cleaning and not transit and vacuuming
-        if gate_open and new_by_layer["dry"]:
+        was_dry_open = self._dry_path_open.get(duid, False)
+        dry_changed = gate_open and bool(new_by_layer["dry"])
+        if dry_changed:
             segs = self._dry_path.setdefault(duid, [])
-            if not self._dry_path_open.get(duid):
+            if not was_dry_open:
                 segs.append([])
             segs[-1].extend(new_by_layer["dry"])
         self._dry_path_open[duid] = gate_open
+        # The gate closing (e.g. the session-end poll, cleaning -> not cleaning)
+        # touches no NEW points at all, so `dry_changed` alone would miss it —
+        # but it must still persist: otherwise a restart landing right after a
+        # session ends (before any new sortie) would reload with the segment
+        # incorrectly still marked "open" (2026-07-26, path persistence tests).
+        dry_open_changed = was_dry_open != gate_open
 
         # Wet trace (docs/27): no semantic gate needed (see `_wet_path_open` docstring in
         # __init__) — a new segment opens whenever `_wet_path_open` was forced closed by a
         # job/session boundary above; otherwise new points just extend the open segment.
-        if new_by_layer["wet"]:
+        wet_changed = bool(new_by_layer["wet"])
+        if wet_changed:
             wsegs = self._wet_path.setdefault(duid, [])
             if not self._wet_path_open.get(duid):
                 wsegs.append([])
             wsegs[-1].extend(new_by_layer["wet"])
             self._wet_path_open[duid] = True
+
+        # Persist the trace (2026-07-26, see `_paths_store`) only when it actually
+        # changed this poll — new points appended, an open/closed transition, or
+        # a wipe/stitch decision was made — not on every idle poll, to avoid
+        # writing to disk every SCAN_INTERVAL forever regardless of whether the
+        # vacuum is doing anything.
+        if dry_changed or wet_changed or dry_open_changed or sortie_wipe is not None:
+            self._paths_store.async_delay_save(self._paths_for_save, 5)
 
         if not cleaning or transit:
             return
@@ -1080,6 +1121,12 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 if self._sortie_is_new_job(duid):
                     self._dry_path[duid] = []
                     self._wet_path[duid] = []
+                    # Persist the wipe itself right away (2026-07-26) — `_attribute_points`
+                    # runs right after this in the same poll and usually also triggers a
+                    # save once the new session's first points land, but a poll where the
+                    # robot hasn't produced any points yet must not leave the stale
+                    # pre-wipe trace sitting on disk in the meantime.
+                    self._paths_store.async_delay_save(self._paths_for_save, 5)
                 self._dry_path_open[duid] = False
                 self._wet_path_open[duid] = False
                 self._session_start[duid] = dt_util.utcnow()
@@ -1297,9 +1344,64 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     if vals:
                         loaded.setdefault(duid, {})[room] = vals
             self._estimates = loaded
+        paths = await self._paths_store.async_load()
+        if isinstance(paths, dict):
+            for raw_duid, rec in paths.items():
+                if not isinstance(rec, dict):
+                    continue
+                duid = str(raw_duid)
+
+                def _segs(val: Any) -> list[list[dict[str, float]]]:
+                    if not isinstance(val, list):
+                        return []
+                    out: list[list[dict[str, float]]] = []
+                    for seg in val:
+                        if not isinstance(seg, list):
+                            continue
+                        out.append(
+                            [
+                                {"x": float(p["x"]), "y": float(p["y"])}
+                                for p in seg
+                                if isinstance(p, dict) and "x" in p and "y" in p
+                            ]
+                        )
+                    return out
+
+                dp = _segs(rec.get("dry_path"))
+                if dp:
+                    self._dry_path[duid] = dp
+                wp = _segs(rec.get("wet_path"))
+                if wp:
+                    self._wet_path[duid] = wp
+                ps = rec.get("path_seen")
+                if isinstance(ps, dict):
+                    self._path_seen[duid] = {
+                        "dry": int(ps.get("dry", 0) or 0),
+                        "wet": int(ps.get("wet", 0) or 0),
+                    }
+                if rec.get("dry_path_open"):
+                    self._dry_path_open[duid] = True
+                if rec.get("wet_path_open"):
+                    self._wet_path_open[duid] = True
 
     def _history_for_save(self) -> dict[str, dict[str, str]]:
         return self._history
+
+    def _paths_for_save(self) -> dict[str, dict[str, Any]]:
+        """Snapshot of the segmented trace + the bookkeeping needed to resume
+        diffing the robot's raw path buffers correctly next time (2026-07-26,
+        see `_paths_store`) — one JSON-safe dict per known duid."""
+        duids = set(self._dry_path) | set(self._wet_path) | set(self._path_seen)
+        return {
+            duid: {
+                "dry_path": self._dry_path.get(duid, []),
+                "wet_path": self._wet_path.get(duid, []),
+                "path_seen": self._path_seen.get(duid, {"dry": 0, "wet": 0}),
+                "dry_path_open": self._dry_path_open.get(duid, False),
+                "wet_path_open": self._wet_path_open.get(duid, False),
+            }
+            for duid in duids
+        }
 
     def _evidence_kinds(self, device: AnyVacDevice, room: str, strict: bool = True) -> list[str]:
         """Which clean kinds have real EVIDENCE in `room` this session (docs/16).

@@ -83,7 +83,7 @@ def _new_coordinator(monkeypatch: pytest.MonkeyPatch, clock: _Clock) -> AnyVacCo
     coord.hass = _FakeHass()
     for attr in (
         "_store", "_est_store", "_cov_store", "_sel_store",
-        "_pins_store", "_seq_store", "_layers_store",
+        "_pins_store", "_seq_store", "_layers_store", "_paths_store",
     ):
         setattr(coord, attr, _FakeStore())
     coord._history = {}
