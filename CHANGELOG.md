@@ -4,6 +4,25 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.80.3] - 2026-07-25
+
+Synced to `anyvac-card` 0.80.3 (no card change — integration-only release for
+tomorrow's field test observability).
+
+### Added
+
+INFO-level logging for the progressive-dispatch wait-vs-go decision
+(docs/23, `_JobRunner._dispatch_pools()`/`_dispatch_pool_batch()`) — there
+was previously no log trail for *why* a pool task waited or dispatched, only
+the eventual `vacuum.send_command` itself (indistinguishable in the log from
+any other command). Ahead of the first live field test of the exact
+scenario that motivated docs/23 (2 quick rooms + 1 slow room, one wet-capable
+robot for all three), added three log lines: waiting for a soon-ready room
+(which room, how long, elapsed vs. the `BATCH_WAIT_CAP_MIN` cap), dispatching
+without waiting (nothing due soon / cap reached), and the actual dispatch
+(which rooms went out together). Observability only — no behavior change,
+42/42 tests still pass.
+
 ## [0.80.2] - 2026-07-25
 
 Synced to `anyvac-card` 0.80.2.

@@ -336,10 +336,27 @@ class _JobRunner:
                 now_min = (dt_util.utcnow() - self._start_time).total_seconds() / 60
                 wait_needed = soonest - now_min
                 if 0 < wait_needed <= BATCH_WAIT_THRESHOLD_MIN:
+                    # docs/23 field test observability (2026-07-25): the wait-vs-go
+                    # decision itself had no log trail — worth seeing which room(s)
+                    # a batch waited for and for how long, not just the eventual
+                    # send_command.
+                    _LOGGER.info(
+                        "AnyVac pool %s (%s): %s ready, waiting ~%.1f min for %s "
+                        "(elapsed %.1f/%s min cap)",
+                        tid, pt["vacuum"], sorted(ready), wait_needed,
+                        sorted(not_ready), elapsed_min, BATCH_WAIT_CAP_MIN,
+                    )
                     self._pool_wait_cancel[tid] = async_call_later(
                         self.hass, wait_needed * 60, self._make_pool_recheck(tid)
                     )
                     continue
+            if not_ready:
+                _LOGGER.info(
+                    "AnyVac pool %s (%s): dispatching %s now, not waiting for %s "
+                    "(elapsed %.1f min%s)",
+                    tid, pt["vacuum"], sorted(ready), sorted(not_ready), elapsed_min,
+                    " >= cap" if elapsed_min >= BATCH_WAIT_CAP_MIN else " — nothing due soon",
+                )
             await self._dispatch_pool_batch(tid, pt, ready)
 
     def _make_pool_recheck(self, tid: str):
@@ -388,6 +405,7 @@ class _JobRunner:
                 },
                 blocking=True,
             )
+            _LOGGER.info("AnyVac pool %s (%s): dispatched %s", tid, entity, sorted(rooms))
         except Exception as err:  # noqa: BLE001 - one bad batch must not wedge the job
             _LOGGER.warning(
                 "AnyVac run_job: pool task %s batch %s failed: %s", tid, rooms, err
