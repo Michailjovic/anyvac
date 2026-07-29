@@ -567,6 +567,16 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # {duid: {room_name: {"dry": n, "wet": n}}}. Persisted across restarts.
         self._cov_store: Store = Store(hass, 1, f"{DOMAIN}_coverage_baseline")
         self._cov_baseline: dict[str, dict[str, dict[str, int]]] = {}
+        # Persistent per-room coverage % of the last COMPLETED clean (docs/29): unlike
+        # the live `_build_progress` gauge (reads `_room_cells`, which resets to empty
+        # the moment a session ends), this is a durable "last clean covered X%" snapshot
+        # — keyed like `_history` (room NAME, shared across the fleet; whichever pass
+        # most recently completed wins), not per-duid like `_cov_baseline` above.
+        # Written once per completed room/kind at session end (`_track_and_emit`).
+        # Missing kind = no completed clean with an established baseline yet — the
+        # card shows "—", never a misleading 100%. {room_name: {"dry": pct, "wet": pct}}.
+        self._cov_pct_store: Store = Store(hass, 1, f"{DOMAIN}_room_coverage_pct")
+        self._room_coverage: dict[str, dict[str, int]] = {}
         # Segmented DRY trace (docs/14 §3.9): the parser's ``path`` is the robot's FULL
         # trajectory (transit, mop-wash trips and goto included), so it must not be shown
         # as the "dry" layer directly. Only points recorded while actively cleaning and
@@ -688,6 +698,20 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         if baselines:
             _prune(self._cov_baseline)
             self._cov_store.async_delay_save(lambda: self._cov_baseline, 2)
+            # The persisted coverage % (docs/29) was computed against a baseline that
+            # just got wiped above — stale now, drop it too so the card shows "—"
+            # again instead of a % anchored to a baseline that no longer exists.
+            # `_room_coverage` has no duid dimension (mirrors `_history`'s cross-fleet
+            # room-name keying), so a duid-scoped reset still clears by room/kind only
+            # — a minor over-clear at worst, self-healed by the next completed clean.
+            for rnm in list(self._room_coverage):
+                if room and rnm != room:
+                    continue
+                for k in kinds:
+                    self._room_coverage[rnm].pop(k, None)
+                if not self._room_coverage[rnm]:
+                    self._room_coverage.pop(rnm)
+            self._cov_pct_store.async_delay_save(lambda: self._room_coverage, 2)
         self.async_update_listeners()
 
     def pct_to_mm(self, duid: str, x_pct: float, y_pct: float) -> tuple[int, int] | None:
@@ -1176,6 +1200,13 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             # rightfully learns the same minutes into BOTH tables.
             calibrated: dict[str, dict[str, Any]] = {}
             calib_rooms: dict[str, dict[str, Any]] = {}
+            # Persistent per-room coverage % (docs/29): snapshot dry/wet % against the
+            # PRE-session baseline (computed here, before the `_learn_coverage` loop
+            # below updates `_cov_baseline` with this session's own cells) so the
+            # persisted number reads consistently with what the live debug gauge showed
+            # during the clean, rather than trivially settling near 100% because the
+            # baseline just absorbed this very session.
+            coverage_changed = False
             for nm, sec in sorted((self._room_elapsed.get(duid) or {}).items()):
                 active_min = round(sec / 60)
                 rc = self._room_cells.get(duid, {}).get(nm) or {}
@@ -1194,6 +1225,14 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     # not trivially pass the coverage gate — ignore it (same as _norm).
                     if base and bbox_total and base < 0.2 * bbox_total:
                         base = None
+                    # No baseline yet = "—" on the card (docs/29 §4.3), never a naive
+                    # bbox-relative guess — only a genuinely completed room with an
+                    # established baseline and real evidence updates the persisted %.
+                    if completed and base and cells >= 3:
+                        pct = min(100, round(100 * cells / base))
+                        if self._room_coverage.setdefault(nm, {}).get(kind) != pct:
+                            self._room_coverage[nm][kind] = pct
+                            coverage_changed = True
                     krec: dict[str, Any] = {"cells": cells, "baseline": base}
                     if cells < 3:
                         krec["accepted"], krec["reason"] = False, "no evidence of this kind"
@@ -1213,6 +1252,8 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                             krec["accepted"], krec["reason"] = False, "rejected by learner"
                     room_rec[kind] = krec
                 calib_rooms[nm] = room_rec
+            if coverage_changed:
+                self._cov_pct_store.async_delay_save(lambda: self._room_coverage, 5)
             if calibrated:
                 event["calibrated"] = calibrated
             self._last_calib[duid] = {
@@ -1330,6 +1371,13 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 }
                 for duid, rooms in cov.items()
                 if isinstance(rooms, dict)
+            }
+        cov_pct = await self._cov_pct_store.async_load()
+        if isinstance(cov_pct, dict):
+            self._room_coverage = {
+                room: {k: int(v) for k, v in kinds.items() if k in ("dry", "wet") and isinstance(v, (int, float))}
+                for room, kinds in cov_pct.items()
+                if isinstance(kinds, dict)
             }
         est = await self._est_store.async_load()
         if isinstance(est, dict):
@@ -1583,11 +1631,15 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                         room["estimate_dry"] = est.get("dry")
                         room["estimate_wet"] = est.get("wet")
                         room["progress_pct"] = (progress.get(room.get("name")) or {}).get("spatial_pct")
+                        cov_rec = self._room_coverage.get(room.get("name")) or {}
+                        room["coverage_dry"] = cov_rec.get("dry")
+                        room["coverage_wet"] = cov_rec.get("wet")
                     device.data["rooms_last_cleaned"] = {k: dict(v) for k, v in self._history.items()}
                     device.data["rooms_estimate"] = {
                         r: dict(c) for r, c in (self._estimates.get(device.duid) or {}).items()
                     }
                     device.data["rooms_progress"] = progress
+                    device.data["rooms_coverage"] = {k: dict(v) for k, v in self._room_coverage.items()}
                     device.data.pop("_path_dry", None)
                     device.data.pop("_path_wet", None)
                     # Typed trace layers (docs/14 §3.9): path_dry = trajectory segmented

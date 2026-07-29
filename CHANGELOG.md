@@ -4,6 +4,31 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.82.0] - 2026-07-29
+
+Paired with card 0.82.0 (version synced to the card release it ships with,
+per the versioning convention — see CLAUDE.md).
+
+### Added
+
+Room coverage % (docs/29, spec ratified 2026-07-29). The spatial coverage
+math (`dry_pct`/`wet_pct` = visited cells / learned `_cov_baseline`) already
+existed in `_build_progress()` for the live debug gauge, but it went stale
+the instant `_room_cells` reset at session end — there was no durable
+"last clean covered X%" per room. New persistent `Store`
+(`custom_components.anyvac_room_coverage_pct`) and `_room_coverage` dict,
+keyed by room name like `_history` (shared across the fleet, whichever pass
+most recently completed wins) — written once per completed room/kind in
+`_track_and_emit`, computed against the baseline as it stood BEFORE that
+same session's own `_learn_coverage` update, so it reads consistently with
+what the live gauge showed during the clean. No baseline yet (first-ever
+clean of a room) leaves the value unset — the card shows "—", never a
+misleading 100%. Exposed as `coverage_dry`/`coverage_wet` per room and as
+the consolidated `rooms_coverage` attribute (added to `_unrecorded_attributes`
+alongside `rooms_progress`). `anyvac.reset_learning(baselines=True)` also
+clears the now-stale persisted % for the baseline(s) it wipes. 3 new tests
+(`tests/test_room_coverage_pct.py`) — 53/53 tests in `anyvac/tests/` green.
+
 ## [0.80.6] - 2026-07-26
 
 No card change — integration-only release.

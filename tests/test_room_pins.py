@@ -136,6 +136,7 @@ async def _load_pins(load_value: Any) -> dict[str, dict[str, str]]:
     coord._seq_store = _FakeStore()
     coord._layers_store = _FakeStore()
     coord._cov_store = _FakeStore()
+    coord._cov_pct_store = _FakeStore()
     coord._est_store = _FakeStore()
     coord._paths_store = _FakeStore()
     coord._room_pins = {}  # __init__'s default, in case `load_value` isn't a dict
@@ -185,7 +186,7 @@ def _pin_lifecycle_coordinator(clock_now: datetime) -> AnyVacCoordinator:
     `_new_coordinator`/`_poll` pattern, trimmed to what this path touches."""
     coord = object.__new__(AnyVacCoordinator)
     coord.hass = _FakeHass()
-    for attr in ("_store", "_est_store", "_cov_store", "_sel_store", "_seq_store", "_layers_store", "_paths_store"):
+    for attr in ("_store", "_est_store", "_cov_store", "_cov_pct_store", "_sel_store", "_seq_store", "_layers_store", "_paths_store"):
         setattr(coord, attr, _FakeStore())
     coord._pins_store = _FakeStore()
     coord._history = {}
@@ -212,6 +213,7 @@ def _pin_lifecycle_coordinator(clock_now: datetime) -> AnyVacCoordinator:
     coord._transit_cells = {}
     coord._path_seen = {}
     coord._cov_baseline = {}
+    coord._room_coverage = {}
     coord._dry_path = {}
     coord._dry_path_open = {}
     coord._wet_path = {}

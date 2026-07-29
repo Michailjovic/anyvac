@@ -109,7 +109,7 @@ def _new_coordinator(
     coord = object.__new__(AnyVacCoordinator)
     coord.hass = _FakeHass()
     for attr in (
-        "_store", "_est_store", "_cov_store", "_sel_store",
+        "_store", "_est_store", "_cov_store", "_cov_pct_store", "_sel_store",
         "_pins_store", "_seq_store", "_layers_store",
     ):
         setattr(coord, attr, _FakeStore())
@@ -138,6 +138,7 @@ def _new_coordinator(
     coord._transit_cells = {}
     coord._path_seen = {}
     coord._cov_baseline = {}
+    coord._room_coverage = {}
     coord._dry_path = {}
     coord._dry_path_open = {}
     coord._wet_path = {}
