@@ -4,6 +4,25 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.92.0] - 2026-07-30
+
+Paired with card 0.92.0 (skips ahead from 0.88.1, per the versioning
+convention — this is the card version this release pairs with).
+
+### Added
+
+`anyvac.snapshot_map_as_floorplan`'s response now includes `crop`
+(`{x0,y0,x1,y1}`, pixel space) whenever the 0.88.1 content-crop applied —
+the exact box used, in the same coordinate space as `rooms[].bbox_px`. Lets
+the card place the snapshotted vacuum's own rooms directly onto the cropped
+floorplan with no manual dragging (docs/30 §8 "big seating rework"): before
+this, identity/no-anchor room placement assumed the floorplan was the full
+uncropped canvas, which stopped being true once snapshots got cropped to
+content. `_crop_image_to_bbox` now returns this box alongside the image
+bytes; 2 new tests confirm it matches `_padded_crop_box`'s output and stays
+in the same px space as the room bboxes that produced it (65/65 tests
+green).
+
 ## [0.88.0] - 2026-07-30
 
 Paired with card 0.88.0 (version synced to the card release it ships with —

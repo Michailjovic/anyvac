@@ -117,13 +117,30 @@ def _make_test_image(size: tuple[int, int] = (800, 600)) -> bytes:
 def test_crop_image_to_bbox_shrinks_to_the_padded_room_area() -> None:
     content = _make_test_image((800, 600))
     bbox = (100.0, 100.0, 300.0, 250.0)
-    new_content, content_type = _crop_image_to_bbox(content, bbox)
+    new_content, content_type, box = _crop_image_to_bbox(content, bbox)
     assert content_type == "image/png"
+    expected_box = _padded_crop_box(bbox, 800, 600)
+    assert box == expected_box
     with Image.open(io.BytesIO(new_content)) as cropped:
-        expected_box = _padded_crop_box(bbox, 800, 600)
         expected_w = expected_box[2] - expected_box[0]
         expected_h = expected_box[3] - expected_box[1]
         assert cropped.size == (expected_w, expected_h)
         # Cropped image should be meaningfully smaller than the original —
         # this is the whole point (trimming the unexplored padding).
         assert cropped.size[0] < 800 and cropped.size[1] < 600
+
+
+def test_crop_image_to_bbox_returns_box_in_the_same_px_space_as_bbox_px() -> None:
+    # docs/30 §8: the returned box is what the card uses to re-normalise
+    # bbox_px onto the cropped image (placeRoomInCrop) — it must be usable
+    # directly against the SAME room bboxes that produced it, with no unit
+    # conversion. A room bbox fully inside the crop should map to a sane
+    # 0-100% position once shifted by the returned box's own origin.
+    content = _make_test_image((800, 600))
+    bbox = (100.0, 100.0, 300.0, 250.0)
+    _new_content, _content_type, box = _crop_image_to_bbox(content, bbox)
+    left, top, right, bottom = box
+    room_cx = (bbox[0] + bbox[2]) / 2
+    room_cy = (bbox[1] + bbox[3]) / 2
+    assert left <= room_cx <= right
+    assert top <= room_cy <= bottom

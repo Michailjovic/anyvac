@@ -290,14 +290,22 @@ def _padded_crop_box(
     return left, top, right, bottom
 
 
-def _crop_image_to_bbox(content: bytes, bbox: tuple[float, float, float, float]) -> tuple[bytes, str]:
+def _crop_image_to_bbox(
+    content: bytes, bbox: tuple[float, float, float, float]
+) -> tuple[bytes, str, tuple[int, int, int, int]]:
     """Blocking (run via executor) — opens `content` as an image, crops to a
     padded box around `bbox` (the room union, in the image's own pixel
-    space), and returns (new_bytes, content_type). Re-encodes as PNG
-    regardless of the source format: this is a one-off local floorplan file,
-    not something needing source-format fidelity. Raises on any failure
-    (unreadable image, Pillow missing, etc.) — the caller treats cropping as
-    best-effort and falls back to the uncropped snapshot."""
+    space), and returns (new_bytes, content_type, box). `box` is the exact
+    (left, top, right, bottom) crop applied, in the SAME pixel space as the
+    `bbox_px` the caller passed in — the card needs this back to place the
+    snapshotted vacuum's own rooms onto the now-cropped image without any
+    manual dragging (docs/30 §8 "big seating rework": identity placement
+    against the full uncropped canvas is wrong once the saved file is a
+    crop of it). Re-encodes as PNG regardless of the source format: this is
+    a one-off local floorplan file, not something needing source-format
+    fidelity. Raises on any failure (unreadable image, Pillow missing,
+    etc.) — the caller treats cropping as best-effort and falls back to the
+    uncropped snapshot (and no room auto-placement)."""
     from PIL import Image  # HA core depends on Pillow; imported lazily so a
     # missing/broken install only breaks this optional crop step, never the
     # rest of the service (mirrors the lazy `async_get_image` import above).
@@ -307,7 +315,7 @@ def _crop_image_to_bbox(content: bytes, bbox: tuple[float, float, float, float])
         cropped = im.crop(box)
         buf = io.BytesIO()
         cropped.save(buf, format="PNG")
-        return buf.getvalue(), "image/png"
+        return buf.getvalue(), "image/png", box
 
 
 def _coordinators(hass: HomeAssistant) -> list[Any]:
@@ -862,9 +870,10 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
                 if device is not None:
                     bbox = _room_union_bbox_px(device.data.get("rooms") or [])
                     break
+        crop_box: tuple[int, int, int, int] | None = None
         if bbox is not None:
             try:
-                content, content_type = await hass.async_add_executor_job(
+                content, content_type, crop_box = await hass.async_add_executor_job(
                     _crop_image_to_bbox, content, bbox
                 )
             except Exception as err:  # noqa: BLE001 - crop is a nice-to-have, never fatal
@@ -896,7 +905,16 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
         # the new image once set as image_base.src, not a stale cached one.
         url = f"/local/anyvac/{filename}?t={int(time.time())}"
         _LOGGER.info("AnyVac: snapshotted %s -> %s", entity_id, target_path)
-        return {"path": url}
+        result: dict[str, Any] = {"path": url}
+        if crop_box is not None:
+            # Lets the card place THIS vacuum's own rooms exactly onto the
+            # cropped floorplan with no manual dragging (docs/30 §8) — the
+            # crop is in the same bbox_px pixel space the card already has
+            # from the integration sensor, so it's a plain re-normalisation,
+            # no new coordinate system to reconcile.
+            left, top, right, bottom = crop_box
+            result["crop"] = {"x0": left, "y0": top, "x1": right, "y1": bottom}
+        return result
 
     async def _handle_cancel(call: ServiceCall) -> None:
         started = _cancel_jobs(hass)
