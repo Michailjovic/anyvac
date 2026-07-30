@@ -23,6 +23,7 @@ new job cancels the previous one (docs/13 C6 — no double-driving robots).
 
 from __future__ import annotations
 
+import io
 import logging
 import os
 import re
@@ -235,6 +236,78 @@ def _floorplan_filename(name: str, content_type: str | None) -> str:
     ext = _FLOORPLAN_EXT_FOR_CONTENT_TYPE.get((content_type or "").lower(), "png")
     slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_") or "vacuum"
     return f"anyvac_floorplan_{slug}.{ext}"
+
+
+# docs/30 §4a second field follow-up (2026-07-30): a Roborock map image's
+# canvas is much larger than the actually-explored area — the surrounding
+# "unexplored" fill is included in a raw snapshot, so a floorplan built from
+# one looks mostly empty and wastes the crop for auto-seating precision.
+# Cropping to a fixed aspect ratio or trimming by pixel colour would be a
+# fragile guess; the union of the vacuum's own known room bounding boxes
+# (`rooms[].bbox_px`, already computed by the coordinator from the SAME
+# image/coordinate space) is exact, so that's what's used instead.
+FLOORPLAN_CROP_PADDING_FRAC = 0.08  # cosmetic breathing room, not a safety margin
+
+
+def _room_union_bbox_px(rooms: list[Any]) -> tuple[float, float, float, float] | None:
+    """Pure helper: union bounding box (x0, y0, x1, y1) in image pixel space
+    across every room that currently has one. None if no room has a usable
+    `bbox_px` yet (e.g. right after a remap, before the first poll re-derives
+    it) — caller falls back to the uncropped image in that case."""
+    xs0: list[float] = []
+    ys0: list[float] = []
+    xs1: list[float] = []
+    ys1: list[float] = []
+    for room in rooms:
+        bbox = room.get("bbox_px") if isinstance(room, dict) else None
+        if not isinstance(bbox, dict):
+            continue
+        x0, y0, x1, y1 = bbox.get("x0"), bbox.get("y0"), bbox.get("x1"), bbox.get("y1")
+        if x0 is None or y0 is None or x1 is None or y1 is None:
+            continue
+        xs0.append(x0)
+        ys0.append(y0)
+        xs1.append(x1)
+        ys1.append(y1)
+    if not xs0:
+        return None
+    return (min(xs0), min(ys0), max(xs1), max(ys1))
+
+
+def _padded_crop_box(
+    bbox: tuple[float, float, float, float], img_w: int, img_h: int
+) -> tuple[int, int, int, int]:
+    """Pure helper: pads `bbox` by `FLOORPLAN_CROP_PADDING_FRAC` of its own
+    size on each side and clamps to the image bounds, returning a
+    (left, top, right, bottom) int box ready for `Image.crop()`."""
+    x0, y0, x1, y1 = bbox
+    pad_x = (x1 - x0) * FLOORPLAN_CROP_PADDING_FRAC
+    pad_y = (y1 - y0) * FLOORPLAN_CROP_PADDING_FRAC
+    left = max(0, int(x0 - pad_x))
+    top = max(0, int(y0 - pad_y))
+    right = min(img_w, int(x1 + pad_x))
+    bottom = min(img_h, int(y1 + pad_y))
+    return left, top, right, bottom
+
+
+def _crop_image_to_bbox(content: bytes, bbox: tuple[float, float, float, float]) -> tuple[bytes, str]:
+    """Blocking (run via executor) — opens `content` as an image, crops to a
+    padded box around `bbox` (the room union, in the image's own pixel
+    space), and returns (new_bytes, content_type). Re-encodes as PNG
+    regardless of the source format: this is a one-off local floorplan file,
+    not something needing source-format fidelity. Raises on any failure
+    (unreadable image, Pillow missing, etc.) — the caller treats cropping as
+    best-effort and falls back to the uncropped snapshot."""
+    from PIL import Image  # HA core depends on Pillow; imported lazily so a
+    # missing/broken install only breaks this optional crop step, never the
+    # rest of the service (mirrors the lazy `async_get_image` import above).
+
+    with Image.open(io.BytesIO(content)) as im:
+        box = _padded_crop_box(bbox, im.width, im.height)
+        cropped = im.crop(box)
+        buf = io.BytesIO()
+        cropped.save(buf, format="PNG")
+        return buf.getvalue(), "image/png"
 
 
 def _coordinators(hass: HomeAssistant) -> list[Any]:
@@ -773,8 +846,35 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
                 f"'{entity_id}': {err}"
             ) from err
 
+        content: bytes = image.content
+        content_type: str | None = image.content_type
+
+        # Crop out the unexplored padding around the actual floorplan (docs/30
+        # §4a second field follow-up — reported live as "the map is 4:3 and
+        # doesn't crop the empty space"). Best-effort: any failure (no rooms
+        # known yet, Pillow unavailable, corrupt image) just falls back to the
+        # uncropped snapshot rather than failing the whole service call.
+        duid = duid_for_entity(hass, entity_id)
+        bbox = None
+        if duid:
+            for coord in _coordinators(hass):
+                device = (coord.data or {}).get(duid)
+                if device is not None:
+                    bbox = _room_union_bbox_px(device.data.get("rooms") or [])
+                    break
+        if bbox is not None:
+            try:
+                content, content_type = await hass.async_add_executor_job(
+                    _crop_image_to_bbox, content, bbox
+                )
+            except Exception as err:  # noqa: BLE001 - crop is a nice-to-have, never fatal
+                _LOGGER.warning(
+                    "AnyVac: floorplan crop failed for %s, saving uncropped image: %s",
+                    entity_id, err,
+                )
+
         filename = _floorplan_filename(
-            call.data.get("name") or entity_id.split(".", 1)[-1], image.content_type
+            call.data.get("name") or entity_id.split(".", 1)[-1], content_type
         )
         target_dir = hass.config.path("www", "anyvac")
         target_path = os.path.join(target_dir, filename)
@@ -782,7 +882,7 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
         def _write() -> None:
             os.makedirs(target_dir, exist_ok=True)
             with open(target_path, "wb") as f:
-                f.write(image.content)
+                f.write(content)
 
         try:
             await hass.async_add_executor_job(_write)

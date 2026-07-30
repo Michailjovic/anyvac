@@ -33,6 +33,29 @@ button. Filename is a slugified vacuum name + extension guessed from the
 fetched content type (`_floorplan_filename`, pure/unit-tested). 6 new tests
 (`tests/test_snapshot_floorplan.py`), 59/59 in `anyvac/tests/` green.
 
+## [0.88.1] - 2026-07-30
+
+Card unchanged (still 0.88.0) — backend-only follow-up.
+
+### Fixed
+
+Field report right after 0.88.0's first live use: a snapshotted floorplan
+came out "4:3 and doesn't crop the empty space" — Roborock's map image
+canvas is much larger than the actually-explored area (the surrounding
+"unexplored" fill is included as-is in a raw snapshot), so a floorplan
+built from one looked mostly empty and wasted crop precision for
+auto-seating. `anyvac.snapshot_map_as_floorplan` now crops the snapshot to
+the union of the vacuum's own known room bounding boxes
+(`rooms[].bbox_px`, already computed by the coordinator from the exact
+same image/coordinate space) plus a small cosmetic padding margin — exact,
+not a pixel-colour guess. Cropping is best-effort: any failure (no rooms
+known yet, Pillow unavailable, corrupt image) falls back to the uncropped
+snapshot rather than failing the service call. New pure helpers
+`_room_union_bbox_px`/`_padded_crop_box`/`_crop_image_to_bbox`
+(HA core's own Pillow dependency, imported lazily). 5 new tests exercising
+the box math and an actual PIL crop round-trip, 64/64 in `anyvac/tests/`
+green.
+
 ## [0.82.0] - 2026-07-29
 
 Paired with card 0.82.0 (version synced to the card release it ships with,
