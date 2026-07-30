@@ -433,3 +433,27 @@ dock_self_clean:
       description: Roborock device id, as an alternative to `entity_id`.
       selector:
         text:
+
+snapshot_map_as_floorplan:
+  name: Snapshot map as floorplan
+  description: >-
+    Save a map image entity's current picture as a static file under
+    config/www/anyvac/ and return its /local/ URL. Used by the card's Maps
+    tab to turn one vacuum's own map into the shared floorplan image for
+    merged mode, without manually saving/uploading a file.
+  fields:
+    image_entity:
+      name: Image entity
+      description: >-
+        The map image entity to snapshot (e.g. image.s6_kitchen_map_0).
+      required: true
+      selector:
+        entity:
+          domain: image
+    name:
+      name: Name
+      description: >-
+        Label used to build the output filename (slugified). Defaults to
+        the image entity's object id.
+      selector:
+        text:

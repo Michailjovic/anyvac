@@ -24,6 +24,9 @@ new job cancels the previous one (docs/13 C6 — no double-driving robots).
 from __future__ import annotations
 
 import logging
+import os
+import re
+import time
 from typing import Any
 
 import voluptuous as vol
@@ -54,6 +57,7 @@ SERVICE_DOCK_WASH = "dock_wash"
 SERVICE_DOCK_DRY = "dock_dry"
 SERVICE_DOCK_PUMP = "dock_pump"
 SERVICE_DOCK_SELF_CLEAN = "dock_self_clean"
+SERVICE_SNAPSHOT_FLOORPLAN = "snapshot_map_as_floorplan"
 
 ALL_SERVICES = (
     SERVICE_RUN_JOB,
@@ -72,6 +76,7 @@ ALL_SERVICES = (
     SERVICE_DOCK_DRY,
     SERVICE_DOCK_PUMP,
     SERVICE_DOCK_SELF_CLEAN,
+    SERVICE_SNAPSHOT_FLOORPLAN,
 )
 
 JOB_TIMEOUT_SECONDS = 3 * 3600  # safety: tear down a stuck job after 3 h
@@ -194,6 +199,42 @@ DOCK_ACTION_SCHEMA = vol.Schema(
         vol.Optional("duid"): str,
     }
 )
+# docs/30 §4a field follow-up (2026-07-30): merged mode's per-vacuum auto-seat
+# fit is hard-disabled without a shared floorplan image (`_editorSeat`/
+# `_effectiveSeat` both bail to manual sliders when `image_base.src` is
+# unset) — but getting a usable floorplan photo today meant manually saving
+# a map image out of HA and re-uploading it into `config/www/`, real friction
+# reported live during a new-user onboarding walkthrough. This service lets
+# the card do that in one click: snapshot the CARD-RESOLVED map image entity
+# (passed in explicitly — the card already resolved which one via
+# `_mapEntityFor`, e.g. picking the live floor of a multi-map vacuum; the
+# backend deliberately does not re-resolve this itself, to guarantee the
+# snapshot matches exactly what the user was previewing) and save it as a
+# static file under `config/www/anyvac/` that `image_base.src` can point at.
+SNAPSHOT_FLOORPLAN_SCHEMA = vol.Schema(
+    {
+        vol.Required("image_entity"): str,
+        vol.Optional("name"): str,
+    }
+)
+
+_FLOORPLAN_EXT_FOR_CONTENT_TYPE: dict[str, str] = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+    "image/webp": "webp",
+    "image/gif": "gif",
+}
+
+
+def _floorplan_filename(name: str, content_type: str | None) -> str:
+    """Pure helper (no HA/IO) so the naming logic is unit-testable without
+    mocking the image platform: slugifies `name` and picks a file extension
+    from the fetched image's content type (defaulting to png for anything
+    unrecognised — still a valid, openable file even if the guess is wrong)."""
+    ext = _FLOORPLAN_EXT_FOR_CONTENT_TYPE.get((content_type or "").lower(), "png")
+    slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_") or "vacuum"
+    return f"anyvac_floorplan_{slug}.{ext}"
 
 
 def _coordinators(hass: HomeAssistant) -> list[Any]:
@@ -716,6 +757,47 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
         # no documented way to report which dock accessories are installed).
         await _dock_command(call, "app_amethyst_self_check")
 
+    async def _handle_snapshot_floorplan(call: ServiceCall) -> dict[str, Any]:
+        entity_id = call.data["image_entity"]
+        if hass.states.get(entity_id) is None:
+            raise HomeAssistantError(
+                f"anyvac.snapshot_map_as_floorplan: entity '{entity_id}' not found"
+            )
+        try:
+            from homeassistant.components.image import async_get_image
+
+            image = await async_get_image(hass, entity_id, timeout=15)
+        except Exception as err:  # noqa: BLE001 - surface as one clear service error
+            raise HomeAssistantError(
+                f"anyvac.snapshot_map_as_floorplan: could not fetch image from "
+                f"'{entity_id}': {err}"
+            ) from err
+
+        filename = _floorplan_filename(
+            call.data.get("name") or entity_id.split(".", 1)[-1], image.content_type
+        )
+        target_dir = hass.config.path("www", "anyvac")
+        target_path = os.path.join(target_dir, filename)
+
+        def _write() -> None:
+            os.makedirs(target_dir, exist_ok=True)
+            with open(target_path, "wb") as f:
+                f.write(image.content)
+
+        try:
+            await hass.async_add_executor_job(_write)
+        except OSError as err:
+            raise HomeAssistantError(
+                f"anyvac.snapshot_map_as_floorplan: could not write '{target_path}': {err}"
+            ) from err
+
+        # Cache-bust: browsers/HA frontend will happily cache /local/ files by
+        # URL, and a re-snapshot (same filename, new bytes) must actually show
+        # the new image once set as image_base.src, not a stale cached one.
+        url = f"/local/anyvac/{filename}?t={int(time.time())}"
+        _LOGGER.info("AnyVac: snapshotted %s -> %s", entity_id, target_path)
+        return {"path": url}
+
     async def _handle_cancel(call: ServiceCall) -> None:
         started = _cancel_jobs(hass)
         if call.data.get("return_to_base", True) and started:
@@ -743,6 +825,7 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
         (SERVICE_DOCK_DRY, _handle_dock_dry, DOCK_ACTION_SCHEMA, SupportsResponse.NONE),
         (SERVICE_DOCK_PUMP, _handle_dock_pump, DOCK_ACTION_SCHEMA, SupportsResponse.NONE),
         (SERVICE_DOCK_SELF_CLEAN, _handle_dock_self_clean, DOCK_ACTION_SCHEMA, SupportsResponse.NONE),
+        (SERVICE_SNAPSHOT_FLOORPLAN, _handle_snapshot_floorplan, SNAPSHOT_FLOORPLAN_SCHEMA, SupportsResponse.ONLY),
     ]
     for name, handler, schema, supports in registrations:
         if not hass.services.has_service(DOMAIN, name):

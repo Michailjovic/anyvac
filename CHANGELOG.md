@@ -4,6 +4,35 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.88.0] - 2026-07-30
+
+Paired with card 0.88.0 (version synced to the card release it ships with —
+skips ahead from 0.82.0 since that's the card version this release pairs
+with, per the versioning convention).
+
+### Added
+
+New service `anyvac.snapshot_map_as_floorplan` (docs/30 §4a field follow-up).
+Diagnosed live during a new-user onboarding walkthrough: merged mode's
+per-vacuum auto-seat fit is hard-disabled without a shared floorplan image
+(`_effectiveSeat` bails to manual sliders when `image_base.src` is unset),
+but getting one today meant manually saving a map picture out of Home
+Assistant and re-uploading it into `config/www/` — real friction, and the
+manual rotation/scale/offset sliders it forces in the meantime are close to
+impossible to eyeball correctly across vacuums with differently
+oriented/cropped/scaled maps.
+
+The new service fetches an image entity's current picture (via
+`homeassistant.components.image.async_get_image` — works for ANY image
+entity, not just AnyVac's own) and saves it as a static file under
+`config/www/anyvac/`, returning its `/local/` URL. The card's Maps tab
+(0.88.0) calls this with the SAME map entity it already resolved for
+preview (`_mapEntityFor`) and auto-fills `image_base.src` from the result —
+turning "find the map URL, save it, upload it, type the path" into one
+button. Filename is a slugified vacuum name + extension guessed from the
+fetched content type (`_floorplan_filename`, pure/unit-tested). 6 new tests
+(`tests/test_snapshot_floorplan.py`), 59/59 in `anyvac/tests/` green.
+
 ## [0.82.0] - 2026-07-29
 
 Paired with card 0.82.0 (version synced to the card release it ships with,
