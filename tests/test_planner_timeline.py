@@ -15,7 +15,13 @@ cumulative time for that room (not "wait for the whole dry batch").
 
 from __future__ import annotations
 
-from custom_components.anyvac.planner import DEFAULT_ROOM_MIN, CleanPlanner
+from types import SimpleNamespace
+
+from custom_components.anyvac.planner import (
+    DEFAULT_ROOM_MIN,
+    WASH_DURATION_MIN,
+    CleanPlanner,
+)
 
 
 class _FakeCoordinator:
@@ -24,9 +30,18 @@ class _FakeCoordinator:
         self.rooms_estimate = rooms_estimate
 
 
-def _planner(room_sequence: dict, rooms_estimate: dict) -> CleanPlanner:
+def _dev(wash_interval_min: float | None = None) -> SimpleNamespace:
+    """Fake AnyVacDevice — only the `dock_status.wash_interval_min` shape that
+    `_estimate_timeline` reads (coordinator.py, docs/23 §6)."""
+    return SimpleNamespace(data={"dock_status": {"wash_interval_min": wash_interval_min}})
+
+
+def _planner(
+    room_sequence: dict, rooms_estimate: dict, devices: dict | None = None
+) -> CleanPlanner:
     planner = object.__new__(CleanPlanner)
     planner.coord = _FakeCoordinator(room_sequence, rooms_estimate)
+    planner.devices = devices or {}
     return planner
 
 
@@ -114,3 +129,53 @@ def test_default_room_min_used_when_no_estimate_exists() -> None:
     result = planner._estimate_timeline(dry_assign={"d1": ["Hall"]}, wet_assign={})
 
     assert result["timeline"]["dry"]["Hall"] == DEFAULT_ROOM_MIN
+
+
+def test_wet_pass_adds_one_wash_break_when_interval_crossed() -> None:
+    """docs/23 §6 — a wet session longer than the dock's configured wash
+    interval must pick up a WASH_DURATION_MIN pause once it crosses that
+    threshold. Two rooms totalling 20 min of active wet time against a 15 min
+    interval (real field value: 900s == 15 min, live-verified 2026-07-31)
+    cross the threshold once, inside the second room."""
+    seq = {"Hall": 1, "Bathroom": 2}
+    est = {"d1": {"Hall": {"wet": 10}, "Bathroom": {"wet": 10}}}
+    planner = _planner(seq, est, devices={"d1": _dev(wash_interval_min=15)})
+
+    result = planner._estimate_timeline(dry_assign={}, wet_assign={"d1": ["Hall", "Bathroom"]})
+
+    # Hall alone (10 min) doesn't cross 15 min yet, so it finishes on time.
+    assert result["timeline"]["wet"]["Hall"] == 10
+    # Bathroom crosses the 15 min mark 5 min in -> one wash break inserted.
+    assert result["timeline"]["wet"]["Bathroom"] == 20 + WASH_DURATION_MIN
+    assert result["eta_min"] == round(20 + WASH_DURATION_MIN)
+
+
+def test_wet_pass_adds_multiple_wash_breaks_across_long_session() -> None:
+    """A single very long room (45 min active) against a 15 min interval must
+    pick up THREE breaks (crossed at 15, 30 and 45 min), not one."""
+    seq = {"Kitchen": 1}
+    est = {"d1": {"Kitchen": {"wet": 45}}}
+    planner = _planner(seq, est, devices={"d1": _dev(wash_interval_min=15)})
+
+    result = planner._estimate_timeline(dry_assign={}, wet_assign={"d1": ["Kitchen"]})
+
+    assert result["timeline"]["wet"]["Kitchen"] == 45 + 3 * WASH_DURATION_MIN
+
+
+def test_wet_pass_unaffected_without_wash_interval() -> None:
+    """No wash_interval_min (no washable dock, or robot not in `devices` at
+    all e.g. a stale/incomplete fixture) must leave the wet timeline exactly
+    as it was before docs/23 §6 — no silent behaviour change for dry-only or
+    empty-only-dock fleets."""
+    seq = {"Hall": 1, "Bathroom": 2}
+    est = {"d1": {"Hall": {"wet": 10}, "Bathroom": {"wet": 10}}}
+    planner = _planner(seq, est, devices={"d1": _dev(wash_interval_min=None)})
+
+    result = planner._estimate_timeline(dry_assign={}, wet_assign={"d1": ["Hall", "Bathroom"]})
+
+    assert result["timeline"]["wet"] == {"Hall": 10, "Bathroom": 20}
+
+    # Same result when the duid is missing from `devices` entirely.
+    planner2 = _planner(seq, est)
+    result2 = planner2._estimate_timeline(dry_assign={}, wet_assign={"d1": ["Hall", "Bathroom"]})
+    assert result2["timeline"]["wet"] == {"Hall": 10, "Bathroom": 20}

@@ -4,6 +4,33 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.92.1] - 2026-07-31
+
+Card unchanged, still 0.92.0.
+
+### Added
+
+Mop wash breaks are now included in the wet-pass ETA (docs/22 v1.0.0
+roadmap item 5 / docs/23 §6). `rooms_estimate` deliberately excludes mop-wash
+pauses (coordinator attribution freezes during a wash, docs/16), so
+`_estimate_timeline`'s wet branch silently under-counted every wash break a
+session took. Live-verified against the user's own S8 MaxV Ultra (config
+entry diagnostics via Claude in Chrome, since `vacuum.send_command` doesn't
+return response data for `get_smart_wash_params` — docs/26 §2 caveat):
+`smart_wash_params.wash_interval` is in **seconds** (900 == the app's
+"wash every 15 min" setting), not minutes as first assumed — only present at
+all on docks that actually support a wash cycle (e.g. S8 MaxV Ultra; `None`
+on an empty-only dock or no dock, same `_dockTier()` split as the 0.77.0
+Dock sheet). New `coordinator.py` reads `properties_api.smart_wash_params`
+(vrstva A, docs/26 — zero new polls) and exposes `dock_status.wash_interval_min`
+/ `dock_status.smart_wash_enabled`. `planner.py`'s `_estimate_timeline` inserts
+a `WASH_DURATION_MIN` (2.25 min — field-observed dock positioning + wash,
+docs/17) pause into a wet robot's running time every time its cumulative
+active wet-cleaning time crosses the interval, independent of the app's
+smart/fixed wash mode (best-effort average, no dirt-sensor signal available
+to do better). 4 new tests (`tests/test_planner_timeline.py`) — including a
+confirmed-fails-without-the-fix regression check — 68/68 tests green.
+
 ## [0.92.0] - 2026-07-30
 
 Paired with card 0.92.0 (skips ahead from 0.88.1, per the versioning

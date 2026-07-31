@@ -1826,6 +1826,35 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             "dock_error_status": _s("dock_error_status"),
             "dock_type": _s("dock_type"),
         }
+        # Mop wash cadence (docs/23 §6, docs/26 §3 "vrstva A" item 1) — a separate
+        # trait from `status`, only populated for docks that actually support the
+        # wash cycle (`dock_features.is_washable`, e.g. S8 MaxV Ultra; None on an
+        # empty-only dock like S7 MaxV or no dock at all, S6). Live-verified
+        # 2026-07-31 against the user's own S8 (Claude in Chrome, config entry
+        # diagnostics JSON — `vacuum.send_command` does not return response data,
+        # docs/26 §2 vrstva A caveat, so the diagnostics download was the only way
+        # to see the raw payload): ``washInterval`` is in **seconds** (900 == the
+        # app's "wash every 15 min" setting, matching the app's 10/15/20/25 min
+        # options), NOT minutes — do not "fix" this back to raw minutes.
+        # ``smartWash`` is a 0/1 toggle for the app's dirt-sensing auto mode vs.
+        # this fixed interval; the planner applies wash_interval_min as a best-
+        # effort average cadence either way (docs/23 §6 — no dirt signal available
+        # to do better), which is why it's surfaced separately for the card/debug
+        # rather than folded silently into a single opaque number.
+        smart_wash = getattr(
+            getattr(coord, "properties_api", None), "smart_wash_params", None
+        )
+        wash_interval_s = getattr(smart_wash, "wash_interval", None)
+        data["dock_status"]["wash_interval_min"] = (
+            round(wash_interval_s / 60, 2)
+            if isinstance(wash_interval_s, (int, float))
+            else None
+        )
+        data["dock_status"]["smart_wash_enabled"] = (
+            bool(getattr(smart_wash, "smart_wash", None))
+            if smart_wash is not None
+            else None
+        )
         # Dry/wet: "wet" only when a water level is active AND the mop carriage is
         # actually attached (docs/13 B2 — water set + mop pad removed used to record a
         # dry clean as wet). Unknown attachment (None) keeps the water-mode verdict.

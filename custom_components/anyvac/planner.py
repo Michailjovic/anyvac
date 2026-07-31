@@ -28,6 +28,14 @@ _LOGGER = logging.getLogger(__name__)
 # the first capable robot (same rule as the card's _assignByCap).
 DEFAULT_ROOM_MIN = 15.0
 
+# Wall-clock cost of one mop-wash episode during a wet pass (docs/23 §6): the
+# dock positions itself (~15s) then washes (~2min), field-observed in docs/17
+# ("wash je vždy viditelný"). Room-time estimates (`rooms_estimate`) deliberately
+# EXCLUDE this — coordinator attribution freezes during a wash (docs/16/docs/14
+# rule 4) — so without adding it back here the ETA silently omits every wash
+# break a wet session takes.
+WASH_DURATION_MIN = 2.25
+
 
 def vacuum_entity_for_duid(hass: HomeAssistant, duid: str) -> str | None:
     """vacuum.* entity of the Roborock device with this duid (device registry)."""
@@ -250,11 +258,36 @@ class CleanPlanner:
         room_wet_finish: dict[str, float] = {}
         for duid, rooms in wet_assign.items():
             own_dry_finish = dry_robot_finish.get(duid, 0.0) if duid in dry_assign else 0.0
+            # Mop wash cadence (docs/23 §6) — None on a dock that can't wash the mop
+            # at all (empty-only dock, no dock, coordinator.py `wash_interval_min`).
+            dev = self.devices.get(duid)
+            wash_interval = (
+                (dev.data.get("dock_status") or {}).get("wash_interval_min")
+                if dev is not None
+                else None
+            )
             t = 0.0
+            active_since_wash = 0.0
             for room in ordered(rooms):
                 gate = room_dry_finish.get(room, 0.0)
                 start = max(t, gate, own_dry_finish)
-                t = start + (self._estimate(duid, room, "wet") or DEFAULT_ROOM_MIN)
+                remaining = self._estimate(duid, room, "wet") or DEFAULT_ROOM_MIN
+                # Spend this room's active cleaning time, inserting a wash break
+                # (and resetting the cadence counter) every time it crosses the
+                # configured interval — may fire more than once within one long
+                # room, or not at all within a short one.
+                while (
+                    wash_interval
+                    and wash_interval > 0
+                    and active_since_wash + remaining >= wash_interval
+                ):
+                    chunk = wash_interval - active_since_wash
+                    start += chunk + WASH_DURATION_MIN
+                    remaining -= chunk
+                    active_since_wash = 0.0
+                start += remaining
+                active_since_wash += remaining
+                t = start
                 room_wet_finish[room] = t
             wet_robot_finish[duid] = t
 
