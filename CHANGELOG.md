@@ -4,6 +4,16 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0] - 2026-08-03
+
+First stable release, paired with card 1.0.0. Version jumps from 0.92.1 to
+1.0.0 per the card-pairing convention (release notes for everything in
+between live in the card's CHANGELOG history, since most late-cycle work
+was card-only). Kontrakt v2 (px-space attributes, `anyvac.clean`/`plan`
+services), sequence-aware timeline with mop-wash breaks, progressive wet
+dispatch, per-kind room pinning, room coverage %, dock control services,
+and path persistence/stitching across sorties are all in place.
+
 ## [0.92.1] - 2026-07-31
 
 Card unchanged, still 0.92.0.
