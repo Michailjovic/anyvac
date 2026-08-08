@@ -43,10 +43,21 @@ or mm math on the card side:
 | `pipeline_ok` / `pipeline_error` | integration self-diagnostic for the current poll |
 | `duid`, `calib_debug`, `transit_cells` | diagnostics — device id, calibration solve debug info, "seen but not counted" cells outside the active job's room scope |
 
-Legacy mm-space fields (`vacuum_position`, `charger`, `path`, `mop_path`,
-`calibration_points`, `rooms[].x0/y0/x1/y1`) are still present for backward
-compatibility and custom automations that want to do their own mm math, but the
-AnyVac card itself only reads the pixel-space attributes above.
+### Legacy millimetre attributes
+
+The small mm-space fields — `vacuum_position`, `charger`, `calibration_points`
+and `rooms[].x0/y0/x1/y1` — are always published, for custom automations that
+want to do their own mm math.
+
+The mm **path arrays** (`path`, `mop_path`, `path_dry`, `path_wet`) are **off by
+default since 1.1.0**. The card has not read them since it moved to the
+pixel-space contract, and they were measured at roughly 224 KB per vacuum on
+every 30-second update — pushed over the websocket to every open browser tab
+whether anything consumed them or not. If you have automations or templates that
+read them, turn them back on under **Settings → Devices & Services → AnyVac →
+Configure**; the integration reloads and starts publishing them again.
+
+`path_points` / `mop_path_points` (raw point counts) are published either way.
 
 ## Recorder
 

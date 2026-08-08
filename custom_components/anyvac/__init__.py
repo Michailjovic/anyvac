@@ -51,12 +51,19 @@ def _install_blueprints(hass: HomeAssistant) -> None:
         _LOGGER.warning("AnyVac: could not install notification blueprints: %s", err)
 
 
+async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Reload on an options change (1.1.0) — the coordinator reads its options
+    once at construction, so a reload is what applies them."""
+    await hass.config_entries.async_reload(entry.entry_id)
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up AnyVac from a config entry."""
     await hass.async_add_executor_job(_install_blueprints, hass)
     coordinator = AnyVacCoordinator(hass, entry)
     await coordinator.async_config_entry_first_refresh()
     entry.runtime_data = coordinator
+    entry.async_on_unload(entry.add_update_listener(_async_options_updated))
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     async_register_services(hass)
     return True

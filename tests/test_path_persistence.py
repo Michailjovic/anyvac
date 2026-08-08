@@ -143,10 +143,12 @@ def _new_coordinator(
     coord._dry_path_open = {}
     coord._wet_path = {}
     coord._wet_path_open = {}
+    coord._decim_cache = {}
     coord._known_duids = set()
     coord._pipeline_warned = False
     coord._view_layers = {"dry": True, "wet": False}
     coord._debug_seen = {}
+    coord._expose_legacy_mm = False
     monkeypatch.setattr(coordinator_mod.dt_util, "utcnow", lambda: clock.now)
     return coord
 
@@ -206,9 +208,28 @@ async def test_finished_clean_survives_a_simulated_restart(
     after = _new_coordinator(monkeypatch, clock, paths_store=store)
     await after._async_setup()
 
-    assert after._dry_path[duid] == before._dry_path[duid]
-    assert after._wet_path[duid] == before._wet_path[duid]
-    assert after._path_seen[duid] == before._path_seen[duid]
+    # Since 1.1.0 the store holds an RDP-SIMPLIFIED copy (the raw trace was
+    # rewritten in full on every poll — ~66 MiB over a long job, see
+    # `_paths_for_save`), so the restored trace is shape-equivalent rather than
+    # byte-identical: here the midpoint (400,100) sits exactly on the line
+    # between (100,100) and (700,100), so it carries no information and is
+    # dropped. Segment COUNT and endpoints are what actually matter for the
+    # rendered polyline, and those must survive exactly.
+    for layer, restored, original in (
+        ("dry", after._dry_path[duid], before._dry_path[duid]),
+        ("wet", after._wet_path[duid], before._wet_path[duid]),
+    ):
+        assert len(restored) == len(original), f"{layer}: segment count changed"
+        for seg_after, seg_before in zip(restored, original):
+            assert seg_after[0] == seg_before[0], f"{layer}: start point moved"
+            assert seg_after[-1] == seg_before[-1], f"{layer}: end point moved"
+            assert len(seg_after) <= len(seg_before), f"{layer}: simplification grew the path"
+        assert restored == [[{"x": 100, "y": 100}, {"x": 700, "y": 100}]]
+
+    # The diff cursor must NOT be simplified along with the geometry — it counts
+    # RAW points consumed from the robot's buffer, so rewriting it would make the
+    # next poll re-attribute points that were already counted.
+    assert after._path_seen[duid] == before._path_seen[duid] == {"dry": 3, "wet": 3}
     assert after._dry_path_open.get(duid, False) == before._dry_path_open.get(duid, False)
     assert after._wet_path_open.get(duid, False) == before._wet_path_open.get(duid, False)
 

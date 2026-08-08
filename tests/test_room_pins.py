@@ -218,10 +218,12 @@ def _pin_lifecycle_coordinator(clock_now: datetime) -> AnyVacCoordinator:
     coord._dry_path_open = {}
     coord._wet_path = {}
     coord._wet_path_open = {}
+    coord._decim_cache = {}
     coord._known_duids = set()
     coord._pipeline_warned = False
     coord._view_layers = {"dry": True, "wet": False}
     coord._debug_seen = {}
+    coord._expose_legacy_mm = False
     return coord
 
 

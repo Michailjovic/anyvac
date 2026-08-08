@@ -18,3 +18,16 @@ SCAN_INTERVAL_SECONDS = 30
 # coordinator.py, which now preserves shape via Douglas-Peucker instead of
 # naive every-Nth-point stride).
 PATH_MAX_POINTS = 2000
+
+# Config-entry option (1.1.0): republish the legacy mm-space path arrays
+# (`path`, `mop_path`, `path_dry`, `path_wet`) on the map sensor.
+#
+# The card stopped reading any of them at Fáze 3 of the canon (docs/14) when it
+# moved onto the px contract, but the backend kept publishing them — measured at
+# ~224 KiB per vacuum per poll of pure websocket payload nobody consumes. They
+# are documented in anyvac/README.md as available for user automations, though,
+# so this is opt-in rather than a silent removal. Default off; the px attributes
+# (`path_dry_px`/`path_wet_px`) and every small mm field are unaffected either
+# way, so Pin & Go, zone clean and the card itself do not depend on this.
+OPT_EXPOSE_LEGACY_MM = "expose_legacy_mm_attributes"
+DEFAULT_EXPOSE_LEGACY_MM = False

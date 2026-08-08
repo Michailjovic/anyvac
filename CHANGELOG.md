@@ -4,6 +4,127 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-08-08
+
+Completes the bug-fix and optimisation pass started in 1.0.10, closing out
+`docs/34-analyza-kodu-2026-08-08.md`. Paired with card 1.1.0. Every number below
+was measured before the change was made.
+
+### Added
+
+**Option: "Publish legacy millimetre path attributes"** (Settings → Devices &
+Services → AnyVac → Configure), default **off**.
+
+The card stopped reading the mm-space path arrays at Fáze 3 of the canon
+(docs/14) when it moved to the px contract, but the backend kept publishing
+them — verified by scanning every attribute the card and editor actually touch.
+They were pure websocket payload: `path`, `mop_path`, `path_dry` and `path_wet`,
+up to `PATH_MAX_POINTS` each, measured at ~224 KiB per vacuum per poll (~670 KiB
+every 30 s for a three-vacuum fleet), serialised and pushed to every open browser
+tab. They are documented in the README as available for user automations, so this
+is opt-in rather than a silent removal.
+
+Turning it off does **not** affect the card, Pin & Go or zone clean: the px
+attributes are untouched, and the small mm fields stay published
+unconditionally — in particular `calibration_points`, which `pct_to_mm()` reads
+back on every goto/zone call. `path_points`/`mop_path_points` also stay (two
+integers, read by the editor's debug rows).
+
+### Changed
+
+`_paths_for_save()` now stores RDP-simplified points. The store is a full-file
+rewrite and held the raw trajectory: ~378 KiB per write for three vacuums at
+3000 points, i.e. roughly 66 MiB rewritten over a three-hour whole-home job —
+enough to matter on the SD/eMMC installs this typically runs on. The card only
+ever receives a simplified path anyway, and the epsilon is below the robot's own
+positioning precision, so a restart restores a visually identical trace. The
+debounce also moves from 5 s to 120 s for incremental appends (a wipe keeps the
+short delay, so a restart can't restore the previous job's trace as the new
+one's). `path_seen` is deliberately left raw — it's a diff cursor into the
+robot's own buffer, not geometry.
+
+`_decimate_segments()` memoises the RDP step per closed segment. It re-ran over
+the WHOLE accumulated trace every 30 s poll, so cost grew with session length
+rather than with new data. Split into `_simplify()` (expensive, budget-
+independent, cached) and `_cap()` (an O(n) stride that must stay outside the
+cache, since its budget shifts every time the last segment grows — caching the
+finished output would have missed on essentially every poll and been dead
+weight). Measured on a realistic sweep pattern, 8 closed segments plus a growing
+one: **27.4 ms → 4.1 ms per poll**. Output is byte-identical either way.
+
+The map sensor's state reads `path_points` instead of `len(path)` — the raw
+count is the better "is this map live" signal anyway (it keeps rising through a
+long clean instead of flattening once decimation caps the exposed array), and it
+no longer depends on an attribute that is now optional.
+
+### Fixed
+
+`transit_cells` was the one top-level attribute missing from
+`_unrecorded_attributes`, so it was written to the recorder database on every
+state change (every 30 s during a clean).
+
+### Added (tests)
+
+`tests/test_payload_and_write_reduction.py` — 7 tests: the decimation memo is
+output-neutral, actually skips closed segments (counted, not assumed — the
+output-neutrality tests pass with the memo disabled by design, so on their own
+they would let the optimisation silently regress to a no-op), still tracks a
+shifting budget, and saved paths shrink without moving endpoints or touching the
+diff cursor, while a path with real corners survives untouched. Suite is now 82
+tests.
+
+## [1.0.10] - 2026-08-08
+
+Paired with card 1.0.10 (version follows the card per the pairing convention).
+Found by a full code audit (`docs/34-analyza-kodu-2026-08-08.md`) and
+reproduced against the real `_JobRunner` before being fixed.
+
+### Fixed
+
+A job whose tasks are all ungated ended the moment its last command was
+dispatched, before the robot had even started moving. `_maybe_finish()`
+tested `pending`, which only ever tracked tasks not yet DISPATCHED — and
+only `mode: both` builds `after` gates or pool tasks, so **every `mode: dry`
+job and every `mode: wet` job** emptied `pending` inside `start()` and
+immediately called `finish()`. Three things silently depended on the job
+still being registered:
+
+- **`anyvac.cancel` did nothing during a dry or wet clean.** `_cancel_jobs()`
+  found no job, so it reported no started vacuums and no `return_to_base`
+  was sent — the card's CANCEL bar was a no-op for those runs.
+- **Plan-scope transit labeling (docs/17 §1.3) never applied to dry/wet
+  jobs.** `set_job_rooms(duid, None)` ran before the first poll could use the
+  scope, so attribution always fell back to the state-based gate — leaving
+  exactly the case plan-scope exists for (robot drives through an unplanned
+  room while the firmware still reports "cleaning") uncovered.
+- **Cross-sortie path stitching (docs/27) was inactive for dry/wet jobs.**
+  With no active scope, `_sortie_is_new_job()` returned True on every sortie
+  and wiped the trace instead of stitching it.
+
+`_JobRunner` now tracks `awaiting_finish` — duids dispatched that have not
+yet reported `anyvac_clean_finished` — and stays alive until it is empty.
+`JOB_TIMEOUT_SECONDS` remains the safety net for a robot that never reports
+(and now names it in the warning). A robot whose dispatch raised is never
+added, so a failed command cannot pin a job open. Hand-written
+`anyvac.run_job` task lists carry no `duid` and therefore keep the previous
+dispatch-and-forget behaviour rather than hanging until the timeout.
+
+### Changed
+
+Planner-built static tasks now carry `duid` alongside `vacuum` (pool tasks
+already did), which is what lets the runner match a task against the
+duid-keyed `anyvac_clean_finished` event. Additive — no existing field
+changed.
+
+### Added
+
+`tests/test_job_runner_lifecycle.py` — 7 tests covering job lifetime:
+ungated dry and wet jobs staying alive, cancel reporting the started robot,
+a multi-vacuum job waiting for every robot, and three non-regression
+controls (raw `run_job` without a duid, a failed dispatch, and the timeout
+teardown). Five of them fail against the previous `_maybe_finish()`,
+verified by reverting it. Suite is now 75 tests.
+
 ## [1.0.0] - 2026-08-03
 
 First stable release, paired with card 1.0.0. Version jumps from 0.92.1 to

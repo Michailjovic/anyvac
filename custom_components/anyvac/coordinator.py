@@ -28,7 +28,14 @@ from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
-from .const import DOMAIN, PATH_MAX_POINTS, ROBOROCK_DOMAIN, SCAN_INTERVAL_SECONDS
+from .const import (
+    DEFAULT_EXPOSE_LEGACY_MM,
+    DOMAIN,
+    OPT_EXPOSE_LEGACY_MM,
+    PATH_MAX_POINTS,
+    ROBOROCK_DOMAIN,
+    SCAN_INTERVAL_SECONDS,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -97,6 +104,22 @@ _RDP_EPSILON_MM = 20.0
 # RDP itself never has to chew through more than this many points at once.
 _RDP_PRETHIN_MAX = 4000
 
+# Debounce (seconds) for the two `_paths_store` write paths (1.1.0).
+#
+# The store is a full-file rewrite, so at the old 5 s debounce a 30 s poll meant
+# one whole-file write per poll for the entire clean. Persistence exists so a HA
+# restart doesn't blank the last trace — it does NOT need 30 s granularity, and
+# losing the last minute of a trace to an unclean shutdown is a non-event (the
+# next poll re-reads it from the robot's own buffer anyway). Raised to 2 min for
+# incremental appends.
+#
+# A wipe keeps the short delay: it must land promptly, because until it does the
+# on-disk copy still holds the PREVIOUS job's trace, and a restart in that window
+# would restore it as if it belonged to the new job (`_sortie_is_new_job` has
+# already fired by then and won't fire again for the same job).
+_PATHS_SAVE_DELAY_S = 120
+_PATHS_WIPE_SAVE_DELAY_S = 5
+
 
 def _rdp_simplify(points: list[dict[str, float]], epsilon: float) -> list[dict[str, float]]:
     """Ramer-Douglas-Peucker trajectory simplification, iterative (stack-based,
@@ -141,20 +164,20 @@ def _rdp_simplify(points: list[dict[str, float]], epsilon: float) -> list[dict[s
     return [p for p, k in zip(points, keep) if k]
 
 
-def _decimate(points: list[Any], max_points: int) -> list[Any]:
-    """Down-sample a list to at most ``max_points`` entries, preserving shape.
-
-    Shape-preserving RDP simplification (see ``_rdp_simplify``) does the real
-    work; ``max_points`` is a hard safety cap for pathological cases (a very
-    long / multi-hour session), applied as a last-resort uniform stride on top
-    of the already-simplified points — in the common case RDP alone lands
-    comfortably under the cap and this second pass is a no-op.
-    """
+def _simplify(points: list[Any]) -> list[Any]:
+    """The expensive, budget-INDEPENDENT half of ``_decimate``: optional stride
+    pre-thin (RDP worst-case guard) followed by RDP itself. Split out in 1.1.0
+    purely so it can be memoised — its result depends only on the point list,
+    unlike the cap below, which depends on how big the rest of the trace is."""
     n = len(points)
-    if n <= max_points or max_points <= 0:
-        return points
     pre = points[:: max(1, n // _RDP_PRETHIN_MAX)] if n > _RDP_PRETHIN_MAX else points
-    simplified = _rdp_simplify(pre, _RDP_EPSILON_MM)
+    return _rdp_simplify(pre, _RDP_EPSILON_MM)
+
+
+def _cap(simplified: list[Any], max_points: int) -> list[Any]:
+    """The cheap, budget-DEPENDENT half: a last-resort uniform stride so a
+    pathological (very long / multi-hour) session still can't exceed the cap.
+    In the common case RDP alone lands under it and this is a no-op."""
     m = len(simplified)
     if m <= max_points:
         return simplified
@@ -162,22 +185,70 @@ def _decimate(points: list[Any], max_points: int) -> list[Any]:
     return simplified[::step]
 
 
-def _decimate_segments(segments: list[list[Any]], max_points: int) -> list[list[Any]]:
+def _decimate(points: list[Any], max_points: int) -> list[Any]:
+    """Down-sample a list to at most ``max_points`` entries, preserving shape.
+
+    Shape-preserving RDP simplification (see ``_rdp_simplify``) does the real
+    work; ``max_points`` is a hard safety cap for pathological cases, applied as
+    a last-resort uniform stride on top of the already-simplified points.
+    """
+    if len(points) <= max_points or max_points <= 0:
+        return points
+    return _cap(_simplify(points), max_points)
+
+
+def _decimate_segments(
+    segments: list[list[Any]],
+    max_points: int,
+    cache: dict[int, tuple[int, list[Any]]] | None = None,
+) -> list[list[Any]]:
     """Down-sample each segment independently, preserving the segment breaks.
 
     Budget is split across segments proportional to their length so long segments
     keep more detail. Never merges/reorders across segments — that would recreate
     the exact straight-line-across-a-gap bug this segmentation exists to avoid.
+
+    ``cache`` (1.1.0) memoises the expensive ``_simplify`` (RDP) step per segment
+    INDEX, keyed on that segment's point count. Only the last segment of a live
+    trace ever grows; every earlier one is closed and can never change again, yet
+    this ran RDP over all of them from scratch on every 30 s poll, so the cost
+    grew with session length rather than with new data.
+
+    Only the RDP result is cached, deliberately NOT the finished output: the
+    ``budget`` below is derived from ``total``, which shifts every time the last
+    segment grows, so a closed segment's budget drifts even while the segment
+    itself is untouched. Caching the finished output under a key that includes
+    the budget would therefore miss on essentially every poll — the memo would
+    be dead weight. Splitting at ``_simplify``/``_cap`` puts the whole cost on
+    the cacheable side and leaves only an O(n) stride outside it.
+
+    A hit is provably identical to a recompute: points are only ever APPENDED to
+    a segment (a wipe replaces the whole list and resets `path_seen` with it), so
+    equal length means equal content. Callers that don't benefit (one-shot
+    conversions) simply pass no cache.
     """
     total = sum(len(s) for s in segments)
     if total <= max_points or max_points <= 0:
         return segments
     out: list[list[Any]] = []
-    for seg in segments:
+    for i, seg in enumerate(segments):
         if not seg:
             continue
         budget = max(1, round(len(seg) / total * max_points))
-        out.append(_decimate(seg, budget))
+        # Mirrors `_decimate`'s early return exactly, so caching changes nothing
+        # about what a caller sees: a segment already under its budget is passed
+        # through untouched rather than simplified.
+        if len(seg) <= budget:
+            out.append(seg)
+            continue
+        hit = cache.get(i) if cache is not None else None
+        if hit is not None and hit[0] == len(seg):
+            simplified = hit[1]
+        else:
+            simplified = _simplify(seg)
+            if cache is not None:
+                cache[i] = (len(seg), simplified)
+        out.append(_cap(simplified, budget))
     return out
 
 
@@ -465,6 +536,12 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         )
         self.entry = entry
         self._store: Store = Store(hass, 1, f"{DOMAIN}_room_history")
+        # Read once at construction: `__init__.py` reloads the entry on an
+        # options change (`async_update_listener`), so a new coordinator picks
+        # up the new value — no need to re-read it on every poll.
+        self._expose_legacy_mm: bool = entry.options.get(
+            OPT_EXPOSE_LEGACY_MM, DEFAULT_EXPOSE_LEGACY_MM
+        )
         # Cross-vacuum room history keyed by room NAME: {name: {dry, wet, any: iso}}
         self._history: dict[str, dict[str, str]] = {}
         self._was_cleaning: dict[str, bool] = {}
@@ -641,6 +718,11 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # sensor manually. Remember the last non-empty sighting per vacuum so a regular
         # clean answers "does the firmware publish them?" without manual timing.
         self._debug_seen: dict[str, dict[str, Any]] = {}
+        # Per-duid, per-layer memo for `_decimate_segments` (1.1.0) — see its
+        # docstring. {duid: {"dry"/"wet": {segment_index: ((len, budget), pts)}}}.
+        # Dropped wholesale whenever a trace is wiped, so it can never outlive
+        # the segments it describes.
+        self._decim_cache: dict[str, dict[str, dict[int, Any]]] = {}
 
     @property
     def rooms_history(self) -> dict[str, dict[str, str]]:
@@ -949,6 +1031,10 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     if sortie_wipe:
                         self._wet_path[duid] = []
                     self._wet_path_open[duid] = False
+                if sortie_wipe:
+                    # Segment indexes are about to be reused by a different
+                    # trace — drop the decimation memo with them (1.1.0).
+                    self._decim_cache.get(duid, {}).pop(layer, None)
             new_by_layer[layer] = full[start:]
             seen[layer] = len(full)
 
@@ -996,7 +1082,10 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # writing to disk every SCAN_INTERVAL forever regardless of whether the
         # vacuum is doing anything.
         if dry_changed or wet_changed or dry_open_changed or sortie_wipe is not None:
-            self._paths_store.async_delay_save(self._paths_for_save, 5)
+            self._paths_store.async_delay_save(
+                self._paths_for_save,
+                _PATHS_WIPE_SAVE_DELAY_S if sortie_wipe else _PATHS_SAVE_DELAY_S,
+            )
 
         if not cleaning or transit:
             return
@@ -1145,12 +1234,15 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 if self._sortie_is_new_job(duid):
                     self._dry_path[duid] = []
                     self._wet_path[duid] = []
+                    self._decim_cache.pop(duid, None)  # see `_decimate_segments` (1.1.0)
                     # Persist the wipe itself right away (2026-07-26) — `_attribute_points`
                     # runs right after this in the same poll and usually also triggers a
                     # save once the new session's first points land, but a poll where the
                     # robot hasn't produced any points yet must not leave the stale
                     # pre-wipe trace sitting on disk in the meantime.
-                    self._paths_store.async_delay_save(self._paths_for_save, 5)
+                    self._paths_store.async_delay_save(
+                        self._paths_for_save, _PATHS_WIPE_SAVE_DELAY_S
+                    )
                 self._dry_path_open[duid] = False
                 self._wet_path_open[duid] = False
                 self._session_start[duid] = dt_util.utcnow()
@@ -1438,12 +1530,32 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
     def _paths_for_save(self) -> dict[str, dict[str, Any]]:
         """Snapshot of the segmented trace + the bookkeeping needed to resume
         diffing the robot's raw path buffers correctly next time (2026-07-26,
-        see `_paths_store`) — one JSON-safe dict per known duid."""
+        see `_paths_store`) — one JSON-safe dict per known duid.
+
+        Points are RDP-simplified before being written (1.1.0). The store is a
+        full-file JSON rewrite on every save, and it used to persist the raw
+        trajectory: measured at ~378 KiB per write for three vacuums at 3000
+        points each, i.e. roughly 66 MiB rewritten over a three-hour whole-home
+        job — enough to matter on the SD/eMMC installs this typically runs on.
+        Simplification is lossless for our purposes: the card only ever receives
+        an RDP-simplified path anyway (`_decimate_segments` on the way out), and
+        the epsilon is below the robot's own positioning precision, so a restart
+        restores a visually identical trace.
+
+        Deliberately NOT simplified: `path_seen`, which counts RAW points
+        consumed from the robot's buffers. That's a diff cursor, not geometry —
+        rewriting it to the simplified count would make the next poll re-attribute
+        points that were already counted.
+        """
         duids = set(self._dry_path) | set(self._wet_path) | set(self._path_seen)
+
+        def _thin(segments: list[list[dict[str, float]]]) -> list[list[dict[str, float]]]:
+            return [_rdp_simplify(seg, _RDP_EPSILON_MM) for seg in segments]
+
         return {
             duid: {
-                "dry_path": self._dry_path.get(duid, []),
-                "wet_path": self._wet_path.get(duid, []),
+                "dry_path": _thin(self._dry_path.get(duid, [])),
+                "wet_path": _thin(self._wet_path.get(duid, [])),
                 "path_seen": self._path_seen.get(duid, {"dry": 0, "wet": 0}),
                 "dry_path_open": self._dry_path_open.get(duid, False),
                 "wet_path_open": self._wet_path_open.get(duid, False),
@@ -1651,11 +1763,16 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     # 2026-07-15, docs/14 §3.9; wet: cross-sortie stitching, docs/27 —
                     # a dock trip between two dispatches of the same orchestrated job must
                     # not draw as a straight line either).
+                    dcache = self._decim_cache.setdefault(device.duid, {})
                     dry_segs = self._dry_path.get(device.duid, [])
-                    device.data["path_dry"] = _decimate_segments(dry_segs, PATH_MAX_POINTS)
+                    path_dry = _decimate_segments(
+                        dry_segs, PATH_MAX_POINTS, dcache.setdefault("dry", {})
+                    )
                     device.data["path_dry_points"] = sum(len(s) for s in dry_segs)
                     wet_segs = self._wet_path.get(device.duid, [])
-                    device.data["path_wet"] = _decimate_segments(wet_segs, PATH_MAX_POINTS)
+                    path_wet = _decimate_segments(
+                        wet_segs, PATH_MAX_POINTS, dcache.setdefault("wet", {})
+                    )
                     device.data["path_wet_points"] = sum(len(s) for s in wet_segs)
                     device.data["duid"] = device.duid
                     device.data["calib_debug"] = self._last_calib.get(device.duid)
@@ -1669,9 +1786,8 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                         for room, cells in (self._transit_cells.get(device.duid) or {}).items()
                     }
                     device.data["transit_cells"] = transit or None
-                    # Kontrakt v2 (docs/14 §3.6 + §5): geometry additionally in rendered
-                    # image PIXELS so the card never has to do mm math again. The mm
-                    # attributes stay in parallel until Fáze 3 removes the card's use.
+                    # Kontrakt v2 (docs/14 §3.6 + §5): geometry in rendered image
+                    # PIXELS so the card never has to do mm math again.
                     aff = _solve_affine(device.data.get("calibration_points"))
                     device.data["schema_version"] = 2
                     if aff is not None:
@@ -1684,12 +1800,12 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                         # and wet are segmented (docs/27) — same shape, same conversion.
                         device.data["path_dry_px"] = [
                             seg_px
-                            for seg in (device.data.get("path_dry") or [])
+                            for seg in path_dry
                             if (seg_px := [q for p in seg if (q := _px_point(p, aff))])
                         ]
                         device.data["path_wet_px"] = [
                             seg_px
-                            for seg in (device.data.get("path_wet") or [])
+                            for seg in path_wet
                             if (seg_px := [q for p in seg if (q := _px_point(p, aff))])
                         ]
                         for room in device.data.get("rooms", []):
@@ -1712,6 +1828,32 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                         device.data["path_wet_px"] = []
                         for room in device.data.get("rooms", []):
                             room["bbox_px"] = None
+                    # Legacy mm-space attributes (1.1.0). The card has not read
+                    # any of these since Fáze 3 of the canon (docs/14) moved it
+                    # onto the px contract — verified by scanning every attribute
+                    # the card and editor actually touch. They are pure websocket
+                    # payload: four point arrays of up to PATH_MAX_POINTS each,
+                    # measured at ~224 KiB per vacuum per poll (~670 KiB every
+                    # 30 s for a three-vacuum fleet), pushed to every open tab.
+                    #
+                    # Not deleted outright, because anyvac/README.md documents
+                    # them as available for the user's own automations — so they
+                    # stay behind an opt-in config-entry option (default off).
+                    #
+                    # Only the four big ARRAYS are dropped. The single-point mm
+                    # fields (`vacuum_position`, `charger`) and especially
+                    # `calibration_points` stay unconditionally: they cost a few
+                    # points each, and `pct_to_mm()` — the pct->mm conversion
+                    # behind Pin & Go and zone clean — reads `calibration_points`
+                    # back off `self.data` on every call. `path_points` /
+                    # `mop_path_points` stay too (two integers, read by the
+                    # editor's debug rows and by the sensor's own state).
+                    if self._expose_legacy_mm:
+                        device.data["path_dry"] = path_dry
+                        device.data["path_wet"] = path_wet
+                    else:
+                        for key in ("path", "mop_path", "path_dry", "path_wet"):
+                            device.data.pop(key, None)
                     result[device.duid] = device
 
         # Observability (docs/13 B6): a vacuum we used to read suddenly yields no map

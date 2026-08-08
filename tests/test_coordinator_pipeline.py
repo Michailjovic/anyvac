@@ -115,10 +115,12 @@ def _new_coordinator(monkeypatch: pytest.MonkeyPatch, clock: _Clock) -> AnyVacCo
     coord._dry_path_open = {}
     coord._wet_path = {}
     coord._wet_path_open = {}
+    coord._decim_cache = {}
     coord._known_duids = set()
     coord._pipeline_warned = False
     coord._view_layers = {"dry": True, "wet": False}
     coord._debug_seen = {}
+    coord._expose_legacy_mm = False
     monkeypatch.setattr(coordinator_mod.dt_util, "utcnow", lambda: clock.now)
     return coord
 

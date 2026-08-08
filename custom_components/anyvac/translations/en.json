@@ -9,5 +9,18 @@
     "abort": {
       "already_configured": "AnyVac is already configured."
     }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "AnyVac options",
+        "data": {
+          "expose_legacy_mm_attributes": "Publish legacy millimetre path attributes"
+        },
+        "data_description": {
+          "expose_legacy_mm_attributes": "Adds the pre-v2 mm-space path arrays (path, mop_path, path_dry, path_wet) back onto the map sensor. The AnyVac card does not use them — it reads the pixel-space attributes instead — and they add roughly 220 KB per vacuum to every 30-second update sent to your browser. Only turn this on if you have your own automations or templates reading them."
+        }
+      }
+    }
   }
 }

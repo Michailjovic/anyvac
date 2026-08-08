@@ -370,6 +370,23 @@ class _JobRunner:
         # Vacuums whose clean command was actually dispatched — the set anyvac.cancel
         # sends home (a never-started robot has nothing to return from).
         self.started_vacuums: set[str] = set()
+        # Duids that have been dispatched and have NOT yet reported
+        # `anyvac_clean_finished` (2026-08-08 fix). `pending` only tracks tasks
+        # not yet DISPATCHED, so a job whose tasks are all ungated — i.e. every
+        # `mode: dry` job, and every `mode: wet` job, since only `both` builds
+        # `after` gates or pool tasks — emptied `pending` inside `start()` and
+        # immediately called `finish()`, before the robot had even begun. Three
+        # things silently broke as a result:
+        #   1. `anyvac.cancel` found no registered job, so the CANCEL button
+        #      never sent `return_to_base` during a dry clean;
+        #   2. plan-scope transit labeling (docs/17 §1.3) was cleared before the
+        #      first poll, so it never applied to dry/wet jobs at all;
+        #   3. `_sortie_is_new_job` saw no active scope, so cross-sortie path
+        #      stitching (docs/27) wiped the trace on every sortie.
+        # Only populated when a task carries a resolvable `duid` — a raw
+        # `run_job` task list without one keeps the old dispatch-and-forget
+        # behaviour rather than hanging until JOB_TIMEOUT_SECONDS.
+        self.awaiting_finish: set[str] = set()
         # Plan-scope transit labeling (docs/17 §1.3): {duid: room-name scope}, applied
         # to every known coordinator on start() and cleared on finish() — only
         # anyvac.clean's planned jobs carry this (run_job's raw task lists don't know
@@ -413,7 +430,12 @@ class _JobRunner:
         return True
 
     def _maybe_finish(self) -> None:
-        if not self.pending and not self.pool_tasks:
+        """A job is over only when there is nothing left to dispatch AND every
+        robot we did dispatch has reported in. `awaiting_finish` is what makes
+        the second half true — see its doc comment in `__init__` for the three
+        regressions its absence caused. `_on_timeout` remains the safety net for
+        a robot that never reports (offline, command silently dropped)."""
+        if not self.pending and not self.pool_tasks and not self.awaiting_finish:
             self.finish()
 
     async def _dispatch_ready(self) -> None:
@@ -538,6 +560,7 @@ class _JobRunner:
             )
             return  # dispatch itself failed — don't mark the robot busy/started
         self.started_vacuums.add(entity)
+        self.awaiting_finish.add(pt["duid"])
         self.pool_busy[pt["duid"]] = tid
 
     async def _run_task(self, task: dict[str, Any]) -> None:
@@ -576,6 +599,12 @@ class _JobRunner:
             )
             if task.get("vacuum"):
                 self.started_vacuums.add(task["vacuum"])
+            # Keep the job alive until this robot reports `anyvac_clean_finished`
+            # (see `awaiting_finish` in __init__). Only when the task actually
+            # names a duid — planner-built tasks always do now, hand-written
+            # `run_job` payloads may not, and those keep the old behaviour.
+            if task.get("duid"):
+                self.awaiting_finish.add(task["duid"])
 
     async def _on_room_done(self, event) -> None:
         self.done.add((event.data.get("duid"), event.data.get("room")))
@@ -587,6 +616,10 @@ class _JobRunner:
         # Whole-session completion satisfies a condition with the room omitted.
         duid = event.data.get("duid")
         self.done.add((duid, None))
+        # This robot has reported in; it no longer holds the job open. If it has
+        # another pool batch queued, `_dispatch_pools()` below re-adds it before
+        # `_maybe_finish()` runs, so a multi-batch pool task can't close early.
+        self.awaiting_finish.discard(duid)
         # docs/23: if this was a pool task's batch finishing, the robot is free
         # again — clear it and close out the task if that was its last batch.
         tid = self.pool_busy.pop(duid, None)
@@ -599,10 +632,12 @@ class _JobRunner:
         self._maybe_finish()
 
     def _on_timeout(self, _now) -> None:
-        if self.pending or self.pool_tasks:
+        if self.pending or self.pool_tasks or self.awaiting_finish:
             _LOGGER.warning(
-                "AnyVac run_job: %d static + %d pool task(s) never became ready; cleaning up.",
+                "AnyVac run_job: %d static + %d pool task(s) never became ready, "
+                "%d vacuum(s) never reported finished (%s); cleaning up.",
                 len(self.pending), len(self.pool_tasks),
+                len(self.awaiting_finish), sorted(self.awaiting_finish),
             )
         self.finish()
 
@@ -617,6 +652,10 @@ class _JobRunner:
         for cancel in self._pool_wait_cancel.values():
             cancel()
         self._pool_wait_cancel = {}
+        # Nothing can re-open a finished job, so stop holding duids open —
+        # keeps `finish()` idempotent even if a late `clean_finished` lands
+        # after the listeners are already unsubscribed.
+        self.awaiting_finish.clear()
         # Clear this job's plan-scope (docs/17 §1.3) on every path that ends a job —
         # completion, cancellation, and the timeout safety net all funnel through here.
         for duid in self.job_rooms:

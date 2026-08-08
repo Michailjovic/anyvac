@@ -79,10 +79,10 @@ class AnyVacMapSensor(CoordinatorEntity[AnyVacCoordinator], SensorEntity):
             "vacuum_room", "vacuum_room_name", "in_cleaning", "clean_type", "mop_signal", "duid",
             "path_points", "mop_path_points", "calib_debug", "selected_rooms",
             "rooms_progress", "rooms_coverage", "path_dry", "path_dry_points", "path_wet", "path_wet_points",
-            "status_state", "transit", "vacuuming", "view_layers", "debug_map",
-            "schema_version", "vacuum_position_px", "charger_px", "path_dry_px",
-            "path_wet_px", "pipeline_ok", "pipeline_error", "room_pins",
-            "room_sequence", "dock_status",
+            "status_state", "transit", "transit_cells", "vacuuming", "view_layers",
+            "debug_map", "schema_version", "vacuum_position_px", "charger_px",
+            "path_dry_px", "path_wet_px", "pipeline_ok", "pipeline_error",
+            "room_pins", "room_sequence", "dock_status",
         }
     )
 
@@ -107,11 +107,18 @@ class AnyVacMapSensor(CoordinatorEntity[AnyVacCoordinator], SensorEntity):
 
     @property
     def native_value(self) -> int | None:
-        """Number of path points currently known (a 'map is live' proxy)."""
+        """Number of path points currently known (a 'map is live' proxy).
+
+        Reads the RAW count (`path_points`) rather than `len(path)` since 1.1.0:
+        the decimated `path` array is only published when the legacy mm option is
+        on, and the raw count is the better signal anyway — it keeps ticking up
+        through a long clean instead of flattening once decimation caps the
+        exposed array at PATH_MAX_POINTS.
+        """
         device = self._device
         if device is None:
             return None
-        return len(device.data.get("path") or [])
+        return device.data.get("path_points") or 0
 
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:

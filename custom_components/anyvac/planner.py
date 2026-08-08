@@ -402,6 +402,12 @@ class CleanPlanner:
                 {
                     "id": f"dry{i}",
                     "vacuum": entity,
+                    # `duid` lets _JobRunner match this task against the
+                    # `anyvac_clean_finished` event (which is keyed by duid) so
+                    # the job stays alive until the robot has actually FINISHED,
+                    # not merely until the command was dispatched — pool tasks
+                    # already carried it, static ones didn't (2026-08-08 fix).
+                    "duid": duid,
                     "selects": selects,
                     "fan_speed": fan,
                     "service": "vacuum.send_command",
@@ -482,6 +488,7 @@ class CleanPlanner:
                         {
                             "id": f"wet{j}",
                             "vacuum": entity,
+                            "duid": duid,  # see the dry task above
                             "selects": selects,
                             "fan_speed": fan,
                             "service": "vacuum.send_command",
