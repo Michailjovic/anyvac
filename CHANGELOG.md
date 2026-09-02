@@ -4,10 +4,10 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.2.1] - 2026-09-02
+## [1.2.3] - 2026-09-02
 
 Bug-fix release for the per-room coverage percentages, from a field report that
-the gauges "still don't return the right numbers". Paired with card 1.2.1; the
+the gauges "still don't return the right numbers". Paired with card 1.2.3; the
 version number jumps from 1.1.0 to match the card it was tested against. Written
 up in `docs/36-beh-vs-vyjezd-coverage.md`.
 
