@@ -4,6 +4,64 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-09-02
+
+Home Assistant 2026.9 shipped with `python-roborock` 7.1.1 (up from 5.31.1) and a
+new set of native dock switches. Nothing AnyVac reads broke — the piggyback path
+(`entry.runtime_data.v1` -> `coord.properties_api.home`) is byte-identical between
+core 2026.8.0 and 2026.9.0, and so are the library's `home` and `map_content`
+traits. What the release did do is disprove one of our own written assumptions and
+show up two gaps. Paired with card 1.3.0.
+
+### Added
+
+**Dock capabilities are now reported, not guessed** — `dock_status.features`
+carries `has_dock` / `is_collectable` / `is_washable` / `is_dryable`, read
+straight off `properties_api.device_features.dock_features`. `docs/26` §3
+concluded that "HA/firmware has no documented way to report which dock
+accessories are installed", which is why the card gated dock actions and
+dock-mounted consumables on a hand-maintained `dock_type` tier table. HA 2026.9's
+own dock switches gate on exactly these flags, so the conclusion was wrong — and
+had been since `python-roborock` 5.31.1, we simply never looked. It is the same
+object tree as `status`, so this costs no extra poll. Every flag is a computed
+property upstream, so each is read defensively: one that disappears or raises
+degrades to `null`, which the card reads as "unknown, fall back to the tier",
+never as "confirmed absent".
+
+**`dock_status.running`** — whether the dock is emptying, washing or drying right
+now, derived from the raw status state and the new `dock_status.dry_status` field,
+mirroring what HA 2026.9's `switch.<vacuum>_dust_emptying` / `_mop_washing` /
+`_mop_drying` report as `is_on`. The card needs this to turn its Dock sheet
+buttons into toggles; deriving it here keeps the card a view (docs/14 rule 1).
+
+**`anyvac.dock_empty` / `dock_wash` / `dock_dry` take `action: start | stop`**
+(default `start`, so existing calls are unchanged). These three are cycles the
+dock ends on its own, and each has always had a documented stop command
+(`app_stop_collect_dust`, `app_stop_wash`, `app_set_dryer_status {"status": 0}`)
+that AnyVac never exposed — HA 2026.9's switches send the very same pairs.
+`dock_pump` and `dock_self_clean` have no documented stop and are unchanged.
+
+### Fixed
+
+**A mop-only pass no longer counts as vacuuming when the library uses the older
+mode name.** `_extract_device` decided the `vacuuming` flag by testing
+`fan_speed_name` against an exact set of `("off", "none", "closed")`. On
+`python-roborock` 5.31.1 a pure-clean-mop device that can raise its main brush
+reported `"off_raise_main_brush"` instead, which that test read as "suction on" —
+so a wet clean painted the dry trace layer and fed dry coverage, the docs/16 bug
+class. 7.1.1 offers plain `OFF` to those devices and so fixes this by accident;
+the check now prefix-matches "off" and is therefore correct on both versions
+rather than correct only on the newest one.
+
+### Notes
+
+- `RoborockStateCode` is unchanged between the two library versions, so
+  `TRANSIT_STATES` needed no attention. `mop_route_name` and `water_mode_name` now
+  resolve through `display_name` rather than `.value`, which only affects
+  `DEEP_PLUS_CN`; AnyVac uses both fields for truthiness and debug display only.
+- Core removed the deprecated `battery_level` property from the vacuum entity in
+  2026.9. AnyVac never read it.
+
 ## [1.2.3] - 2026-09-02
 
 Bug-fix release for the per-room coverage percentages, from a field report that

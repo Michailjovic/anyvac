@@ -57,6 +57,28 @@ _RUN_DEFER_MAX_S = 3 * 3600 + 600
 # ``docked`` — so room confirmation, per-room elapsed time and coverage attribution must
 # all FREEZE during these states, otherwise the dock's room gets "confirmed", rooms fire
 # ``anyvac_room_done`` prematurely and single-room calibration never sees exactly 1 room.
+# Raw Roborock states that mean "the dock is washing the mop right now" — the same
+# pair HA 2026.9's `switch.<vacuum>_mop_washing` uses for its `is_on`.
+WASH_STATES = {"washing_the_mop", "washing_the_mop_2"}
+
+
+def _mode_is_off(name: Any) -> bool:
+    """Is a Roborock fan/water mode name the "not running" one?
+
+    python-roborock 7.x (HA 2026.9) stopped offering ``VacuumModes.OFF_RAISE_MAIN_BRUSH``
+    (code 109) in ``fan_speed_options`` for pure-clean-mop devices that can raise the
+    main brush — they now get plain ``OFF`` (105, "off"). On 5.x such a device reported
+    ``fan_speed_name == "off_raise_main_brush"``, which a plain membership test does NOT
+    recognise as off — so a mop-only pass counted as vacuuming and painted the dry layer
+    (the docs/16 bug class). Prefix-matching "off" is correct on BOTH library versions;
+    do not narrow this back to an exact-match set.
+    """
+    if name is None:
+        return False
+    n = str(name).strip().lower()
+    return n.startswith("off") or n in ("none", "closed")
+
+
 TRANSIT_STATES = {
     "returning_home",
     "docking",
@@ -2094,6 +2116,60 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             "wash_ready": _s("wash_ready"),
             "dock_error_status": _s("dock_error_status"),
             "dock_type": _s("dock_type"),
+            # Is the dryer running right now? Same field HA 2026.9's own
+            # `switch.<vacuum>_mop_drying` reads for its `is_on`.
+            "dry_status": _s("dry_status"),
+        }
+        # Dock CAPABILITIES (2026-09-02). docs/26 §3 said HA/firmware has no
+        # documented way to report which dock accessories are installed, so the
+        # card gated dock actions on a hand-maintained `dock_type` tier table
+        # (`_dockTier`). That is no longer true: `properties_api.device_features
+        # .dock_features` is a `RoborockDockFeatures` derived from the dock type
+        # by python-roborock itself, and HA 2026.9's own new dock switches
+        # (`switch.<vacuum>_dust_emptying` / `_mop_washing` / `_mop_drying`) gate
+        # on exactly these three flags. Same object tree as `status` above — no
+        # extra poll, no new failure mode. Available in python-roborock 5.31.1
+        # too (HA 2026.8); the flags simply went unnoticed until 2026.9 used them.
+        #
+        # Every flag is a computed property, so read defensively: a library that
+        # renames or drops one must degrade to None (card falls back to the
+        # `dock_type` tier), never raise mid-poll.
+        dock_features = getattr(
+            getattr(getattr(coord, "properties_api", None), "device_features", None),
+            "dock_features",
+            None,
+        )
+
+        def _cap(attr: str) -> bool | None:
+            if dock_features is None:
+                return None
+            try:
+                val = getattr(dock_features, attr, None)
+            except Exception as err:  # noqa: BLE001 - a capability must never break the poll
+                _LOGGER.debug("AnyVac: dock feature %s unreadable: %s", attr, err)
+                return None
+            return bool(val) if val is not None else None
+
+        data["dock_status"]["features"] = {
+            "has_dock": _cap("has_dock"),
+            "is_collectable": _cap("is_collectable"),
+            "is_washable": _cap("is_washable"),
+            "is_dryable": _cap("is_dryable"),
+        }
+        # Which dock action is running right now (docs/14 rule 1 — the card is a
+        # view, it does not re-derive state). Mirrors HA 2026.9's dock switches
+        # 1:1: emptying/washing come from the raw status state, drying from
+        # `dry_status`. `state_name` is the same value already published as
+        # `status_state`, so this adds no new source of truth — it just names the
+        # three phases the Dock sheet has buttons for.
+        data["dock_status"]["running"] = {
+            "empty": state_name == "emptying_the_bin" if state_name else False,
+            "wash": state_name in WASH_STATES if state_name else False,
+            "dry": (
+                bool(data["dock_status"]["dry_status"])
+                if data["dock_status"]["dry_status"] is not None
+                else None
+            ),
         }
         # Mop wash cadence (docs/23 §6, docs/26 §3 "vrstva A" item 1) — a separate
         # trait from `status`, only populated for docks that actually support the
@@ -2127,9 +2203,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # Dry/wet: "wet" only when a water level is active AND the mop carriage is
         # actually attached (docs/13 B2 — water set + mop pad removed used to record a
         # dry clean as wet). Unknown attachment (None) keeps the water-mode verdict.
-        water_active = bool(
-            water_name and str(water_name).lower() not in ("off", "none", "closed")
-        )
+        water_active = bool(water_name) and not _mode_is_off(water_name)
         attached = _s("is_water_box_carriage_attached")
         data["clean_type"] = (
             "wet" if water_active and (attached is None or bool(attached)) else "dry"
@@ -2143,7 +2217,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             # fan speed, which is not "vacuuming".
             data["vacuuming"] = False
         elif fan_name is not None:
-            data["vacuuming"] = str(fan_name).lower() not in ("off", "none", "closed")
+            data["vacuuming"] = not _mode_is_off(fan_name)
         else:
             data["vacuuming"] = data["clean_type"] == "dry"
         vr = data.get("vacuum_room")

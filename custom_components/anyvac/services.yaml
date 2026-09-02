@@ -351,7 +351,7 @@ reset_learning:
 
 dock_empty:
   name: Dock — empty dustbin
-  description: Start the dock's auto-empty (dust collection) cycle.
+  description: Start or stop the dock's auto-empty (dust collection) cycle.
   fields:
     entity_id:
       name: Vacuum
@@ -364,10 +364,21 @@ dock_empty:
       description: Roborock device id, as an alternative to `entity_id`.
       selector:
         text:
+    action:
+      name: Action
+      description: >-
+        Start the cycle (default) or stop a running one. The dock ends the cycle
+        on its own; stop is for cutting it short.
+      default: start
+      selector:
+        select:
+          options:
+            - start
+            - stop
 
 dock_wash:
   name: Dock — wash mop
-  description: Start the dock's mop-washing cycle.
+  description: Start or stop the dock's mop-washing cycle.
   fields:
     entity_id:
       name: Vacuum
@@ -380,10 +391,21 @@ dock_wash:
       description: Roborock device id, as an alternative to `entity_id`.
       selector:
         text:
+    action:
+      name: Action
+      description: >-
+        Start the cycle (default) or stop a running one. The dock ends the cycle
+        on its own; stop is for cutting it short.
+      default: start
+      selector:
+        select:
+          options:
+            - start
+            - stop
 
 dock_dry:
   name: Dock — dry mop
-  description: Start the dock's mop-drying cycle now.
+  description: Start or stop the dock's mop-drying cycle.
   fields:
     entity_id:
       name: Vacuum
@@ -396,6 +418,17 @@ dock_dry:
       description: Roborock device id, as an alternative to `entity_id`.
       selector:
         text:
+    action:
+      name: Action
+      description: >-
+        Start the cycle (default) or stop a running one. The dock ends the cycle
+        on its own; stop is for cutting it short.
+      default: start
+      selector:
+        select:
+          options:
+            - start
+            - stop
 
 dock_pump:
   name: Dock — pump

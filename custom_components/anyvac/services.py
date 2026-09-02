@@ -200,6 +200,16 @@ DOCK_ACTION_SCHEMA = vol.Schema(
         vol.Optional("duid"): str,
     }
 )
+# Empty / wash / dry are cycles the dock runs for a while and ends on its own, so
+# they also have a stop (2026-09-02). HA 2026.9 shipped native switches for exactly
+# these three (`switch.<vacuum>_dust_emptying` / `_mop_washing` / `_mop_drying`)
+# using the same command pairs; AnyVac keeps its own services because the backend
+# stays the single writer (docs/14 rule 1), but there is no reason for it to be the
+# poorer interface. Pump and self-clean have no documented stop and keep the plain
+# schema above.
+DOCK_TOGGLE_SCHEMA = DOCK_ACTION_SCHEMA.extend(
+    {vol.Optional("action", default="start"): vol.In(["start", "stop"])}
+)
 # docs/30 §4a field follow-up (2026-07-30): merged mode's per-vacuum auto-seat
 # fit is hard-disabled without a shared floorplan image (`_editorSeat`/
 # `_effectiveSeat` both bail to manual sliders when `image_base.src` is
@@ -832,11 +842,20 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
 
     async def _handle_dock_empty(call: ServiceCall) -> None:
         # app_start_collect_dust — documented, confirmed command (docs/26 §3).
-        await _dock_command(call, "app_start_collect_dust")
+        # app_stop_collect_dust is its documented counterpart; HA 2026.9's own
+        # `switch.<vacuum>_dust_emptying` sends exactly this pair.
+        if call.data.get("action") == "stop":
+            await _dock_command(call, "app_stop_collect_dust")
+        else:
+            await _dock_command(call, "app_start_collect_dust")
 
     async def _handle_dock_wash(call: ServiceCall) -> None:
-        # app_start_wash — documented, confirmed command (docs/26 §3).
-        await _dock_command(call, "app_start_wash")
+        # app_start_wash / app_stop_wash — documented, confirmed commands
+        # (docs/26 §3); same pair as HA 2026.9's `switch.<vacuum>_mop_washing`.
+        if call.data.get("action") == "stop":
+            await _dock_command(call, "app_stop_wash")
+        else:
+            await _dock_command(call, "app_start_wash")
 
     async def _handle_dock_dry(call: ServiceCall) -> None:
         # app_set_dryer_status — found in python-roborock's RoborockCommand enum
@@ -847,7 +866,11 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
         # {"status": 1} then {"status": 0}) — both accepted without error, mirroring
         # the docs/26 verification method (no response payload to inspect either way,
         # same limitation noted there for action/set commands).
-        await _dock_command(call, "app_set_dryer_status", {"status": 1})
+        # `{"status": 0}` stops it — the same off command HA 2026.9's
+        # `switch.<vacuum>_mop_drying` sends, and the same call this service
+        # already made in its own live verification back in 2026-07-24.
+        status = 0 if call.data.get("action") == "stop" else 1
+        await _dock_command(call, "app_set_dryer_status", {"status": status})
 
     async def _handle_dock_pump(call: ServiceCall) -> None:
         # app_empty_rinse_tank_water — found in python-roborock's RoborockCommand
@@ -977,9 +1000,9 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
         (SERVICE_GOTO, _handle_goto, GOTO_SCHEMA, SupportsResponse.NONE),
         (SERVICE_ZONE_CLEAN, _handle_zone_clean, ZONE_CLEAN_SCHEMA, SupportsResponse.NONE),
         (SERVICE_CANCEL, _handle_cancel, CANCEL_SCHEMA, SupportsResponse.NONE),
-        (SERVICE_DOCK_EMPTY, _handle_dock_empty, DOCK_ACTION_SCHEMA, SupportsResponse.NONE),
-        (SERVICE_DOCK_WASH, _handle_dock_wash, DOCK_ACTION_SCHEMA, SupportsResponse.NONE),
-        (SERVICE_DOCK_DRY, _handle_dock_dry, DOCK_ACTION_SCHEMA, SupportsResponse.NONE),
+        (SERVICE_DOCK_EMPTY, _handle_dock_empty, DOCK_TOGGLE_SCHEMA, SupportsResponse.NONE),
+        (SERVICE_DOCK_WASH, _handle_dock_wash, DOCK_TOGGLE_SCHEMA, SupportsResponse.NONE),
+        (SERVICE_DOCK_DRY, _handle_dock_dry, DOCK_TOGGLE_SCHEMA, SupportsResponse.NONE),
         (SERVICE_DOCK_PUMP, _handle_dock_pump, DOCK_ACTION_SCHEMA, SupportsResponse.NONE),
         (SERVICE_DOCK_SELF_CLEAN, _handle_dock_self_clean, DOCK_ACTION_SCHEMA, SupportsResponse.NONE),
         (SERVICE_SNAPSHOT_FLOORPLAN, _handle_snapshot_floorplan, SNAPSHOT_FLOORPLAN_SCHEMA, SupportsResponse.ONLY),
