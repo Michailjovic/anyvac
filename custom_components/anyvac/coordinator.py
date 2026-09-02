@@ -44,6 +44,13 @@ _LOGGER = logging.getLogger(__name__)
 # bounding box. ~250 mm ≈ the vacuum's cleaning width, a sensible coverage granularity.
 COVERAGE_CELL_MM = 250
 
+# Safety cap (seconds) on how long a finished sortie may keep its RUN open waiting for
+# the orchestrated job to release the vacuum (docs/36). Normally the job runner clears
+# the scope within one poll of the last batch; this only catches a scope that never
+# clears at all, and is deliberately longer than services.py's own 3 h JOB_TIMEOUT so
+# the job's cleanup path always wins the race.
+_RUN_DEFER_MAX_S = 3 * 3600 + 600
+
 # Raw Roborock states in which the robot is driving somewhere / servicing itself rather
 # than cleaning the room it is physically in. CRITICAL (docs/13 A1+A2, docs/14 rule 4):
 # a mid-clean mop wash keeps ``in_cleaning`` truthy while HA maps the vacuum state to
@@ -621,6 +628,11 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         self._job_seq = 0
         self._job_id: dict[str, int] = {}
         self._path_job_id: dict[str, int | None] = {}
+        # Runs whose harvest is waiting for the job to release this vacuum (docs/36).
+        # {duid: utc time the last sortie ended}; absent = nothing pending. Not
+        # persisted — an in-flight run does not survive a restart anyway, same as
+        # `_job_rooms` above. See `_run_still_open` / `_harvest_run`.
+        self._run_pending: dict[str, datetime] = {}
         # Cells seen this session while OUTSIDE the active job's room scope — driven
         # through on the way to an actually-scoped room, not really "cleaning" that
         # room for THIS job even though the vacuum's raw state says "cleaning" (no
@@ -629,9 +641,14 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # never feeds `_room_cells`/`_room_elapsed`, so it can never poison
         # calibration/coverage. {duid: {room_name: set[(cx, cy)]}}.
         self._transit_cells: dict[str, dict[str, set[tuple[int, int]]]] = {}
-        # Per-room spatial coverage: visited grid cells, accumulated ONLY for the room the
-        # robot is currently confirmed to be cleaning (so transit / mop-wash trips through
-        # other rooms are not counted). Dry (vacuum) and wet (mop) are tracked separately.
+        # Per-room spatial coverage: visited grid cells for the whole RUN (docs/36 — a
+        # dock trip between two batches of one job does not reset them). Filled while the
+        # robot is genuinely cleaning, so mop-wash / return trips (TRANSIT_STATES) and
+        # out-of-scope driving are excluded — but WITHIN a plain segment clean the
+        # trajectory still crosses rooms it is only passing through, which is why the
+        # consumers (`_build_progress`, `_harvest_run`) additionally require the room to
+        # be in the job's scope, debounce-confirmed, or in the firmware's `cleaned_rooms`
+        # before turning cells into a number. Dry (vacuum) and wet (mop) are separate.
         # {duid: {room_name: {"dry": set[(cx, cy)], "wet": set[(cx, cy)]}}}.
         self._room_cells: dict[str, dict[str, dict[str, set[tuple[int, int]]]]] = {}
         # How many dry/wet trajectory points have already been attributed, per vacuum, so
@@ -1013,8 +1030,6 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             start = seen.get(layer, 0)
             if len(full) < start:  # path was reset/trimmed -> start this layer over
                 start = 0
-                for rc in self._room_cells.get(duid, {}).values():
-                    rc[layer] = set()
                 # Cross-sortie stitching (docs/27, job-id corrected 2026-07-26): a
                 # mid-job sortie restart (robot back from a dock trip, next
                 # pool-dispatch batch) must NOT wipe the already-drawn trace — only
@@ -1023,6 +1038,14 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 # per-vacuum start / raw run_job) DOES wipe, same as before docs/27.
                 if sortie_wipe is None:
                     sortie_wipe = self._sortie_is_new_job(duid)
+                if sortie_wipe:
+                    # docs/36: the coverage cells follow the SAME verdict as the trace.
+                    # Wiping them unconditionally here meant a firmware path reset in
+                    # the middle of a run (the robot coming back for a second pass
+                    # through a room) silently threw away everything measured so far,
+                    # while the drawn trace correctly survived it.
+                    for rc in self._room_cells.get(duid, {}).values():
+                        rc[layer] = set()
                 if layer == "dry":
                     if sortie_wipe:
                         self._dry_path[duid] = []
@@ -1209,7 +1232,17 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     _LOGGER.debug("AnyVac: %s left %s without evidence — no room_done", device.name, prev)
 
     def _track_and_emit(self, device: AnyVacDevice) -> None:
-        """Fire anyvac_clean_started / anyvac_clean_finished events on cleaning transitions.
+        """Fire the clean lifecycle events and drive the RUN's accumulators.
+
+        Three events, two lifetimes (docs/36):
+
+        * ``anyvac_clean_finished`` — one per SORTIE, on every ``in_cleaning`` falling
+          edge. services.py's `_JobRunner` listens on it to free the robot and dispatch
+          the job's next batch, so it must never be deferred or coalesced.
+        * ``anyvac_clean_started`` / ``anyvac_run_finished`` — one per RUN. A job
+          dispatched in batches (docs/23) docks in between, and those dock trips are not
+          separate cleans: a notification automation should fire once per job, and the
+          calibration/coverage harvest must see the whole run's cells, not one batch's.
 
         Notifications are built by the user from these events + the per-room timestamp
         sensors; the integration never composes message text itself.
@@ -1219,19 +1252,29 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         was = self._was_cleaning.get(duid, False)
         if cleaning:
             if not was:
-                self._session_rooms[duid] = set()
-                self._session_confirmed[duid] = set()
-                self._session_clean_type.pop(duid, None)
-                self._room_elapsed[duid] = {}
-                self._room_cells[duid] = {}
-                self._transit_cells[duid] = {}
+                # RUN vs SORTIE (docs/36). A job dispatched progressively (docs/23) or
+                # interrupted by a dock trip comes back as a fresh ``in_cleaning`` edge
+                # even though it is the SAME cleaning run. `_sortie_is_new_job` — the
+                # very verdict docs/27 already uses for the drawn trace — tells the two
+                # apart; everything that measures the RUN (coverage cells, per-room
+                # active time, confirmed/visited rooms, the run's start time) must
+                # survive a continuation. Wiping them per sortie was the 2026-09-02
+                # field bug: coverage restarted from zero mid-job and the resulting
+                # partial cell count dragged the learned baseline down with it.
+                new_run = self._sortie_is_new_job(duid)
                 self._path_seen[duid] = {"dry": 0, "wet": 0}
-                # Cross-sortie stitching (docs/27, job-id corrected 2026-07-26): same
-                # `_sortie_is_new_job` check as the lazy reset detection in
-                # `_attribute_points` — don't wipe the trace for a sortie restart within
-                # the SAME job, only close the current segment so it isn't bridged with
-                # a straight line; a genuinely new job (or no job scope) does wipe.
-                if self._sortie_is_new_job(duid):
+                if new_run:
+                    # A previous run whose harvest never got its closing poll (job scope
+                    # stuck, HA restarted mid-job) must still be written out before its
+                    # accumulators are wiped — see `_run_still_open`.
+                    if self._run_pending.pop(duid, None) is not None:
+                        self._harvest_run(device)
+                    self._session_clean_type.pop(duid, None)
+                    self._session_rooms[duid] = set()
+                    self._session_confirmed[duid] = set()
+                    self._room_elapsed[duid] = {}
+                    self._room_cells[duid] = {}
+                    self._transit_cells[duid] = {}
                     self._dry_path[duid] = []
                     self._wet_path[duid] = []
                     self._decim_cache.pop(duid, None)  # see `_decimate_segments` (1.1.0)
@@ -1243,13 +1286,15 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     self._paths_store.async_delay_save(
                         self._paths_for_save, _PATHS_WIPE_SAVE_DELAY_S
                     )
+                    self._session_start[duid] = dt_util.utcnow()
+                    # ``clean_started`` is a RUN-level signal (docs/36): a notification
+                    # automation must not fire again for every batch of the same job.
+                    self.hass.bus.async_fire(
+                        f"{DOMAIN}_clean_started",
+                        {"vacuum": device.name, "duid": duid, "clean_type": device.data.get("clean_type")},
+                    )
                 self._dry_path_open[duid] = False
                 self._wet_path_open[duid] = False
-                self._session_start[duid] = dt_util.utcnow()
-                self.hass.bus.async_fire(
-                    f"{DOMAIN}_clean_started",
-                    {"vacuum": device.name, "duid": duid, "clean_type": device.data.get("clean_type")},
-                )
             room = device.data.get("vacuum_room_name")
             if room:
                 self._session_rooms.setdefault(duid, set()).add(room)
@@ -1259,162 +1304,228 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 if ct_now in ("dry", "wet"):
                     self._session_clean_type[duid] = ct_now
         elif was:
-            started = self._session_start.get(duid)
-            duration_min = round((dt_util.utcnow() - started).total_seconds() / 60) if started else None
-            rooms = sorted(self._session_rooms.get(duid, set()))
-            # Use the clean type captured *during* the clean, not the finish-poll value
-            # (the robot resets to its default mode at the end of a clean).
-            ct = self._session_clean_type.get(duid) or device.data.get("clean_type")
-            event: dict[str, Any] = {
-                "vacuum": device.name,
-                "duid": duid,
-                "clean_type": ct,
-                "rooms": rooms,
-                "duration_min": duration_min,
-            }
-            # Continuous calibration (docs/16 §4): EVERY completed room of the session is
-            # a sample — a single-room clean is just the trivial case. A room counts as
-            # completed when the firmware lists it in cleaned_rooms OR it was confirmed
-            # (debounced) during the session; the coverage gate (vs the learned full-clean
-            # baseline) rejects partially cleaned rooms, and the point-weighted active
-            # time already excludes pauses, transit and mop washes.
-            confirmed = set(self._session_confirmed.get(duid, set()))
-            seg_names = {
-                str(r.get("segment_id")): r.get("name") for r in device.data.get("rooms", [])
-            }
-            cleaned_names = {
-                seg_names.get(str(s)) for s in device.data.get("cleaned_rooms") or []
-            } - {None}
-            # Which KIND(S) a room calibrates is decided by EVIDENCE (its dry/wet cells),
-            # never by the water-mode signal — an S7 dry pass once reported clean_type=wet
-            # and poisoned the wet estimate table. Wet cells only exist while the mop is
-            # physically down; dry cells only while suction is on. A combined pass
-            # rightfully learns the same minutes into BOTH tables.
-            calibrated: dict[str, dict[str, Any]] = {}
-            calib_rooms: dict[str, dict[str, Any]] = {}
-            # Persistent per-room coverage % (docs/29): snapshot dry/wet % against the
-            # PRE-session baseline (computed here, before the `_learn_coverage` loop
-            # below updates `_cov_baseline` with this session's own cells) so the
-            # persisted number reads consistently with what the live debug gauge showed
-            # during the clean, rather than trivially settling near 100% because the
-            # baseline just absorbed this very session.
-            coverage_changed = False
-            for nm, sec in sorted((self._room_elapsed.get(duid) or {}).items()):
-                active_min = round(sec / 60)
-                rc = self._room_cells.get(duid, {}).get(nm) or {}
-                completed = nm in cleaned_names or nm in confirmed
-                bbox_total = None
-                rmeta = next((r for r in device.data.get("rooms", []) if r.get("name") == nm), None)
-                if rmeta and None not in (rmeta.get("x0"), rmeta.get("y0"), rmeta.get("x1"), rmeta.get("y1")):
-                    bbox_total = max(1, int(abs(rmeta["x1"] - rmeta["x0"]) // COVERAGE_CELL_MM) + 1) * max(
-                        1, int(abs(rmeta["y1"] - rmeta["y0"]) // COVERAGE_CELL_MM) + 1
-                    )
-                room_rec: dict[str, Any] = {"active_min": active_min}
-                for kind in ("dry", "wet"):
-                    cells = len(rc.get(kind) or set())
-                    base = ((self._cov_baseline.get(duid) or {}).get(nm) or {}).get(kind)
-                    # Implausibly small baseline (poisoned by an old partial run) must
-                    # not trivially pass the coverage gate — ignore it (same as _norm).
-                    if base and bbox_total and base < 0.2 * bbox_total:
-                        base = None
-                    # No baseline yet = "—" on the card (docs/29 §4.3), never a naive
-                    # bbox-relative guess — only a genuinely completed room with an
-                    # established baseline and real evidence updates the persisted %.
-                    if completed and base and cells >= 3:
-                        pct = min(100, round(100 * cells / base))
-                        if self._room_coverage.setdefault(nm, {}).get(kind) != pct:
-                            self._room_coverage[nm][kind] = pct
-                            coverage_changed = True
-                    krec: dict[str, Any] = {"cells": cells, "baseline": base}
-                    if cells < 3:
-                        krec["accepted"], krec["reason"] = False, "no evidence of this kind"
-                    elif not completed:
-                        krec["accepted"], krec["reason"] = False, "not completed (transit only?)"
-                    elif base and cells < 0.7 * base:
-                        krec["accepted"], krec["reason"] = False, f"coverage {cells}/{base} < 70% of baseline"
-                    elif not (1 <= active_min <= 180):
-                        krec["accepted"], krec["reason"] = False, "active time out of 1-180 min range"
-                    else:
-                        before, after = self._learn_estimate(duid, nm, kind, active_min)
-                        if after is not None:
-                            krec["accepted"], krec["reason"] = True, "ok"
-                            krec["before"], krec["after"] = before, after
-                            calibrated.setdefault(nm, {})[kind] = {"before": before, "after": after}
-                        else:
-                            krec["accepted"], krec["reason"] = False, "rejected by learner"
-                    room_rec[kind] = krec
-                calib_rooms[nm] = room_rec
-            if coverage_changed:
-                self._cov_pct_store.async_delay_save(lambda: self._room_coverage, 5)
+            event = self._run_event(device)
+            # The SORTIE-level event keeps firing exactly as before, on every
+            # ``in_cleaning`` falling edge: services.py's `_JobRunner` listens on it to
+            # free the robot and dispatch its next batch (docs/23), so deferring it
+            # would wedge every progressively dispatched job. What IS deferred while
+            # the job still holds this vacuum's scope is the HARVEST — learning,
+            # coverage %, accumulator reset — which needs the whole run, not one batch
+            # of it (docs/36).
+            if self._run_still_open(duid):
+                self._run_pending[duid] = dt_util.utcnow()
+                self.hass.bus.async_fire(f"{DOMAIN}_clean_finished", event)
+            else:
+                # Pop FIRST: this sortie may be closing a run that an earlier sortie
+                # already marked pending (the job released the vacuum while it was on
+                # its way home), and a leftover entry would swallow `run_finished`.
+                self._run_pending.pop(duid, None)
+                calibrated = self._harvest_run(device)
+                if calibrated:
+                    event["calibrated"] = calibrated
+                self.hass.bus.async_fire(f"{DOMAIN}_clean_finished", event)
+                self.hass.bus.async_fire(f"{DOMAIN}_run_finished", event)
+        elif self._run_pending.get(duid) is not None and not self._run_still_open(duid):
+            # The job that held this run open has cleared its scope (or the safety cap
+            # expired): close the run now — one poll after the last sortie's event
+            # (docs/36). ``clean_finished`` already fired per sortie; the run-level
+            # result lands on ``anyvac_run_finished``.
+            self._run_pending.pop(duid, None)
+            event = self._run_event(device)
+            calibrated = self._harvest_run(device)
             if calibrated:
                 event["calibrated"] = calibrated
-            self._last_calib[duid] = {
-                "at": dt_util.utcnow().isoformat(timespec="seconds"),
-                "clean_type": ct,
-                "duration_min": duration_min,
-                "confirmed_rooms": sorted(confirmed),
-                "cleaned_rooms": sorted(cleaned_names),  # type: ignore[type-var]
-                "accepted": sorted(calibrated),
-                "rooms": calib_rooms,
-            }
-            # Learn each room's "full clean" coverage baseline from this session's cells.
-            # Only for COMPLETED rooms — with point-based attribution a drive-through
-            # room also collects a thin line of cells, and a first sample from that
-            # would poison its baseline (docs/13 B8).
-            rooms_meta = {r.get("name"): r for r in device.data.get("rooms", [])}
-            for rnm, cells in self._room_cells.get(duid, {}).items():
-                if rnm not in cleaned_names and rnm not in confirmed:
-                    continue
-                rmeta = rooms_meta.get(rnm) or {}
-                x0, y0, x1, y1 = rmeta.get("x0"), rmeta.get("y0"), rmeta.get("x1"), rmeta.get("y1")
-                total = None
-                if None not in (x0, y0, x1, y1):
-                    total = max(1, int(abs(x1 - x0) // COVERAGE_CELL_MM) + 1) * max(
-                        1, int(abs(y1 - y0) // COVERAGE_CELL_MM) + 1
-                    )
-                self._learn_coverage(duid, rnm, "dry", len(cells.get("dry", set())), total)
-                self._learn_coverage(duid, rnm, "wet", len(cells.get("wet", set())), total)
-            self.hass.bus.async_fire(f"{DOMAIN}_clean_finished", event)
-            # Auto-clear the finished rooms from the shared card-level selection —
-            # this replaces the card's old client-side selection clearing (docs/14 §3.11;
-            # room keys == integration room names by convention).
-            if rooms and self._selected_rooms & set(rooms):
-                self._selected_rooms -= set(rooms)
-                self._sel_store.async_delay_save(lambda: sorted(self._selected_rooms), 2)
-            # Pins are one-shot user overrides — clear them with the finished rooms
-            # (docs/18 §7e), same lifecycle as the selection auto-clear above.
-            # Per-kind since 2026-07-25: this session's evidence-based `ct` is a
-            # single "dry" or "wet" (never both — one physical robot session is
-            # one pass), so only the pass that actually just ran is cleared,
-            # leaving the other pass's pin (e.g. a still-pending wet pin while
-            # the dry robot finishes first in a "both" job) untouched. `ct`
-            # unknown (no settings signal captured) falls back to clearing the
-            # whole room, same as the old flat-pin behavior.
-            if rooms and any(r in self._room_pins for r in rooms):
-                pins_changed = False
-                for r in rooms:
-                    kinds = self._room_pins.get(r)
-                    if not kinds:
-                        continue
-                    if ct in ("dry", "wet"):
-                        if kinds.pop(ct, None) is not None:
-                            pins_changed = True
-                            if not kinds:
-                                self._room_pins.pop(r, None)
-                    else:
-                        self._room_pins.pop(r, None)
-                        pins_changed = True
-                if pins_changed:
-                    self._pins_store.async_delay_save(lambda: dict(self._room_pins), 2)
-            self._session_rooms[duid] = set()
-            # Clear the live per-room session accumulators NOW (calibration + baseline
-            # learning above already consumed them). Without this, rooms_progress kept
-            # showing residual transit percentages (e.g. "Kitchen 9 %" from the drive
-            # home through it) until the NEXT session started — stale gauges on the card.
-            self._room_elapsed[duid] = {}
-            self._room_cells[duid] = {}
-            self._transit_cells[duid] = {}
+            self.hass.bus.async_fire(f"{DOMAIN}_run_finished", event)
         self._was_cleaning[duid] = cleaning
+
+    def _run_still_open(self, duid: str) -> bool:
+        """Is a docked vacuum only between two sorties of the SAME run (docs/36)?
+
+        True while an orchestrated job still holds this vacuum's plan scope — the job
+        runner clears it (`set_job_rooms(duid, None)`) on every path that ends a job,
+        so the very next poll closes the run. The elapsed cap is a safety net for a
+        scope that never clears (a job runner torn down without its cleanup path):
+        without it a stuck scope would keep a run open forever and no coverage % would
+        ever be written. Without any job scope at all — a manual start from the app or
+        the card — every sortie is its own run, exactly as before docs/36."""
+        if duid not in self._job_rooms:
+            return False
+        since = self._run_pending.get(duid)
+        if since is not None and (dt_util.utcnow() - since).total_seconds() > _RUN_DEFER_MAX_S:
+            return False
+        return True
+
+    def _run_event(self, device: AnyVacDevice) -> dict[str, Any]:
+        """The shared payload of ``clean_finished`` / ``run_finished``."""
+        duid = device.duid
+        started = self._session_start.get(duid)
+        duration_min = round((dt_util.utcnow() - started).total_seconds() / 60) if started else None
+        return {
+            "vacuum": device.name,
+            "duid": duid,
+            # Use the clean type captured *during* the clean, not the finish-poll value
+            # (the robot resets to its default mode at the end of a clean).
+            "clean_type": self._session_clean_type.get(duid) or device.data.get("clean_type"),
+            "rooms": sorted(self._session_rooms.get(duid, set())),
+            "duration_min": duration_min,
+        }
+
+    def _harvest_run(self, device: AnyVacDevice) -> dict[str, dict[str, Any]]:
+        """Close a finished RUN: calibrate, persist the coverage %, learn the coverage
+        baselines, clear the one-shot UI state and reset the per-run accumulators.
+
+        Split out of `_track_and_emit` in docs/36 because it no longer runs on every
+        ``in_cleaning`` falling edge — a job dispatched in batches docks between them,
+        and harvesting each batch as if it were a whole clean is what made a room's %
+        read 60 % after the first batch and then drag its baseline down to the size of
+        that batch. Returns the ``calibrated`` payload (empty when nothing was learned).
+        """
+        duid = device.duid
+        rooms = sorted(self._session_rooms.get(duid, set()))
+        duration_min = self._run_event(device)["duration_min"]
+        ct = self._session_clean_type.get(duid) or device.data.get("clean_type")
+        # Continuous calibration (docs/16 §4): EVERY completed room of the session is
+        # a sample — a single-room clean is just the trivial case. A room counts as
+        # completed when the firmware lists it in cleaned_rooms OR it was confirmed
+        # (debounced) during the session; the coverage gate (vs the learned full-clean
+        # baseline) rejects partially cleaned rooms, and the point-weighted active
+        # time already excludes pauses, transit and mop washes.
+        confirmed = set(self._session_confirmed.get(duid, set()))
+        seg_names = {
+            str(r.get("segment_id")): r.get("name") for r in device.data.get("rooms", [])
+        }
+        cleaned_names = {
+            seg_names.get(str(s)) for s in device.data.get("cleaned_rooms") or []
+        } - {None}
+        # Which KIND(S) a room calibrates is decided by EVIDENCE (its dry/wet cells),
+        # never by the water-mode signal — an S7 dry pass once reported clean_type=wet
+        # and poisoned the wet estimate table. Wet cells only exist while the mop is
+        # physically down; dry cells only while suction is on. A combined pass
+        # rightfully learns the same minutes into BOTH tables.
+        calibrated: dict[str, dict[str, Any]] = {}
+        calib_rooms: dict[str, dict[str, Any]] = {}
+        # Persistent per-room coverage % (docs/29): snapshot dry/wet % against the
+        # PRE-session baseline (computed here, before the `_learn_coverage` loop
+        # below updates `_cov_baseline` with this session's own cells) so the
+        # persisted number reads consistently with what the live debug gauge showed
+        # during the clean, rather than trivially settling near 100% because the
+        # baseline just absorbed this very session.
+        coverage_changed = False
+        for nm, sec in sorted((self._room_elapsed.get(duid) or {}).items()):
+            active_min = round(sec / 60)
+            rc = self._room_cells.get(duid, {}).get(nm) or {}
+            completed = nm in cleaned_names or nm in confirmed
+            bbox_total = None
+            rmeta = next((r for r in device.data.get("rooms", []) if r.get("name") == nm), None)
+            if rmeta and None not in (rmeta.get("x0"), rmeta.get("y0"), rmeta.get("x1"), rmeta.get("y1")):
+                bbox_total = max(1, int(abs(rmeta["x1"] - rmeta["x0"]) // COVERAGE_CELL_MM) + 1) * max(
+                    1, int(abs(rmeta["y1"] - rmeta["y0"]) // COVERAGE_CELL_MM) + 1
+                )
+            room_rec: dict[str, Any] = {"active_min": active_min}
+            for kind in ("dry", "wet"):
+                cells = len(rc.get(kind) or set())
+                base = ((self._cov_baseline.get(duid) or {}).get(nm) or {}).get(kind)
+                # Implausibly small baseline (poisoned by an old partial run) must
+                # not trivially pass the coverage gate — ignore it (same as _norm).
+                if base and bbox_total and base < 0.2 * bbox_total:
+                    base = None
+                # No baseline yet = "—" on the card (docs/29 §4.3), never a naive
+                # bbox-relative guess — only a genuinely completed room with an
+                # established baseline and real evidence updates the persisted %.
+                if completed and base and cells >= 3:
+                    pct = min(100, round(100 * cells / base))
+                    if self._room_coverage.setdefault(nm, {}).get(kind) != pct:
+                        self._room_coverage[nm][kind] = pct
+                        coverage_changed = True
+                krec: dict[str, Any] = {"cells": cells, "baseline": base}
+                if cells < 3:
+                    krec["accepted"], krec["reason"] = False, "no evidence of this kind"
+                elif not completed:
+                    krec["accepted"], krec["reason"] = False, "not completed (transit only?)"
+                elif base and cells < 0.7 * base:
+                    krec["accepted"], krec["reason"] = False, f"coverage {cells}/{base} < 70% of baseline"
+                elif not (1 <= active_min <= 180):
+                    krec["accepted"], krec["reason"] = False, "active time out of 1-180 min range"
+                else:
+                    before, after = self._learn_estimate(duid, nm, kind, active_min)
+                    if after is not None:
+                        krec["accepted"], krec["reason"] = True, "ok"
+                        krec["before"], krec["after"] = before, after
+                        calibrated.setdefault(nm, {})[kind] = {"before": before, "after": after}
+                    else:
+                        krec["accepted"], krec["reason"] = False, "rejected by learner"
+                room_rec[kind] = krec
+            calib_rooms[nm] = room_rec
+        if coverage_changed:
+            self._cov_pct_store.async_delay_save(lambda: self._room_coverage, 5)
+        self._last_calib[duid] = {
+            "at": dt_util.utcnow().isoformat(timespec="seconds"),
+            "clean_type": ct,
+            "duration_min": duration_min,
+            "confirmed_rooms": sorted(confirmed),
+            "cleaned_rooms": sorted(cleaned_names),  # type: ignore[type-var]
+            "accepted": sorted(calibrated),
+            "rooms": calib_rooms,
+        }
+        # Learn each room's "full clean" coverage baseline from this session's cells.
+        # Only for COMPLETED rooms — with point-based attribution a drive-through
+        # room also collects a thin line of cells, and a first sample from that
+        # would poison its baseline (docs/13 B8).
+        rooms_meta = {r.get("name"): r for r in device.data.get("rooms", [])}
+        for rnm, cells in self._room_cells.get(duid, {}).items():
+            if rnm not in cleaned_names and rnm not in confirmed:
+                continue
+            rmeta = rooms_meta.get(rnm) or {}
+            x0, y0, x1, y1 = rmeta.get("x0"), rmeta.get("y0"), rmeta.get("x1"), rmeta.get("y1")
+            total = None
+            if None not in (x0, y0, x1, y1):
+                total = max(1, int(abs(x1 - x0) // COVERAGE_CELL_MM) + 1) * max(
+                    1, int(abs(y1 - y0) // COVERAGE_CELL_MM) + 1
+                )
+            self._learn_coverage(duid, rnm, "dry", len(cells.get("dry", set())), total)
+            self._learn_coverage(duid, rnm, "wet", len(cells.get("wet", set())), total)
+        # Auto-clear the finished rooms from the shared card-level selection —
+        # this replaces the card's old client-side selection clearing (docs/14 §3.11;
+        # room keys == integration room names by convention).
+        if rooms and self._selected_rooms & set(rooms):
+            self._selected_rooms -= set(rooms)
+            self._sel_store.async_delay_save(lambda: sorted(self._selected_rooms), 2)
+        # Pins are one-shot user overrides — clear them with the finished rooms
+        # (docs/18 §7e), same lifecycle as the selection auto-clear above.
+        # Per-kind since 2026-07-25: this session's evidence-based `ct` is a
+        # single "dry" or "wet" (never both — one physical robot session is
+        # one pass), so only the pass that actually just ran is cleared,
+        # leaving the other pass's pin (e.g. a still-pending wet pin while
+        # the dry robot finishes first in a "both" job) untouched. `ct`
+        # unknown (no settings signal captured) falls back to clearing the
+        # whole room, same as the old flat-pin behavior.
+        if rooms and any(r in self._room_pins for r in rooms):
+            pins_changed = False
+            for r in rooms:
+                kinds = self._room_pins.get(r)
+                if not kinds:
+                    continue
+                if ct in ("dry", "wet"):
+                    if kinds.pop(ct, None) is not None:
+                        pins_changed = True
+                        if not kinds:
+                            self._room_pins.pop(r, None)
+                else:
+                    self._room_pins.pop(r, None)
+                    pins_changed = True
+            if pins_changed:
+                self._pins_store.async_delay_save(lambda: dict(self._room_pins), 2)
+        self._session_rooms[duid] = set()
+        # Clear the live per-room session accumulators NOW (calibration + baseline
+        # learning above already consumed them). Without this, rooms_progress kept
+        # showing residual transit percentages (e.g. "Kitchen 9 %" from the drive
+        # home through it) until the NEXT session started — stale gauges on the card.
+        self._room_elapsed[duid] = {}
+        self._room_cells[duid] = {}
+        self._transit_cells[duid] = {}
+        self._session_confirmed[duid] = set()
+        self._session_clean_type.pop(duid, None)
+        return calibrated
 
     async def _async_setup(self) -> None:
         """Load persisted per-room clean history before the first refresh."""
@@ -1652,8 +1763,24 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         elapsed = self._room_elapsed.get(duid, {})
         ests = self._estimates.get(duid, {})
         ctype = self._session_clean_type.get(duid) or device.data.get("clean_type")
+        # Only rooms with a real claim to being cleaned in THIS run get a live number
+        # (docs/36). Point attribution fills a room's cells whenever the robot's
+        # trajectory crosses it with the fan on, and outside an orchestrated job there
+        # is no `job_rooms` scope to filter that — so a corridor the robot merely drove
+        # through used to show a live % chip on the card. A room qualifies when it is in
+        # the active job's scope, was debounce-confirmed as actively cleaned this run,
+        # or the firmware itself lists it in `cleaned_rooms`.
+        scope: set[str] = set(self._job_rooms.get(duid) or ())
+        scope |= set(self._session_confirmed.get(duid) or ())
+        seg_names = {
+            str(r.get("segment_id")): r.get("name") for r in device.data.get("rooms", [])
+        }
+        for seg in device.data.get("cleaned_rooms") or []:
+            nm_seg = seg_names.get(str(seg))
+            if nm_seg:
+                scope.add(nm_seg)
         out: dict[str, dict[str, Any]] = {}
-        for nm in set(cells_map) | set(elapsed):
+        for nm in (set(cells_map) | set(elapsed)) & scope:
             rc = cells_map.get(nm) or {}
             dry_visited = len(rc.get("dry", set()))
             wet_visited = len(rc.get("wet", set()))

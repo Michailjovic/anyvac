@@ -107,6 +107,7 @@ def _new_coordinator(monkeypatch: pytest.MonkeyPatch, clock: _Clock) -> AnyVacCo
     coord._job_seq = 0
     coord._job_id = {}
     coord._path_job_id = {}
+    coord._run_pending = {}
     coord._transit_cells = {}
     coord._path_seen = {}
     coord._cov_baseline = {}
@@ -243,6 +244,9 @@ def test_mop_wash_freezes_attribution_and_room_done(
     _poll(coord, _device(duid, in_cleaning=False))
     assert coord.hass.bus.names() == [
         "anyvac_clean_started", "anyvac_room_done", "anyvac_clean_finished",
+        # docs/36: with no orchestrated job scope the run closes on the same poll,
+        # so its run-level event follows the sortie's immediately.
+        "anyvac_run_finished",
     ]
     finished = coord.hass.bus.events[-1][1]
     assert finished["duration_min"] == 20  # wall-clock session length, includes the wash
@@ -539,13 +543,14 @@ def test_path_stitches_across_job_sorties(monkeypatch: pytest.MonkeyPatch, clock
     assert coord._dry_path[duid] == [[{"x": 100, "y": 100}], [{"x": 200, "y": 100}]]
     assert coord._wet_path[duid] == [[{"x": 100, "y": 100}], [{"x": 200, "y": 100}]]
 
-    # Coverage/calibration state is a separate, already-validated system
-    # (docs/16) — `_room_elapsed` must keep resetting per sortie exactly as
-    # before (it's zeroed at session start, then re-earns time from THIS
-    # poll's own delta only); docs/27 only changes the visual trace's
-    # lifetime. A non-reset would show accumulated time from both sorties
-    # merged into one continuous span instead of sortie 2 starting fresh.
-    assert coord._session_start[duid] == clock.now
+    # docs/36 (this assertion was the exact opposite until 2026-09-02): the RUN's
+    # accumulators now follow the same lifetime as the trace above. A dock trip
+    # inside one job is not a new clean, so the run keeps its original start time
+    # and its coverage cells instead of restarting from zero — the per-sortie
+    # reset was what made a room's coverage % read a partial number and then drag
+    # its learned baseline down to the size of a single batch.
+    assert coord._session_start[duid] == clock.now - timedelta(minutes=6)
+    assert coord._room_cells[duid]["Hall"]["dry"] == {(0, 0)}
 
 
 def test_path_resets_across_sorties_without_job_scope(

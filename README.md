@@ -78,13 +78,20 @@ for "overdue" logic (`now() - states(sensor) > N days`).
 
 | Event | Data |
 | --- | --- |
-| `anyvac_clean_started` | `{ vacuum, duid, clean_type }` |
-| `anyvac_clean_finished` | `{ vacuum, duid, clean_type, rooms, duration_min }` plus `calibrated_room, estimate_before, estimate_after` when the session was a single-room calibration |
+| `anyvac_clean_started` | `{ vacuum, duid, clean_type }` — once per RUN |
+| `anyvac_clean_finished` | `{ vacuum, duid, clean_type, rooms, duration_min }` — once per OUTING |
+| `anyvac_run_finished` | the same payload, plus `calibrated` (per room and kind: `before`/`after` estimate) — once per RUN, when the whole job is done and its calibration/coverage has been written |
 | `anyvac_room_done` | `{ vacuum, duid, room, reason }` — fired when a vacuum has truly left a room it was cleaning (`reason: "left"`, debounced over 2 polls) or on return-to-dock (`reason: "docked"`). The orchestrator's per-room "wet follows dry" signal. |
 
-Both events are fired **server-side** on the vacuum's cleaning transitions, so notifications built on
+**Run vs outing** (docs/36): a job dispatched progressively sends the robot out several times, with a
+dock trip between batches. `anyvac_clean_finished` fires on every one of those outings — the
+orchestrator listens on it to dispatch the next batch — while `anyvac_clean_started` /
+`anyvac_run_finished` bracket the whole job. **For a "cleaning done" notification, use
+`anyvac_run_finished`**: `clean_finished` would fire once per batch.
+
+All events are fired **server-side** on the vacuum's cleaning transitions, so notifications built on
 them fire reliably whether or not the AnyVac card (or any dashboard) is open. `rooms` is the set of
-rooms actually visited during the session; `duration_min` is the measured session length in minutes.
+rooms actually visited during the run; `duration_min` is the measured run length in minutes.
 
 **Errors:** use the existing Roborock `sensor.<vacuum>_vacuum_error`.
 

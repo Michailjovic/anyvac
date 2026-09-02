@@ -4,6 +4,78 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] - 2026-09-02
+
+Bug-fix release for the per-room coverage percentages, from a field report that
+the gauges "still don't return the right numbers". Paired with card 1.2.1; the
+version number jumps from 1.1.0 to match the card it was tested against. Written
+up in `docs/36-beh-vs-vyjezd-coverage.md`.
+
+### Fixed
+
+**A cleaning RUN is no longer confused with a single OUTING.** A job dispatched
+progressively (docs/23) docks between its batches, and the robot comes back for
+another pass through the same rooms. Every one of those dock trips raised a fresh
+`in_cleaning` edge, and everything that measures the clean — coverage cells,
+per-room active time, the run's start time, the set of confirmed rooms — was
+reset on it, then harvested as if a whole clean had just ended. Two compounding
+consequences, both visible on the card:
+
+- The persisted "last clean covered X %" was written from one batch. A room
+  cleaned across a dock trip persisted the partial number (60 % where the run
+  actually covered 100 %) and then stopped updating, because the following batch
+  no longer had enough cells of its own to clear the evidence floor.
+- Worse, that same partial cell count was fed to the coverage-baseline learner.
+  Being above the 50 %-of-baseline partial guard, it passed as a genuine sample
+  and dragged the learned "full clean" size down towards the size of one batch.
+  Measured on a room whose full clean is 120 cells, split 72 + 48: baseline
+  120 → 101 → 73 → 63 → 58 over four jobs, after which **every** room reads
+  100 %, a normal undivided clean included.
+
+The run's accumulators now follow the same `_sortie_is_new_job` verdict that
+docs/27 already uses for the drawn trace, and the harvest (calibration, coverage
+%, baseline learning, accumulator reset) waits until the orchestrated job
+releases the vacuum. A start with no job scope at all — the Roborock app, the
+card's native command, degraded mode — is unchanged: every outing is its own run,
+harvested on the docking poll exactly as before. A stuck job scope cannot hold a
+run open indefinitely; a safety cap closes it after 3 h 10 min.
+
+**A firmware path reset mid-run no longer throws the measured coverage away.**
+When the robot's own trajectory array restarts inside a run, docs/27 stitches the
+drawn trace instead of wiping it — but the coverage cells were wiped
+unconditionally right next to it, so a room's measured coverage silently dropped
+back to whatever came after the reset. The cells now follow the same verdict as
+the trace. Outside a job (where a restarted trajectory really is an unrelated new
+clean) they still start over, and there is a regression test for each direction.
+
+**The live gauge no longer reports rooms the robot only drove through.** Point
+attribution fills a room's cells whenever the trajectory crosses it with the
+suction on, and outside an orchestrated job there is no room scope to filter
+that, so a corridor crossed on the way somewhere else grew a live % chip on the
+card. The persisted % and the calibration always required the room to be
+completed; the live gauge now applies the same standard — in the job's scope,
+debounce-confirmed as actively cleaned, or listed in the firmware's
+`cleaned_rooms`. Cells are still collected for every crossed room (they are what
+the trace is made of) and out-of-scope ones stay visible in `transit_cells`.
+
+### Added
+
+**`anyvac_run_finished` event.** `anyvac_clean_finished` keeps its meaning and
+its per-outing cadence — `_JobRunner` listens on it to dispatch a pool task's
+next batch, so it can never be deferred — and now has a run-level sibling that
+fires once per whole job, carrying the run's `rooms`, `duration_min` and the
+`calibrated` payload. For a notification that should arrive once per job rather
+than once per batch, listen on this one. `anyvac_clean_started` became
+run-level for the same reason: it no longer repeats for each batch.
+
+### Tests
+
+Eight new tests in `tests/test_run_vs_sortie.py` (split job vs single outing,
+run-level event cadence, the no-job-scope regression guard, path reset in both
+directions, drive-through filtering, the stuck-scope cap, and a job releasing a
+vacuum while it is still driving home). Seven of them fail against 1.1.0; the
+eighth is the guard that has to hold in both directions. Suite: 90/90 green.
+
 ## [1.1.0] - 2026-08-08
 
 Completes the bug-fix and optimisation pass started in 1.0.10, closing out
