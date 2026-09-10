@@ -18,6 +18,7 @@ yields no data for that vacuum rather than raising.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
@@ -861,6 +862,24 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         x = (e * (u - c) - b * (v - f)) / det
         y = (-d * (u - c) + a * (v - f)) / det
         return round(x), round(y)
+
+    def px_per_mm(self, duid: str) -> float | None:
+        """Linear mm→px scale factor from the vacuum's calibration affine
+        transform (docs/37 §5) — for sizing a physical measurement (e.g. a
+        drawn stroke width) in rendered-image pixels. Geometry stays owned by
+        the coordinator (docs/14 §1); callers must not solve the affine
+        transform themselves. None when calibration is unavailable — the
+        caller falls back to a fixed pixel width.
+        """
+        device = (self.data or {}).get(duid)
+        if device is None:
+            return None
+        aff = _solve_affine(device.data.get("calibration_points"))
+        if aff is None:
+            return None
+        a, b, c, d, e, f = aff
+        det = a * e - b * d
+        return math.sqrt(abs(det)) if det else None
 
     @property
     def view_layers(self) -> dict[str, bool]:

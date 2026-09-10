@@ -14,6 +14,11 @@ Public command interface for the card (and automations):
 - ``anyvac.run_job``    — INTERNAL executor (docs/14 §5: undocumented); kept
                           registered for the transition period while the card still
                           builds v1 plans, removed from docs in Fáze 3.
+- ``anyvac.snapshot_map_as_floorplan`` / ``anyvac.export_map_guide`` — custom
+                          floorplan helpers (docs/30 §8, docs/37): save a
+                          vacuum's own map as a static photo, and export its
+                          room/dry/wet geometry as transparent tracing layers
+                          over that same crop. Neither writes card config.
 
 Execution model (proven in the field by the card-built v1 plans): a job is a list
 of tasks; a task with no ``after`` runs immediately, the rest run when all their
@@ -59,6 +64,7 @@ SERVICE_DOCK_DRY = "dock_dry"
 SERVICE_DOCK_PUMP = "dock_pump"
 SERVICE_DOCK_SELF_CLEAN = "dock_self_clean"
 SERVICE_SNAPSHOT_FLOORPLAN = "snapshot_map_as_floorplan"
+SERVICE_EXPORT_MAP_GUIDE = "export_map_guide"
 
 ALL_SERVICES = (
     SERVICE_RUN_JOB,
@@ -78,6 +84,7 @@ ALL_SERVICES = (
     SERVICE_DOCK_PUMP,
     SERVICE_DOCK_SELF_CLEAN,
     SERVICE_SNAPSHOT_FLOORPLAN,
+    SERVICE_EXPORT_MAP_GUIDE,
 )
 
 JOB_TIMEOUT_SECONDS = 3 * 3600  # safety: tear down a stuck job after 3 h
@@ -228,6 +235,33 @@ SNAPSHOT_FLOORPLAN_SCHEMA = vol.Schema(
         vol.Optional("name"): str,
     }
 )
+# docs/37: draws room-boundary / dry-path / wet-path guides as transparent PNGs
+# in the SAME pixel canvas as `snapshot_map_as_floorplan`'s crop, so a user
+# building a custom floorplan in an external image editor (GIMP etc.) can lay
+# them over the floorplan photo as tracing layers — the negative space inside
+# the drawn path is where furniture stands. Draws only, never touches config
+# (docs/37 §2 point 4 — unlike the snapshot service, this has no side effects).
+EXPORT_MAP_GUIDE_SCHEMA = vol.Schema(
+    {
+        vol.Required("image_entity"): str,
+        vol.Optional("name"): str,
+        vol.Optional("layers", default=["rooms", "dry", "wet"]): [
+            vol.In(["rooms", "dry", "wet"])
+        ],
+        vol.Optional("labels", default=True): bool,
+        vol.Optional("stroke_mm", default=300): vol.All(
+            vol.Coerce(int), vol.Range(min=50, max=600)
+        ),
+        vol.Optional("crop"): vol.Schema(
+            {
+                vol.Required("x0"): vol.Coerce(float),
+                vol.Required("y0"): vol.Coerce(float),
+                vol.Required("x1"): vol.Coerce(float),
+                vol.Required("y1"): vol.Coerce(float),
+            }
+        ),
+    }
+)
 
 _FLOORPLAN_EXT_FOR_CONTENT_TYPE: dict[str, str] = {
     "image/png": "png",
@@ -326,6 +360,174 @@ def _crop_image_to_bbox(
         buf = io.BytesIO()
         cropped.save(buf, format="PNG")
         return buf.getvalue(), "image/png", box
+
+
+# ── Guide layer export (docs/37) ───────────────────────────────────────────
+# Vivid, non-configurable colours (docs/37 §5) — a tracing aid, not decoration.
+_GUIDE_COLOR: dict[str, tuple[int, int, int, int]] = {
+    "rooms": (255, 0, 255, 255),  # magenta
+    "dry": (0, 255, 0, 255),  # lime
+    "wet": (0, 200, 255, 255),  # cyan
+}
+_GUIDE_FALLBACK_STROKE_PX = 8  # used when calibration (px_per_mm) is unavailable
+
+
+def _guide_filename(name: str, layer: str) -> str:
+    """Pure helper (mirrors `_floorplan_filename`): slugifies `name` for the
+    per-layer output filename. Always PNG — the canvas is drawn RGBA, there is
+    no source content-type to mirror like the floorplan snapshot has."""
+    slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_") or "vacuum"
+    return f"anyvac_guide_{slug}_{layer}.png"
+
+
+def _guide_point(p: dict[str, Any], crop: tuple[float, float, float, float]) -> tuple[float, float] | None:
+    """Pure helper: `px_point − crop origin` (docs/37 §3/§6), or None when the
+    point falls outside the crop box — the caller breaks the path there rather
+    than drawing a straight line across the gap."""
+    x, y = p.get("x"), p.get("y")
+    if x is None or y is None:
+        return None
+    x0, y0, x1, y1 = crop
+    if x < x0 or x > x1 or y < y0 or y > y1:
+        return None
+    return (x - x0, y - y0)
+
+
+def _guide_path_segments(
+    path_px: list[list[dict[str, Any]]], crop: tuple[float, float, float, float]
+) -> list[list[tuple[float, float]]]:
+    """Pure helper: transforms a list of path segments (each a list of
+    `{x, y}` in rendered-image px space, e.g. `path_dry_px`/`path_wet_px`)
+    into crop-local canvas coordinates. A point outside the crop breaks the
+    segment there (docs/37 §5 "Body mimo crop se přeskakují") instead of
+    drawing a straight line to the next in-bounds point; an all-outside or
+    empty input segment simply contributes nothing."""
+    out: list[list[tuple[float, float]]] = []
+    for seg in path_px:
+        cur: list[tuple[float, float]] = []
+        for p in seg:
+            q = _guide_point(p, crop)
+            if q is None:
+                if cur:
+                    out.append(cur)
+                    cur = []
+                continue
+            cur.append(q)
+        if cur:
+            out.append(cur)
+    return out
+
+
+def _guide_room_rects(
+    rooms: list[Any], crop: tuple[float, float, float, float]
+) -> list[tuple[tuple[float, float, float, float], str | None]]:
+    """Pure helper: each room's `bbox_px` translated into crop-local canvas
+    coordinates, paired with its name for the optional label. Rooms without a
+    usable bbox are skipped (mirrors `_room_union_bbox_px`); a rect that spills
+    slightly past the (padded) crop is left as-is — PIL clips drawing to the
+    canvas on its own, no crash, no need to clamp here."""
+    x0, y0, _x1, _y1 = crop
+    out: list[tuple[tuple[float, float, float, float], str | None]] = []
+    for room in rooms:
+        bbox = room.get("bbox_px") if isinstance(room, dict) else None
+        if not isinstance(bbox, dict):
+            continue
+        rx0, ry0 = bbox.get("x0"), bbox.get("y0")
+        rx1, ry1 = bbox.get("x1"), bbox.get("y1")
+        if rx0 is None or ry0 is None or rx1 is None or ry1 is None:
+            continue
+        name = room.get("name") if isinstance(room, dict) else None
+        out.append(((rx0 - x0, ry0 - y0, rx1 - x0, ry1 - y0), name))
+    return out
+
+
+def _image_pixel_size(content: bytes) -> tuple[int, int]:
+    """Blocking: opens `content` only to read its (width, height). docs/37 §6
+    point 2 — `_padded_crop_box` needs the map image's real pixel size to
+    clamp against, and `image_dims` would be a second, independently-drifting
+    source of truth for the same number. The decoded image is discarded."""
+    from PIL import Image
+
+    with Image.open(io.BytesIO(content)) as im:
+        return im.width, im.height
+
+
+def _guide_font(size: int = 16) -> Any:
+    """Best-effort TrueType font for room labels — `ImageFont.load_default()`
+    is bitmap and tiny. Labels are nice-to-have (docs/37 §5): any failure here
+    just falls back to the default font, never raises."""
+    from PIL import ImageFont
+
+    for path in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    ):
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception:  # noqa: BLE001 - font lookup is best-effort
+            continue
+    return ImageFont.load_default()
+
+
+def _render_guide_layer(
+    layer: str,
+    canvas_size: tuple[int, int],
+    *,
+    rects: list[tuple[tuple[float, float, float, float], str | None]] | None = None,
+    segments: list[list[tuple[float, float]]] | None = None,
+    stroke_px: int = _GUIDE_FALLBACK_STROKE_PX,
+    labels: bool = True,
+) -> bytes | None:
+    """Blocking (run via `hass.async_add_executor_job`, like `_crop_image_to_bbox`).
+
+    Draws ONE guide layer onto a fully transparent RGBA canvas sized exactly to
+    `canvas_size` (the crop box's own size — geometry is already crop-local by
+    the time it reaches here, produced by `_guide_room_rects`/
+    `_guide_path_segments`). Returns PNG bytes, or None when nothing was drawn
+    — the caller does not publish a layer with no data (docs/37 §4).
+    """
+    from PIL import Image, ImageDraw
+
+    w, h = canvas_size
+    if w <= 0 or h <= 0:
+        return None
+
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    color = _GUIDE_COLOR.get(layer, (255, 0, 255, 255))
+    drew = False
+
+    if layer == "rooms":
+        font = _guide_font() if labels else None
+        for (rx0, ry0, rx1, ry1), name in rects or []:
+            draw.rectangle([rx0, ry0, rx1, ry1], outline=color, width=2)
+            drew = True
+            if labels and name:
+                try:
+                    draw.text((rx0 + 4, ry0 + 4), str(name), fill=color, font=font)
+                except Exception:  # noqa: BLE001 - a label must never sink the export
+                    pass
+    else:  # "dry" / "wet"
+        r = max(1, stroke_px // 2)
+        for sub in segments or []:
+            if len(sub) >= 2:
+                draw.line(sub, fill=color, width=stroke_px, joint="curve")
+                drew = True
+            # PIL's line joints don't round the two free ends of a segment,
+            # which reads as a false square corner in the furniture mask
+            # (docs/37 §5) — cap both ends (and lone single-point segments)
+            # with a filled circle of the same width.
+            ends = (sub[0], sub[-1]) if sub else ()
+            for px, py in ends:
+                draw.ellipse([px - r, py - r, px + r, py + r], fill=color)
+                drew = True
+
+    if not drew:
+        return None
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 def _coordinators(hass: HomeAssistant) -> list[Any]:
@@ -978,6 +1180,143 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
             result["crop"] = {"x0": left, "y0": top, "x1": right, "y1": bottom}
         return result
 
+    async def _handle_export_map_guide(call: ServiceCall) -> dict[str, Any]:
+        entity_id = call.data["image_entity"]
+        if hass.states.get(entity_id) is None:
+            raise HomeAssistantError(
+                f"anyvac.export_map_guide: entity '{entity_id}' not found"
+            )
+
+        # Same duid/device resolution as snapshot_map_as_floorplan.
+        duid = duid_for_entity(hass, entity_id)
+        device = None
+        coord_for_duid = None
+        if duid:
+            for coord in _coordinators(hass):
+                d = (coord.data or {}).get(duid)
+                if d is not None:
+                    device = d
+                    coord_for_duid = coord
+                    break
+        rooms: list[Any] = (device.data.get("rooms") or []) if device is not None else []
+
+        # Crop (docs/37 §6 — must not be computed a second, independent way):
+        # either the caller's explicit box, or the SAME `_room_union_bbox_px` +
+        # `_padded_crop_box` helpers `snapshot_map_as_floorplan` uses, against
+        # the SAME image fetched the SAME way (only for its width/height —
+        # `_image_pixel_size` — never for its pixels; those are discarded).
+        explicit_crop = call.data.get("crop")
+        if explicit_crop is not None:
+            crop_box: tuple[int, int, int, int] = (
+                int(explicit_crop["x0"]), int(explicit_crop["y0"]),
+                int(explicit_crop["x1"]), int(explicit_crop["y1"]),
+            )
+        else:
+            bbox = _room_union_bbox_px(rooms)
+            if bbox is None:
+                raise HomeAssistantError(
+                    "anyvac.export_map_guide: no room geometry available yet for "
+                    f"'{entity_id}' (needed to compute the crop) — wait for the "
+                    "vacuum's next poll, or pass 'crop' explicitly"
+                )
+            try:
+                from homeassistant.components.image import async_get_image
+
+                image = await async_get_image(hass, entity_id, timeout=15)
+            except Exception as err:  # noqa: BLE001 - one clear service error
+                raise HomeAssistantError(
+                    f"anyvac.export_map_guide: could not fetch image from "
+                    f"'{entity_id}': {err}"
+                ) from err
+            try:
+                img_w, img_h = await hass.async_add_executor_job(
+                    _image_pixel_size, image.content
+                )
+            except Exception as err:  # noqa: BLE001 - surface as one clear error
+                raise HomeAssistantError(
+                    f"anyvac.export_map_guide: could not read image dimensions "
+                    f"for '{entity_id}': {err}"
+                ) from err
+            crop_box = _padded_crop_box(bbox, img_w, img_h)
+
+        x0, y0, x1, y1 = crop_box
+        canvas_size = (x1 - x0, y1 - y0)
+        if canvas_size[0] <= 0 or canvas_size[1] <= 0:
+            raise HomeAssistantError(
+                f"anyvac.export_map_guide: crop box for '{entity_id}' is empty"
+            )
+
+        # Stroke width: robot footprint in mm -> px, via the SAME calibration
+        # affine the coordinator already owns (docs/37 §5 — services.py must
+        # not solve the affine itself). Falls back to a fixed pixel width so
+        # the service never fails just because calibration is unavailable.
+        stroke_mm = call.data.get("stroke_mm", 300)
+        stroke_px = _GUIDE_FALLBACK_STROKE_PX
+        if coord_for_duid is not None and duid:
+            ppm = coord_for_duid.px_per_mm(duid)
+            if ppm:
+                stroke_px = max(1, round(stroke_mm * ppm))
+
+        requested_layers: list[str] = list(call.data.get("layers") or ["rooms", "dry", "wet"])
+        labels = call.data.get("labels", True)
+        crop_tuple = (float(x0), float(y0), float(x1), float(y1))
+
+        dry_segments = (
+            _guide_path_segments(device.data.get("path_dry_px") or [], crop_tuple)
+            if device is not None and "dry" in requested_layers
+            else []
+        )
+        wet_segments = (
+            _guide_path_segments(device.data.get("path_wet_px") or [], crop_tuple)
+            if device is not None and "wet" in requested_layers
+            else []
+        )
+        points = {
+            "dry": sum(len(s) for s in dry_segments),
+            "wet": sum(len(s) for s in wet_segments),
+        }
+
+        def _render(layer: str) -> bytes | None:
+            if layer == "rooms":
+                return _render_guide_layer(
+                    "rooms", canvas_size,
+                    rects=_guide_room_rects(rooms, crop_tuple), labels=labels,
+                )
+            segs = dry_segments if layer == "dry" else wet_segments
+            return _render_guide_layer(layer, canvas_size, segments=segs, stroke_px=stroke_px)
+
+        name = call.data.get("name") or entity_id.split(".", 1)[-1]
+        target_dir = hass.config.path("www", "anyvac")
+
+        def _write(path: str, data: bytes) -> None:
+            os.makedirs(target_dir, exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(data)
+
+        paths: dict[str, str] = {}
+        ts = int(time.time())
+        for layer in requested_layers:
+            png = await hass.async_add_executor_job(_render, layer)
+            if png is None:
+                continue  # empty layer: no file, no path entry (docs/37 §4)
+            filename = _guide_filename(name, layer)
+            target_path = os.path.join(target_dir, filename)
+            try:
+                await hass.async_add_executor_job(_write, target_path, png)
+            except OSError as err:
+                raise HomeAssistantError(
+                    f"anyvac.export_map_guide: could not write '{target_path}': {err}"
+                ) from err
+            paths[layer] = f"/local/anyvac/{filename}?t={ts}"
+
+        _LOGGER.info("AnyVac: exported guide layers for %s -> %s", entity_id, sorted(paths))
+        return {
+            "paths": paths,
+            "crop": {"x0": x0, "y0": y0, "x1": x1, "y1": y1},
+            "size": {"w": canvas_size[0], "h": canvas_size[1]},
+            "points": points,
+        }
+
     async def _handle_cancel(call: ServiceCall) -> None:
         started = _cancel_jobs(hass)
         if call.data.get("return_to_base", True) and started:
@@ -1006,6 +1345,7 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
         (SERVICE_DOCK_PUMP, _handle_dock_pump, DOCK_ACTION_SCHEMA, SupportsResponse.NONE),
         (SERVICE_DOCK_SELF_CLEAN, _handle_dock_self_clean, DOCK_ACTION_SCHEMA, SupportsResponse.NONE),
         (SERVICE_SNAPSHOT_FLOORPLAN, _handle_snapshot_floorplan, SNAPSHOT_FLOORPLAN_SCHEMA, SupportsResponse.ONLY),
+        (SERVICE_EXPORT_MAP_GUIDE, _handle_export_map_guide, EXPORT_MAP_GUIDE_SCHEMA, SupportsResponse.ONLY),
     ]
     for name, handler, schema, supports in registrations:
         if not hass.services.has_service(DOMAIN, name):

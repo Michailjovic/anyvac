@@ -490,3 +490,69 @@ snapshot_map_as_floorplan:
         the image entity's object id.
       selector:
         text:
+
+export_map_guide:
+  name: Export map guide layers
+  description: >-
+    Draw room boundaries and the last dry/wet path as separate transparent
+    PNGs, cropped to the same box as `anyvac.snapshot_map_as_floorplan`. Used
+    by the card's Maps tab as a tracing aid for building a custom floorplan by
+    hand (e.g. in GIMP) — the gaps inside the drawn path are where furniture
+    stands. Draws only; never changes card config.
+  fields:
+    image_entity:
+      name: Image entity
+      description: >-
+        The map image entity whose geometry to export (e.g.
+        image.s6_kitchen_map_0). Same entity `anyvac.snapshot_map_as_floorplan`
+        would use for this vacuum.
+      required: true
+      selector:
+        entity:
+          domain: image
+    name:
+      name: Name
+      description: >-
+        Label used to build the output filenames (slugified). Defaults to
+        the image entity's object id.
+      selector:
+        text:
+    layers:
+      name: Layers
+      description: >-
+        Which guide layers to produce. Any of `rooms`, `dry`, `wet`.
+      example: '["rooms", "dry", "wet"]'
+      selector:
+        object:
+    labels:
+      name: Room name labels
+      description: >-
+        Write each room's name into the `rooms` layer near its top-left
+        corner.
+      default: true
+      selector:
+        boolean:
+    stroke_mm:
+      name: Stroke width
+      description: >-
+        Width of the drawn dry/wet path, in millimetres — should match the
+        vacuum's real footprint so the negative space inside the path lines
+        up with actual furniture. Converted to pixels using this vacuum's
+        own map calibration; falls back to a fixed pixel width when
+        calibration is unavailable.
+      default: 300
+      selector:
+        number:
+          min: 50
+          max: 600
+          unit_of_measurement: mm
+    crop:
+      name: Crop override
+      description: >-
+        Force a specific `{x0, y0, x1, y1}` crop box (rendered-image pixel
+        space) instead of the one computed from this vacuum's current room
+        geometry. Use this to match guide layers to an EXISTING older
+        floorplan whose crop has since shifted (e.g. after a remap).
+      example: '{"x0": 412, "y0": 384, "x1": 764, "y1": 1692}'
+      selector:
+        object:

@@ -4,6 +4,34 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-09-10
+
+Paired with card 1.4.0.
+
+### Added
+
+**`anyvac.export_map_guide`** (docs/37) — draws room boundaries and the last
+dry/wet path as separate transparent PNGs, cropped to the exact same box
+`anyvac.snapshot_map_as_floorplan` produces. Reuses that service's
+`_room_union_bbox_px`/`_padded_crop_box` helpers (and fetches the image the
+same way, only for its width/height) rather than computing the crop a second,
+independent way — exactly the drift class docs/34 finding B4 named. Colours
+are fixed and vivid (magenta rooms, lime dry, cyan wet) — a tracing aid, not
+decoration; a layer with no data (e.g. no wet pass run yet) is not produced at
+all, rather than an empty transparent file, so its key is simply absent from
+the response's `paths`. Stroke width defaults to a 300mm robot footprint,
+converted to pixels via a new `AnyVacCoordinator.px_per_mm(duid)` — the
+coordinator's own calibration affine, same source `pct_to_mm` already uses, so
+geometry stays backend-owned (docs/14 §1); falls back to a fixed pixel width
+when calibration is unavailable. Draws only — unlike the floorplan snapshot
+service, this never writes to card config. New `services.yaml` entry (a
+missing/incomplete entry surfaces as a startup ERROR and blank Developer
+Tools descriptions — finding 0.80.2). 16 new tests
+(`tests/test_export_map_guide.py`: filename slugification, the crop-local
+coordinate transform incl. mid-segment breaks at the crop boundary,
+`px_per_mm` against a known affine, and a real PIL round-trip verifying the
+rendered canvas size/alpha), 119/119 in `anyvac/tests/` green.
+
 ## [1.3.0] - 2026-09-02
 
 Home Assistant 2026.9 shipped with `python-roborock` 7.1.1 (up from 5.31.1) and a
