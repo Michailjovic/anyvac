@@ -4,6 +4,68 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.2] - 2026-09-13
+
+Fáze 0 of docs/40 ("home frame" — automatic multi-vacuum map calibration): a
+verification spike only. **No behaviour change.** Paired with card 1.6.2
+(card unchanged).
+
+### Added
+
+**Raw map diagnostic inventory** — `sensor.*`'s `debug_map` attribute gains
+`map_index`/`map_sequence` (read defensively from the parser's
+`additional_parameters`, docs/40 §2) and `image_top`/`image_left`/
+`image_width`/`image_height` (from `map_data.image.dimensions` — recorded
+separately from the raw IMAGE block header docs/40 decodes directly from
+bytes, since the two can legitimately differ once the library applies its
+own trim, and that discrepancy is itself a Fáze 0 finding, not a bug to
+reconcile) — plus `raw_len`/`raw_sha1` (a 12-char short hash) for the raw
+Roborock map bytes (`MapContent.raw_api_response`), when the piggybacked
+Roborock integration/library version exposes them. The raw bytes themselves
+are never published on any sensor attribute (`AnyVacCoordinator.
+raw_map_for(duid)` re-reads them fresh, on demand, for the service below —
+never cached alongside the published device data).
+
+**`anyvac.dump_raw_map`** — DEBUG/DIAGNOSTIC ONLY. Writes one vacuum's raw
+map bytes to `config/www/anyvac/debug/<name>_<map_flag>.bin` so they can be
+copied into `anyvac/tools/samples/` for the new offline registration probe
+below. Same target resolution as `goto`/`zone_clean` (`entity_id` or
+`duid`); `ServiceValidationError` when no raw bytes are available yet. New
+`services.yaml` entry (a missing one is a startup ERROR — finding 0.80.2).
+Not used by the card, not part of any user-facing workflow.
+
+**`anyvac/tools/homeframe_probe.py`** — a pure Python + numpy, non-HA,
+runnable-in-a-sandbox offline tool: decodes a raw Roborock map's IMAGE block
+directly from bytes into numpy floor/wall/room-id masks (`decode_grid` —
+independent of the library's own PIL-rendered image, docs/40 §2), self-tests
+that decoder against the real `vacuum_map_parser_roborock` parser's own
+`Room.x0..y1` bboxes (`self_test` — must match to the cell), and registers
+one robot's floor mask onto another's via coarse 4×90° + fine ±6°/1° FFT
+cross-correlation (`register`/`register_with_fallback`, with a 360°@2°
+fallback sweep and an independent Kabsch cross-check, `kabsch_from_names`).
+Writes a visual overlay PNG per pair. Validated against synthetic maps in
+this session (exact rotation recovery at 0/90/180/270/93/86°, `covered`/`iou`
+> 0.97 even with 2% noise + partial exploration + an unrelated canvas
+offset; a wrong-rotation hypothesis scores visibly lower). No opencv/scipy/
+scikit-image (docs/40 §6); `decode_grid`/`register`/`kabsch_from_names` are
+written with zero dependency on this tool file specifically so they move
+into `custom_components/anyvac/homeframe.py` unchanged in Fáze 1.
+
+7 new tests (`tests/test_dump_raw_map.py`: filename slugification + the "no
+raw data available" error path via mock coordinators exposing only
+`raw_map_for`, docs/14 rule 1 — no second implementation of the piggyback
+walk to mock against). 135/135 in `anyvac/tests/` green (128 pre-existing +
+7 new; the previously-documented "119" baseline was stale — the suite had
+already grown past it before this session).
+
+### Notes
+
+Card unchanged — nothing here is read by `anyvac-card`. See docs/40 for the
+full spec and the Fáze 0 human-verification report (real-device raw map
+dumps, decoder self-test, registration numbers for the three-robot setup);
+Fáze 1 (backend home frame, contract v3) starts only after that report and
+an explicit go-ahead.
+
 ## [1.4.0] - 2026-09-10
 
 Paired with card 1.4.0.

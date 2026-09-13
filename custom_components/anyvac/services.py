@@ -19,6 +19,10 @@ Public command interface for the card (and automations):
                           vacuum's own map as a static photo, and export its
                           room/dry/wet geometry as transparent tracing layers
                           over that same crop. Neither writes card config.
+- ``anyvac.dump_raw_map`` — DEBUG/DIAGNOSTIC only (docs/40 Fáze 0): writes a
+                          vacuum's raw Roborock map bytes to disk for the
+                          offline home-frame registration probe. No card
+                          involvement, no behaviour change to anything else.
 
 Execution model (proven in the field by the card-built v1 plans): a job is a list
 of tasks; a task with no ``after`` runs immediately, the rest run when all their
@@ -28,6 +32,7 @@ new job cancels the previous one (docs/13 C6 — no double-driving robots).
 
 from __future__ import annotations
 
+import hashlib
 import io
 import logging
 import os
@@ -38,7 +43,7 @@ from typing import Any
 import voluptuous as vol
 
 from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers.event import async_call_later
 from homeassistant.util import dt as dt_util
 
@@ -65,6 +70,7 @@ SERVICE_DOCK_PUMP = "dock_pump"
 SERVICE_DOCK_SELF_CLEAN = "dock_self_clean"
 SERVICE_SNAPSHOT_FLOORPLAN = "snapshot_map_as_floorplan"
 SERVICE_EXPORT_MAP_GUIDE = "export_map_guide"
+SERVICE_DUMP_RAW_MAP = "dump_raw_map"
 
 ALL_SERVICES = (
     SERVICE_RUN_JOB,
@@ -85,6 +91,7 @@ ALL_SERVICES = (
     SERVICE_DOCK_SELF_CLEAN,
     SERVICE_SNAPSHOT_FLOORPLAN,
     SERVICE_EXPORT_MAP_GUIDE,
+    SERVICE_DUMP_RAW_MAP,
 )
 
 JOB_TIMEOUT_SECONDS = 3 * 3600  # safety: tear down a stuck job after 3 h
@@ -217,6 +224,17 @@ DOCK_ACTION_SCHEMA = vol.Schema(
 DOCK_TOGGLE_SCHEMA = DOCK_ACTION_SCHEMA.extend(
     {vol.Optional("action", default="start"): vol.In(["start", "stop"])}
 )
+# docs/40 Fáze 0 (2026-09-13): DEBUG/DIAGNOSTIC ONLY — dumps a vacuum's raw
+# Roborock map bytes to disk for the offline home-frame registration probe
+# (`anyvac/tools/homeframe_probe.py`). Same target resolution as goto/zone_clean/
+# the dock actions (entity_id or duid).
+DUMP_RAW_MAP_SCHEMA = vol.Schema(
+    {
+        vol.Optional("entity_id"): str,
+        vol.Optional("duid"): str,
+        vol.Optional("name"): str,
+    }
+)
 # docs/30 §4a field follow-up (2026-07-30): merged mode's per-vacuum auto-seat
 # fit is hard-disabled without a shared floorplan image (`_editorSeat`/
 # `_effectiveSeat` both bail to manual sliders when `image_base.src` is
@@ -280,6 +298,42 @@ def _floorplan_filename(name: str, content_type: str | None) -> str:
     ext = _FLOORPLAN_EXT_FOR_CONTENT_TYPE.get((content_type or "").lower(), "png")
     slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_") or "vacuum"
     return f"anyvac_floorplan_{slug}.{ext}"
+
+
+# ── Raw map dump (docs/40 Fáze 0) ──────────────────────────────────────────────
+
+
+def _raw_map_filename(name: str, map_flag: Any) -> str:
+    """Pure helper (mirrors `_floorplan_filename`): slugified `<name>_<map_flag>.bin`
+    filename for one `anyvac.dump_raw_map` dump. `map_flag` distinguishes a
+    multi-map vacuum's floors from each other; falls back to "map" when it is
+    unknown (e.g. a Roborock/library version with no `current_map_data`)."""
+    slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_") or "vacuum"
+    flag_slug = (
+        re.sub(r"[^a-z0-9]+", "_", str(map_flag).lower()).strip("_")
+        if map_flag is not None
+        else ""
+    ) or "map"
+    return f"{slug}_{flag_slug}.bin"
+
+
+def _require_raw_map(coords: list[Any], duid: str) -> tuple[bytes, dict[str, Any]]:
+    """Look up raw map bytes for `duid` across every AnyVac coordinator (in
+    practice one), via `AnyVacCoordinator.raw_map_for` — no second
+    implementation of that piggyback walk here (docs/14 rule 1). Raises
+    `ServiceValidationError` with a clear message when none has it yet, so
+    `anyvac.dump_raw_map`'s "no raw data available" path is unit-testable
+    without a running Home Assistant instance (mock objects exposing just
+    `raw_map_for`, no real coordinator needed)."""
+    for coord in coords:
+        result = coord.raw_map_for(duid)
+        if result is not None:
+            return result
+    raise ServiceValidationError(
+        f"anyvac.dump_raw_map: no raw map bytes available yet for vacuum '{duid}' "
+        "(piggyback map not ready, or this Roborock integration/library version "
+        "does not expose raw_api_response)"
+    )
 
 
 # docs/30 §4a second field follow-up (2026-07-30): a Roborock map image's
@@ -1317,6 +1371,45 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
             "points": points,
         }
 
+    async def _handle_dump_raw_map(call: ServiceCall) -> dict[str, Any]:
+        # docs/40 Fáze 0: DEBUG/DIAGNOSTIC ONLY. Writes the raw Roborock map
+        # bytes for one vacuum to disk so the user can pull them into
+        # `anyvac/tools/samples/` for the offline home-frame registration probe.
+        # Never writes card config, never touches anything the card reads.
+        duid = _resolve_target_duid(hass, call)
+        raw, meta = _require_raw_map(_coordinators(hass), duid)
+
+        entity = call.data.get("entity_id") or vacuum_entity_for_duid(hass, duid)
+        name = call.data.get("name") or (entity.split(".", 1)[-1] if entity else duid)
+        filename = _raw_map_filename(name, meta.get("map_flag"))
+        target_dir = hass.config.path("www", "anyvac", "debug")
+        target_path = os.path.join(target_dir, filename)
+
+        def _write() -> None:
+            os.makedirs(target_dir, exist_ok=True)
+            with open(target_path, "wb") as f:
+                f.write(raw)
+
+        try:
+            await hass.async_add_executor_job(_write)
+        except OSError as err:
+            raise HomeAssistantError(
+                f"anyvac.dump_raw_map: could not write '{target_path}': {err}"
+            ) from err
+
+        sha1 = hashlib.sha1(raw).hexdigest()[:12]
+        _LOGGER.info(
+            "AnyVac: dumped raw map for %s -> %s (%d bytes, sha1 %s)",
+            duid, target_path, len(raw), sha1,
+        )
+        return {
+            "path": f"/local/anyvac/debug/{filename}",
+            "bytes": len(raw),
+            "map_index": meta.get("map_index"),
+            "map_sequence": meta.get("map_sequence"),
+            "sha1": sha1,
+        }
+
     async def _handle_cancel(call: ServiceCall) -> None:
         started = _cancel_jobs(hass)
         if call.data.get("return_to_base", True) and started:
@@ -1346,6 +1439,7 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
         (SERVICE_DOCK_SELF_CLEAN, _handle_dock_self_clean, DOCK_ACTION_SCHEMA, SupportsResponse.NONE),
         (SERVICE_SNAPSHOT_FLOORPLAN, _handle_snapshot_floorplan, SNAPSHOT_FLOORPLAN_SCHEMA, SupportsResponse.ONLY),
         (SERVICE_EXPORT_MAP_GUIDE, _handle_export_map_guide, EXPORT_MAP_GUIDE_SCHEMA, SupportsResponse.ONLY),
+        (SERVICE_DUMP_RAW_MAP, _handle_dump_raw_map, DUMP_RAW_MAP_SCHEMA, SupportsResponse.ONLY),
     ]
     for name, handler, schema, supports in registrations:
         if not hass.services.has_service(DOMAIN, name):

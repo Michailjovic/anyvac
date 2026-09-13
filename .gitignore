@@ -2,3 +2,8 @@ __pycache__/
 *.pyc
 *.pyo
 .DS_Store
+
+# docs/40 Fáze 0: real-device raw map dumps for the homeframe_probe.py tool —
+# personal floorplan data, never committed. `out/` is the tool's own overlay
+# PNG output, also local-only.
+tools/samples/

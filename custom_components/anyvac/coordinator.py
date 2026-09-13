@@ -17,6 +17,7 @@ yields no data for that vacuum rather than raising.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 from dataclasses import dataclass, field
@@ -442,6 +443,23 @@ def _extract_debug(map_data: Any) -> dict[str, Any]:
     out["image_present"] = img is not None
     out["image_data_type"] = type(getattr(img, "data", None)).__name__ if img is not None else None
 
+    # docs/40 Fáze 0: raw-map inventory, purely diagnostic (no behaviour depends on
+    # these). `map_index`/`map_sequence` come from the parser's own header read,
+    # exposed via `additional_parameters` (vacuum-map-parser-roborock 0.1.5) — never
+    # assume the key exists, a parser version bump may drop or rename it.
+    add_params = getattr(map_data, "additional_parameters", None)
+    out["map_index"] = add_params.get("map_index") if isinstance(add_params, dict) else None
+    out["map_sequence"] = add_params.get("map_sequence") if isinstance(add_params, dict) else None
+    # `image.dimensions` already reflects the library's own trim/crop, which can
+    # differ from the raw IMAGE block header docs/40 §2 decodes directly from
+    # bytes — recording both here is exactly the discrepancy Fáze 0's report is
+    # meant to surface, not something to reconcile in code.
+    dims = getattr(img, "dimensions", None) if img is not None else None
+    out["image_top"] = getattr(dims, "top", None) if dims is not None else None
+    out["image_left"] = getattr(dims, "left", None) if dims is not None else None
+    out["image_width"] = getattr(dims, "width", None) if dims is not None else None
+    out["image_height"] = getattr(dims, "height", None) if dims is not None else None
+
     # Field inventory — the definitive ground truth: every public, non-callable field
     # the parser actually carries on THIS model. Ends the guesswork about what exists.
     def _fields(obj: Any) -> list[str]:
@@ -463,6 +481,25 @@ def _extract_debug(map_data: Any) -> dict[str, Any]:
     out["image_fields"] = _fields(img) if img is not None else []
 
     return out
+
+
+def _resolve_map_content(coord: Any) -> Any | None:
+    """Resolve the current (or best-effort fallback) ``MapContent`` object for one
+    Roborock v1 coordinator. Factored out of `_extract_device` (docs/40 Fáze 0) so
+    `AnyVacCoordinator.raw_map_for` — a second, on-demand caller needing the same
+    object, for `anyvac.dump_raw_map` — does not reimplement this walk a second
+    time (docs/14 rule 1 / docs/34 finding B4). Same defensive getattr-chain,
+    same "prefer current map, else any cached one" fallback as before."""
+    home = getattr(getattr(coord, "properties_api", None), "home", None)
+    if home is None:
+        return None
+    contents = getattr(home, "home_map_content", None) or {}
+    current = getattr(home, "current_map_data", None)
+    flag = getattr(current, "map_flag", None)
+    map_content = contents.get(flag) if flag is not None else None
+    if map_content is None:
+        map_content = next(iter(contents.values()), None)
+    return map_content
 
 
 def _extract_map(map_data: Any) -> dict[str, Any]:
@@ -880,6 +917,38 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         a, b, c, d, e, f = aff
         det = a * e - b * d
         return math.sqrt(abs(det)) if det else None
+
+    def raw_map_for(self, duid: str) -> tuple[bytes, dict[str, Any]] | None:
+        """Fresh raw Roborock map bytes for one duid (docs/40 Fáze 0), for
+        ``anyvac.dump_raw_map``. Walks the SAME piggyback tree `_extract_device`
+        does (via `_resolve_map_content` — no second implementation), but does it
+        fresh on every call rather than reading `self.data`: raw bytes are
+        deliberately never cached on the published device data (that would put
+        them one accidental `**device.data` away from a sensor attribute /
+        websocket payload). Returns ``(raw_bytes, meta)`` where meta carries
+        ``map_flag``/``map_index``/``map_sequence``, or None when no Roborock v1
+        coordinator for this duid has raw bytes available yet.
+        """
+        for rb_entry in self.hass.config_entries.async_entries(ROBOROCK_DOMAIN):
+            runtime = getattr(rb_entry, "runtime_data", None)
+            for coord in getattr(runtime, "v1", None) or []:
+                if getattr(coord, "duid", None) != duid:
+                    continue
+                map_content = _resolve_map_content(coord)
+                raw = getattr(map_content, "raw_api_response", None) if map_content else None
+                if not isinstance(raw, (bytes, bytearray)):
+                    return None
+                home = getattr(getattr(coord, "properties_api", None), "home", None)
+                current = getattr(home, "current_map_data", None) if home else None
+                map_data = getattr(map_content, "map_data", None)
+                add_params = getattr(map_data, "additional_parameters", None) if map_data else None
+                meta: dict[str, Any] = {
+                    "map_flag": getattr(current, "map_flag", None),
+                    "map_index": add_params.get("map_index") if isinstance(add_params, dict) else None,
+                    "map_sequence": add_params.get("map_sequence") if isinstance(add_params, dict) else None,
+                }
+                return bytes(raw), meta
+        return None
 
     @property
     def view_layers(self) -> dict[str, bool]:
@@ -2057,13 +2126,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         if home is None:
             return None
 
-        contents = getattr(home, "home_map_content", None) or {}
-        # Prefer the current map; fall back to any cached map content.
-        current = getattr(home, "current_map_data", None)
-        flag = getattr(current, "map_flag", None)
-        map_content = contents.get(flag) if flag is not None else None
-        if map_content is None:
-            map_content = next(iter(contents.values()), None)
+        map_content = _resolve_map_content(coord)
 
         map_data = getattr(map_content, "map_data", None) if map_content else None
         if map_data is None:
@@ -2075,6 +2138,20 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         except Exception as err:  # noqa: BLE001 - debug data must never break the update
             _LOGGER.debug("AnyVac: debug extraction failed: %s", err)
             data["debug_map"] = None
+
+        # docs/40 Fáze 0: raw map bytes inventory (length + short hash) only — the
+        # bytes THEMSELVES never go on `debug_map` / any sensor attribute, since
+        # attributes are pushed over the websocket to every card client. The bytes
+        # are only ever written to disk on-demand, by `anyvac.dump_raw_map`
+        # (`AnyVacCoordinator.raw_map_for`), never cached here.
+        if isinstance(data.get("debug_map"), dict):
+            raw = getattr(map_content, "raw_api_response", None) if map_content else None
+            if isinstance(raw, (bytes, bytearray)):
+                data["debug_map"]["raw_len"] = len(raw)
+                data["debug_map"]["raw_sha1"] = hashlib.sha1(raw).hexdigest()[:12]
+            else:
+                data["debug_map"]["raw_len"] = None
+                data["debug_map"]["raw_sha1"] = None
 
         # MapData.rooms carry no names; merge them from the home trait's room mapping.
         names: dict[int, str] = {}

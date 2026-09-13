@@ -556,3 +556,30 @@ export_map_guide:
       example: '{"x0": 412, "y0": 384, "x1": 764, "y1": 1692}'
       selector:
         object:
+
+dump_raw_map:
+  name: Dump raw map (debug)
+  description: >-
+    DEBUG/DIAGNOSTIC ONLY (docs/40 Fáze 0). Writes the vacuum's raw Roborock
+    map bytes to config/www/anyvac/debug/ for the offline home-frame
+    registration probe. Not used by the card; no behaviour change to anything
+    else. Fails if raw map data is not available yet for this vacuum.
+  fields:
+    entity_id:
+      name: Vacuum
+      description: Vacuum whose raw map to dump. Omit if `duid` is given instead.
+      selector:
+        entity:
+          domain: vacuum
+    duid:
+      name: Vacuum (duid)
+      description: Roborock device id, as an alternative to `entity_id`.
+      selector:
+        text:
+    name:
+      name: Name
+      description: >-
+        Label used to build the output filename (slugified). Defaults to
+        the vacuum entity's object id.
+      selector:
+        text:
