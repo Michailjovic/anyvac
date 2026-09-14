@@ -139,6 +139,7 @@ async def _load_pins(load_value: Any) -> dict[str, dict[str, str]]:
     coord._cov_pct_store = _FakeStore()
     coord._est_store = _FakeStore()
     coord._paths_store = _FakeStore()
+    coord._home_frame_store = _FakeStore()
     coord._room_pins = {}  # __init__'s default, in case `load_value` isn't a dict
     await coord._async_setup()
     return coord._room_pins

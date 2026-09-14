@@ -43,6 +43,31 @@ or mm math on the card side:
 | `pipeline_ok` / `pipeline_error` | integration self-diagnostic for the current poll |
 | `duid`, `calib_debug`, `transit_cells` | diagnostics — device id, calibration solve debug info, "seen but not counted" cells outside the active job's room scope |
 
+### Home frame (multi-vacuum, `schema_version: 3`)
+
+`schema_version` is now `3` — purely additive, every attribute above is
+unchanged. When two or more vacuums share the same physical space, AnyVac
+automatically works out how their maps line up (docs/40) and republishes the
+SAME geometry above in one shared coordinate space, so a floorplan built once
+(via `anyvac.snapshot_map_as_floorplan`) can show every vacuum on it without
+any manual "seat" configuration per robot:
+
+| Attribute | Meaning |
+| --- | --- |
+| `home_frame` | `{id, cell_mm, scale, width_px, height_px}` — the shared raster this vacuum currently belongs to, or `null` if it has none yet (just restarted, or its map failed the decoder self-test) |
+| `registration` | `{status, method, rotation_deg, score, iou}` — `status` is `reference` (this vacuum's map founded/still founds the frame), `aligned` (successfully registered onto it), or `unaligned` (its map doesn't currently match anything, e.g. a different floor — it gets its own frame automatically) |
+| `vacuum_position_home_px` / `charger_home_px` | the same points as `vacuum_position_px`/`charger_px`, in the shared frame's px space |
+| `path_dry_home_px` / `path_wet_home_px` | the same segmented trajectories, in the shared frame's px space |
+| `rooms[].bbox_home_px` | room bounding box in the shared frame's px space |
+| `rooms[].outline_home_px` | the room's actual traced shape (a simplified polygon, ≤ 60 points) instead of just a bounding box |
+| `rooms[].home_room_id` | a stable id shared by two vacuums' rooms once their floor masks overlap enough to be the same physical room — use this (not the room name) to match rooms across vacuums |
+
+Every `*_home_px` field and `home_room_id` are `null`/empty for a vacuum with
+no home-frame registration (`home_frame: null`) — nothing here changes how a
+single-vacuum setup behaves. This is backend-only groundwork for now (Fáze 1
+of docs/40); no service yet accepts home-frame coordinates as input, and the
+card does not read these attributes.
+
 ### Legacy millimetre attributes
 
 The small mm-space fields — `vacuum_position`, `charger`, `calibration_points`

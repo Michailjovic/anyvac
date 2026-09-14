@@ -20,9 +20,12 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
+
+import numpy as np
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -30,6 +33,7 @@ from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
+from . import homeframe
 from .const import (
     DEFAULT_EXPOSE_LEGACY_MM,
     DOMAIN,
@@ -349,6 +353,149 @@ def _px_point(
     return out
 
 
+def _home_px_point(
+    p: dict[str, float] | None, rec: dict[str, Any] | None, frame: dict[str, Any] | None
+) -> dict[str, float] | None:
+    """Transform one {x, y[, a]} point in THIS VACUUM'S OWN mm space into
+    published `*_home_px` space (docs/40 §4.2 point 6, kontrakt v3) — the
+    stored registration `rec` maps robot mm -> frame mm
+    (`homeframe.robot_mm_to_frame_mm`), then the frame's own origin/cell/
+    scale maps frame mm -> home px (`homeframe.mm_to_home_px`). Mirrors
+    `_px_point`'s shape/rounding so the card treats both contracts
+    identically. None whenever any input is missing (no home-frame
+    registration yet for this duid)."""
+    if p is None or rec is None or frame is None:
+        return None
+    x, y = p.get("x"), p.get("y")
+    if x is None or y is None:
+        return None
+    fx_mm, fy_mm = homeframe.robot_mm_to_frame_mm(rec["rot_deg"], rec["tx_mm"], rec["ty_mm"], x, y)
+    px, py = homeframe.mm_to_home_px(
+        frame["origin_mm"],
+        frame.get("cell_mm", homeframe.FRAME_CELL_MM),
+        frame.get("scale", homeframe.HOME_PX_SCALE),
+        fx_mm,
+        fy_mm,
+    )
+    out: dict[str, float] = {"x": round(px, 1), "y": round(py, 1)}
+    if p.get("a") is not None:
+        out["a"] = p["a"]
+    return out
+
+
+def _frame_mm_to_home_px(fx_mm: float, fy_mm: float, frame: dict[str, Any]) -> list[float]:
+    """Frame-space mm (e.g. an `outline_from_mask` point, already offset by
+    the frame's own `origin_mm`) -> published home px `[x, y]` — no
+    robot-space registration step, unlike `_home_px_point` above."""
+    px, py = homeframe.mm_to_home_px(
+        frame["origin_mm"],
+        frame.get("cell_mm", homeframe.FRAME_CELL_MM),
+        frame.get("scale", homeframe.HOME_PX_SCALE),
+        fx_mm,
+        fy_mm,
+    )
+    return [round(px, 1), round(py, 1)]
+
+
+def _apply_home_frame_contract(
+    device: AnyVacDevice,
+    path_dry: list[list[dict[str, float]]],
+    path_wet: list[list[dict[str, float]]],
+    home_frames: dict[str, dict[str, Any]],
+    robot_frame: dict[str, str],
+    room_masks: dict[str, dict[str, dict[int, Any]]],
+) -> None:
+    """Kontrakt v3 (docs/40 §4.2 point 6, additive — every `*_px` attribute
+    stays untouched): the SAME points already on `device.data`, re-expressed
+    in the shared home frame's own px space, for a vacuum that has a
+    home-frame registration. Mutates `device.data`/`device.data["rooms"]` in
+    place, mirroring the v2 `*_px` block's own style. Factored out of
+    `_async_update_data` (a plain function, not a method) purely so it can be
+    unit-tested directly against a hand-built `AnyVacDevice` + frame table,
+    without the full Roborock piggyback tree `_async_update_data` itself
+    needs (docs/14 rule 1 — no second implementation of this logic for
+    tests). `home_frame`/`registration` are `None` and every `*_home_px` is
+    `None`/`[]` when this duid has no assignment yet (self-test disabled,
+    not polled since restart, or `unaligned` with no matching frame) — the
+    card falls back to today's per-vacuum px contract in that case."""
+    frame_id = robot_frame.get(device.duid)
+    frame = home_frames.get(frame_id) if frame_id else None
+    rec = (frame.get("robots") or {}).get(device.duid) if frame is not None else None
+    if frame is None or rec is None:
+        device.data["home_frame"] = None
+        device.data["registration"] = None
+        device.data["vacuum_position_home_px"] = None
+        device.data["charger_home_px"] = None
+        device.data["path_dry_home_px"] = []
+        device.data["path_wet_home_px"] = []
+        for room in device.data.get("rooms", []):
+            room["bbox_home_px"] = None
+            room["outline_home_px"] = None
+            room["home_room_id"] = None
+        return
+
+    cell_mm = frame.get("cell_mm", homeframe.FRAME_CELL_MM)
+    scale = frame.get("scale", homeframe.HOME_PX_SCALE)
+    device.data["home_frame"] = {
+        "id": frame_id,
+        "cell_mm": cell_mm,
+        "scale": scale,
+        "width_px": frame["width"] * scale,
+        "height_px": frame["height"] * scale,
+    }
+    device.data["registration"] = {
+        "status": rec.get("status"),
+        "method": rec.get("method"),
+        "rotation_deg": rec.get("rot_deg"),
+        "score": rec.get("score"),
+        "iou": rec.get("iou"),
+    }
+    device.data["vacuum_position_home_px"] = _home_px_point(
+        device.data.get("vacuum_position"), rec, frame
+    )
+    device.data["charger_home_px"] = _home_px_point(device.data.get("charger"), rec, frame)
+    device.data["path_dry_home_px"] = [
+        seg_px
+        for seg in path_dry
+        if (seg_px := [q for p in seg if (q := _home_px_point(p, rec, frame))])
+    ]
+    device.data["path_wet_home_px"] = [
+        seg_px
+        for seg in path_wet
+        if (seg_px := [q for p in seg if (q := _home_px_point(p, rec, frame))])
+    ]
+    # `outline_home_px`/`home_room_id` (docs/40 §4.2 point 6 "vedlejší
+    # produkt"): from the in-memory-only per-segment masks cached at the
+    # last registration event (never a fresh decode on the hot poll path —
+    # see `_home_frame_room_masks`'s own docstring in `__init__`).
+    frame_masks = room_masks.get(frame_id) or {}
+    seg_masks = frame_masks.get(device.duid) or {}
+    home_room_ids = homeframe.room_identity(frame_masks) if frame_masks else {}
+    for room in device.data.get("rooms", []):
+        p0 = _home_px_point({"x": room.get("x0"), "y": room.get("y0")}, rec, frame)
+        p1 = _home_px_point({"x": room.get("x1"), "y": room.get("y1")}, rec, frame)
+        if p0 and p1:
+            room["bbox_home_px"] = {
+                "x0": min(p0["x"], p1["x"]),
+                "y0": min(p0["y"], p1["y"]),
+                "x1": max(p0["x"], p1["x"]),
+                "y1": max(p0["y"], p1["y"]),
+            }
+        else:
+            room["bbox_home_px"] = None
+        seg_id = room.get("segment_id")
+        mask = seg_masks.get(seg_id) if seg_id is not None else None
+        if mask is not None and mask.any():
+            outline_local = homeframe.outline_from_mask(mask, cell_mm)
+            room["outline_home_px"] = [
+                _frame_mm_to_home_px(frame["origin_mm"][0] + ox, frame["origin_mm"][1] + oy, frame)
+                for ox, oy in outline_local
+            ] or None
+        else:
+            room["outline_home_px"] = None
+        room["home_room_id"] = home_room_ids.get((device.duid, seg_id)) if seg_id is not None else None
+
+
 def _extract_debug(map_data: Any) -> dict[str, Any]:
     """Debug exposure of so-far unadopted MapData fields (docs/17 §2) — for reverse
     engineering which sources are worth adopting (goto/predicted path for transit
@@ -502,6 +649,188 @@ def _resolve_map_content(coord: Any) -> Any | None:
     return map_content
 
 
+def _compute_home_frame_result(
+    frames_snapshot: dict[str, dict[str, Any]],
+    robot_frame_snapshot: dict[str, str],
+    duid: str,
+    raw: bytes,
+    map_index: Any,
+    map_sequence: Any,
+    grid_sha1: str,
+    lib_rooms: dict[int, Any],
+    now_iso: str,
+) -> dict[str, Any]:
+    """Pure docs/40 §4.2 home-frame registration step for ONE duid's changed
+    map. A pure function — everything it needs is passed in as a snapshot
+    (never live coordinator state) and everything it returns is a plain
+    description of what changed — so `AnyVacCoordinator` can run it in
+    `hass.async_add_executor_job` while other work continues on the event
+    loop. Frames are only ever REPLACED wholesale (`homeframe.
+    merge_robot_into_frame`/`grow_frame_canvas` both copy-on-write), so a
+    concurrent caller still holding an old frame object from `frames_snapshot`
+    is never corrupted by this call's result being applied afterwards.
+
+    Lifecycle (docs/40 §4.2, numbered to match that section):
+    1. Decode + self-test against the library's own room bboxes; a failed
+       self-test PERMANENTLY disables registration for this duid (never a
+       silent "best effort" geometry) — ``disabled: True``.
+    2. No frames exist anywhere yet -> this duid founds the very first frame,
+       identity (0°, 0, 0), status ``reference``.
+    3. Otherwise: try registering this duid's floor mask against the frame it
+       is ALREADY assigned to first (continuity — point 5 below), then, if
+       that fails the gate (or it has no assignment yet), against every OTHER
+       known frame, keeping the best gate-passing result.
+    4. Nothing passes the gate anywhere -> a brand-new frame is founded for
+       this duid. If frames already existed elsewhere, this is published as
+       ``unaligned`` (docs/40 §4.2 point 4: "different floor" is the expected
+       reading, even though the new frame's own internal record for this duid
+       is technically ``method: reference``); if `frames_snapshot` was
+       completely empty this really is the first robot ever, so ``reference``.
+    5. A duid that founded its OWN frame, remapped, and now fails to
+       re-register against that SAME frame ("opravdu jiný byt") gets a new
+       frame; the old one is kept (never deleted) and flagged
+       ``stale_frame_id`` for the caller to mark ``{"stale": True}`` so the
+       card can prompt to re-accept a new floorplan rather than silently
+       losing it.
+    """
+    result: dict[str, Any] = {
+        "duid": duid,
+        "cache_key": (map_index, map_sequence, grid_sha1),
+        "disabled": False,
+        "error": None,
+        "updated_frames": {},
+        "removed_robot_from_frames": [],
+        "robot_frame": None,
+        "stale_frame_id": None,
+        "origin_shifted": False,
+        "status": None,
+        "score": None,
+        "iou": None,
+        "method": None,
+        "rot_deg": None,
+        "segment_masks": {},
+    }
+    try:
+        grid = homeframe.decode_grid(raw)
+    except Exception as err:  # noqa: BLE001 - a malformed/short raw blob, never fatal
+        result["error"] = f"decode_grid: {err}"
+        return result
+
+    if lib_rooms and not homeframe.grid_self_test(grid, lib_rooms):
+        result["disabled"] = True
+        result["status"] = "disabled"
+        result["error"] = "grid_self_test failed"
+        return result
+
+    def _record(
+        rot_deg: float, tx_mm: float, ty_mm: float, score: float, iou: float, method: str, status: str
+    ) -> dict[str, Any]:
+        return {
+            "rot_deg": rot_deg, "tx_mm": tx_mm, "ty_mm": ty_mm, "score": score, "iou": iou,
+            "method": method, "status": status, "map_index": map_index, "map_sequence": map_sequence,
+            "grid_sha1": grid_sha1, "updated": now_iso,
+        }
+
+    def _found_new_frame(status: str) -> dict[str, Any]:
+        margin_cells = max(1, round(homeframe.FRAME_MARGIN_MM / homeframe.FRAME_CELL_MM))
+        width = grid.width + 2 * margin_cells
+        height = grid.height + 2 * margin_cells
+        floor_mask = np.zeros((height, width), dtype=bool)
+        wall_mask = np.zeros((height, width), dtype=bool)
+        floor_mask[margin_cells : margin_cells + grid.height, margin_cells : margin_cells + grid.width] = grid.floor
+        wall_mask[margin_cells : margin_cells + grid.height, margin_cells : margin_cells + grid.width] = grid.wall
+        origin_mm = (
+            (grid.left - margin_cells) * homeframe.CELL_MM,
+            (grid.top - margin_cells) * homeframe.CELL_MM,
+        )
+        return {
+            "origin_mm": origin_mm, "cell_mm": float(homeframe.FRAME_CELL_MM),
+            "scale": float(homeframe.HOME_PX_SCALE), "width": width, "height": height,
+            "epoch": 1, "floor_mask": floor_mask, "wall_mask": wall_mask,
+            "robots": {duid: _record(0.0, 0.0, 0.0, 1.0, 1.0, "reference", status)},
+        }
+
+    # Continuity first (docs/40 §4.2 point 5): the frame this duid is already
+    # in gets tried before any other, and a pass there short-circuits the
+    # search — never wander to a different frame while the current one still
+    # matches.
+    current_frame_id = robot_frame_snapshot.get(duid)
+    candidates: list[str] = [current_frame_id] if current_frame_id in frames_snapshot else []
+    candidates += [fid for fid in frames_snapshot if fid not in candidates]
+
+    best: tuple[str, Any] | None = None  # (frame_id, Registration)
+    for fid in candidates:
+        frame = frames_snapshot[fid]
+        if frame.get("stale") or not frame.get("width") or not frame.get("height"):
+            continue
+        reg = homeframe.register_with_fallback(grid.floor, frame["floor_mask"])
+        passes = reg.covered >= homeframe.DEFAULT_GATE_COVERED and reg.iou >= homeframe.DEFAULT_GATE_IOU
+        if passes and (best is None or (reg.covered, reg.iou) > (best[1].covered, best[1].iou)):
+            best = (fid, reg)
+        if fid == current_frame_id and passes:
+            break
+
+    if best is not None:
+        fid, reg = best
+        frame = frames_snapshot[fid]
+        rot_deg, tx_mm, ty_mm = homeframe.affine_from_registration(reg, grid, frame["origin_mm"])
+        merged = homeframe.merge_robot_into_frame(frame, grid, rot_deg, tx_mm, ty_mm)
+        was_founder = (frame.get("robots") or {}).get(duid, {}).get("method") == "reference"
+        status = "reference" if was_founder else "aligned"
+        merged["robots"][duid] = _record(
+            rot_deg, tx_mm, ty_mm, reg.covered, reg.iou,
+            "reference" if was_founder else reg.method, status,
+        )
+        result["updated_frames"][fid] = merged
+        result["robot_frame"] = fid
+        result["status"] = status
+        result["score"] = reg.covered
+        result["iou"] = reg.iou
+        result["method"] = reg.method
+        result["rot_deg"] = rot_deg
+        # docs/40 §4.2 point 6 byproduct (`outline_home_px`/`home_room_id`):
+        # one full-frame-sized mask per room segment, registered the SAME
+        # point-based way the floor/wall masks were just merged — computed
+        # against `merged`'s FINAL shape/origin (post growth/shift), never
+        # persisted (docs/40 §4.2's on-disk schema stays exactly as
+        # specified — this is coordinator-side, in-memory-only cache).
+        result["segment_masks"] = homeframe.segment_masks_in_frame(
+            grid, rot_deg, tx_mm, ty_mm, merged["origin_mm"], merged.get("cell_mm", homeframe.FRAME_CELL_MM),
+            merged["width"], merged["height"],
+        )
+        if merged.get("epoch") != frame.get("epoch", 1):
+            result["origin_shifted"] = True
+        if current_frame_id and current_frame_id != fid:
+            result["removed_robot_from_frames"].append(current_frame_id)
+        return result
+
+    # Nothing matched anywhere -> found a brand-new frame for this duid
+    # (docs/40 §4.2 point 4: "unaligned -> robot dostane vlastní frame").
+    new_frame_id = str(uuid.uuid4())
+    new_status = "reference" if not frames_snapshot else "unaligned"
+    new_frame = _found_new_frame(new_status)
+    result["updated_frames"][new_frame_id] = new_frame
+    result["robot_frame"] = new_frame_id
+    result["status"] = new_status
+    result["score"] = 1.0
+    result["iou"] = 1.0
+    result["method"] = "reference"
+    result["rot_deg"] = 0.0
+    result["segment_masks"] = homeframe.segment_masks_in_frame(
+        grid, 0.0, 0.0, 0.0, new_frame["origin_mm"], new_frame["cell_mm"],
+        new_frame["width"], new_frame["height"],
+    )
+    if current_frame_id and current_frame_id in frames_snapshot:
+        was_founder = (frames_snapshot[current_frame_id].get("robots") or {}).get(duid, {}).get(
+            "method"
+        ) == "reference"
+        if was_founder:
+            result["stale_frame_id"] = current_frame_id
+        else:
+            result["removed_robot_from_frames"].append(current_frame_id)
+    return result
+
+
 def _extract_map(map_data: Any) -> dict[str, Any]:
     """Pull the fields the card needs out of a parser MapData object."""
     out: dict[str, Any] = {}
@@ -561,6 +890,12 @@ def _extract_map(map_data: Any) -> dict[str, Any]:
             }
         )
     out["rooms"] = rooms
+    # Same {segment_number: Room} dict, kept transiently (docs/40 §4.2/§4.3)
+    # so `_maybe_register_home_frame` can pass it straight to
+    # `homeframe.grid_self_test` as `lib_rooms` without a second parse of the
+    # raw map (docs/14 rule 1) — popped before the data is exposed on the
+    # sensor, same as `_path_dry`/`_path_wet` below.
+    out["_lib_rooms"] = dict(room_dict)
 
     # Full (undecimated) trajectories, kept transiently so the coordinator can attribute
     # only the newly-added points to the room currently being cleaned. Dry (vacuum) and
@@ -800,6 +1135,44 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # Dropped wholesale whenever a trace is wiped, so it can never outlive
         # the segments it describes.
         self._decim_cache: dict[str, dict[str, dict[int, Any]]] = {}
+        # Home frame (docs/40 §4.1-4.2, Fáze 1): a shared raster + per-robot
+        # rigid registration onto it, built purely from raw map geometry —
+        # no card/config involvement (additive contract v3, see sensor.py).
+        # In memory, `_home_frames[frame_id]["floor_mask"/"wall_mask"]` are
+        # numpy bool arrays (never the base64 `Store` encoding — that only
+        # exists on disk, via `homeframe.frames_to/from_storage`).
+        # {frame_id: {"origin_mm", "cell_mm", "scale", "width", "height",
+        #             "epoch", "floor_mask", "wall_mask", "robots": {duid: {...}}}}.
+        # Persisted across restarts (debounced, like `_paths_store` — never on
+        # every 30s poll unless a registration actually changed something).
+        self._home_frame_store: Store = Store(hass, 1, f"{DOMAIN}_home_frame")
+        self._home_frames: dict[str, dict[str, Any]] = {}
+        # Which frame each robot currently belongs to. {duid: frame_id}.
+        self._robot_frame: dict[str, str] = {}
+        # Cache key (docs/40 §4.3) so an unchanged map never re-triggers
+        # registration on a plain 30s poll: {duid: (map_index, map_sequence,
+        # grid_sha1)}. Populated/consulted by the Fáze 1 registration pipeline.
+        self._home_frame_cache_key: dict[str, tuple[Any, Any, str]] = {}
+        # Grid self-test (docs/40 §4.3): once a duid's decoded grid fails the
+        # self-test against the library's own room bboxes, home-frame
+        # registration is disabled for it (no `*_home_px`, rest of the
+        # pipeline unaffected) and the WARNING is logged only once.
+        self._home_frame_disabled: set[str] = set()
+        # Per-duid busy-set (docs/40 §4.3 "jen v executoru") — NOT a real
+        # asyncio.Lock, just a set checked/added/discarded on the event loop
+        # thread only, so it never races: prevents dispatching a second
+        # executor job for a duid whose first one hasn't finished yet (a slow
+        # ~5s registration overlapping the next 30s poll).
+        self._home_frame_inflight: set[str] = set()
+        # docs/40 §4.2 point 6 byproduct (`outline_home_px`/`home_room_id`):
+        # one full-frame-sized bool mask per room segment per duid, IN
+        # MEMORY ONLY (never persisted — `homeframe.frame_to_storage` doesn't
+        # know this key, so it simply doesn't survive a restart; the next
+        # registration event for that duid rebuilds it, no correctness
+        # issue, just a brief gap right after startup). Rebuilt wholesale
+        # per duid on every registration event (`_async_run_home_frame_
+        # registration`), never mutated in place. {frame_id: {duid: {segment_id: mask}}}.
+        self._home_frame_room_masks: dict[str, dict[str, dict[int, Any]]] = {}
 
     @property
     def rooms_history(self) -> dict[str, dict[str, str]]:
@@ -1744,9 +2117,174 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     self._dry_path_open[duid] = True
                 if rec.get("wet_path_open"):
                     self._wet_path_open[duid] = True
+        hf_raw = await self._home_frame_store.async_load()
+        if isinstance(hf_raw, dict):
+            self._home_frames, self._robot_frame = homeframe.frames_from_storage(hf_raw)
 
     def _history_for_save(self) -> dict[str, dict[str, str]]:
         return self._history
+
+    def _home_frame_for_save(self) -> dict[str, Any]:
+        """Snapshot for `self._home_frame_store.async_delay_save` (docs/40
+        §4.2) — mirrors `_paths_for_save`'s pattern: a plain method (not a
+        lambda inline at the call site) so the Fáze 1 registration pipeline
+        (`coordinator integrace`, next) can debounce-save from more than one
+        place without duplicating the snapshot logic."""
+        return homeframe.frames_to_storage(self._home_frames, self._robot_frame)
+
+    def _maybe_register_home_frame(self, device: AnyVacDevice) -> None:
+        """Trigger docs/40 §4.2 home-frame registration for one duid — but
+        only when its raw map actually changed since the last attempt (the
+        §4.3 cache key `(map_index, map_sequence, hash(raw))`), never on
+        every plain 30s poll otherwise. Cheap check only: the heavy FFT work
+        itself always runs in the executor
+        (`_async_run_home_frame_registration`), so this never blocks the
+        polling coroutine it's called from."""
+        duid = device.duid
+        if duid in self._home_frame_disabled or duid in self._home_frame_inflight:
+            return
+        dbg = device.data.get("debug_map")
+        if not isinstance(dbg, dict):
+            return
+        raw_sha1 = dbg.get("raw_sha1")
+        if raw_sha1 is None:
+            return
+        key = (dbg.get("map_index"), dbg.get("map_sequence"), raw_sha1)
+        if self._home_frame_cache_key.get(duid) == key:
+            return
+        fetched = self.raw_map_for(duid)
+        if fetched is None:
+            return
+        raw, _meta = fetched
+        lib_rooms = dict(device.data.get("_lib_rooms") or {})
+        self._home_frame_inflight.add(duid)
+        self.hass.async_create_task(
+            self._async_run_home_frame_registration(duid, raw, key, lib_rooms)
+        )
+
+    async def _async_run_home_frame_registration(
+        self, duid: str, raw: bytes, cache_key: tuple[Any, Any, str], lib_rooms: dict[int, Any]
+    ) -> None:
+        """Runs the pure, executor-safe `_compute_home_frame_result` off the
+        event loop, then applies its result back on it (docs/40 §4.2/§4.3).
+        Frames are only ever REPLACED wholesale — never mutated in place, see
+        `homeframe.merge_robot_into_frame`/`grow_frame_canvas` — so this is
+        safe even while another duid's registration is running concurrently
+        against a snapshot of the same frame table."""
+        try:
+            frames_snapshot = dict(self._home_frames)
+            robot_frame_snapshot = dict(self._robot_frame)
+            now_iso = dt_util.utcnow().isoformat(timespec="seconds")
+            result = await self.hass.async_add_executor_job(
+                _compute_home_frame_result,
+                frames_snapshot,
+                robot_frame_snapshot,
+                duid,
+                raw,
+                cache_key[0],
+                cache_key[1],
+                cache_key[2],
+                lib_rooms,
+                now_iso,
+            )
+        finally:
+            self._home_frame_inflight.discard(duid)
+
+        if result.get("disabled"):
+            if duid not in self._home_frame_disabled:
+                self._home_frame_disabled.add(duid)
+                _LOGGER.warning(
+                    "AnyVac: home-frame grid self-test failed for %s — disabling automatic "
+                    "home-frame registration for this vacuum (%s). Its existing *_px "
+                    "attributes are unaffected.",
+                    duid, result.get("error"),
+                )
+            return
+        if result.get("error"):
+            _LOGGER.debug(
+                "AnyVac: home-frame registration skipped for %s: %s", duid, result["error"]
+            )
+            return
+
+        for fid, frame in result.get("updated_frames", {}).items():
+            self._home_frames[fid] = frame
+        for old_fid in result.get("removed_robot_from_frames", []):
+            old_frame = self._home_frames.get(old_fid)
+            if old_frame is not None and duid in (old_frame.get("robots") or {}):
+                trimmed = dict(old_frame)
+                trimmed["robots"] = {k: v for k, v in old_frame["robots"].items() if k != duid}
+                self._home_frames[old_fid] = trimmed
+            old_masks = dict(self._home_frame_room_masks.get(old_fid) or {})
+            if duid in old_masks:
+                old_masks.pop(duid)
+                self._home_frame_room_masks[old_fid] = old_masks
+        stale_fid = result.get("stale_frame_id")
+        if stale_fid and stale_fid in self._home_frames and not self._home_frames[stale_fid].get("stale"):
+            stale_frame = dict(self._home_frames[stale_fid])
+            stale_frame["stale"] = True
+            self._home_frames[stale_fid] = stale_frame
+            _LOGGER.warning(
+                "AnyVac: home-frame %s no longer matches vacuum %s's map (re-registration "
+                "failed) — marked stale and a new frame was created for it. The old "
+                "floorplan/crop_box tied to it will need to be re-accepted (docs/40 §4.2).",
+                stale_fid, duid,
+            )
+        new_frame_id = result.get("robot_frame")
+        if new_frame_id:
+            self._robot_frame[duid] = new_frame_id
+            frame_masks = dict(self._home_frame_room_masks.get(new_frame_id) or {})
+            frame_masks[duid] = result.get("segment_masks") or {}
+            self._home_frame_room_masks[new_frame_id] = frame_masks
+        if result.get("origin_shifted"):
+            _LOGGER.warning(
+                "AnyVac: home-frame %s's origin shifted to accommodate vacuum %s's newly "
+                "explored area (epoch bumped) — the card should re-read crop_box.",
+                new_frame_id, duid,
+            )
+        self._home_frame_cache_key[duid] = result["cache_key"]
+        self._home_frame_store.async_delay_save(self._home_frame_for_save, 5)
+        self.async_update_listeners()
+
+    def home_px_to_mm(self, duid: str, x: float, y: float) -> tuple[float, float] | None:
+        """Home-frame px (docs/40 §4.1, `*_home_px` density) -> this vacuum's
+        OWN mm space — the inverse of what `mm_to_home_px` publishes.
+        Geometry stays owned by the coordinator (docs/14 §1); callers must
+        not solve this transform themselves. None when this duid has no
+        home-frame assignment yet (self-test disabled, no map seen since
+        restart, or `unaligned` with no matching frame)."""
+        frame_id = self._robot_frame.get(duid)
+        frame = self._home_frames.get(frame_id) if frame_id else None
+        if frame is None:
+            return None
+        rec = (frame.get("robots") or {}).get(duid)
+        if rec is None:
+            return None
+        fx_mm, fy_mm = homeframe.home_px_to_mm(
+            frame["origin_mm"],
+            frame.get("cell_mm", homeframe.FRAME_CELL_MM),
+            frame.get("scale", homeframe.HOME_PX_SCALE),
+            x,
+            y,
+        )
+        return homeframe.frame_mm_to_robot_mm(rec["rot_deg"], rec["tx_mm"], rec["ty_mm"], fx_mm, fy_mm)
+
+    def mm_to_home_px(self, duid: str, x_mm: float, y_mm: float) -> tuple[float, float] | None:
+        """Inverse of `home_px_to_mm` — this vacuum's own mm -> home-frame px."""
+        frame_id = self._robot_frame.get(duid)
+        frame = self._home_frames.get(frame_id) if frame_id else None
+        if frame is None:
+            return None
+        rec = (frame.get("robots") or {}).get(duid)
+        if rec is None:
+            return None
+        fx_mm, fy_mm = homeframe.robot_mm_to_frame_mm(rec["rot_deg"], rec["tx_mm"], rec["ty_mm"], x_mm, y_mm)
+        return homeframe.mm_to_home_px(
+            frame["origin_mm"],
+            frame.get("cell_mm", homeframe.FRAME_CELL_MM),
+            frame.get("scale", homeframe.HOME_PX_SCALE),
+            fx_mm,
+            fy_mm,
+        )
 
     def _paths_for_save(self) -> dict[str, dict[str, Any]]:
         """Snapshot of the segmented trace + the bookkeeping needed to resume
@@ -1952,6 +2490,10 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     _LOGGER.debug("AnyVac: failed reading a Roborock coordinator: %s", err)
                     continue
                 if device is not None:
+                    # docs/40 §4.2/§4.3: cheap cache-key check inline, heavy
+                    # FFT registration itself always in the executor — never
+                    # blocks this polling coroutine.
+                    self._maybe_register_home_frame(device)
                     dbg = device.data.get("debug_map")
                     if isinstance(dbg, dict):
                         seen = self._debug_seen.setdefault(device.duid, {})
@@ -1991,6 +2533,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     device.data["rooms_coverage"] = {k: dict(v) for k, v in self._room_coverage.items()}
                     device.data.pop("_path_dry", None)
                     device.data.pop("_path_wet", None)
+                    device.data.pop("_lib_rooms", None)
                     # Typed trace layers (docs/14 §3.9): path_dry = trajectory segmented
                     # to actual cleaning (no transit / mop-wash driving); path_wet = the
                     # mop trace. ``path`` (full trajectory) stays for backward compat.
@@ -2026,7 +2569,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     # Kontrakt v2 (docs/14 §3.6 + §5): geometry in rendered image
                     # PIXELS so the card never has to do mm math again.
                     aff = _solve_affine(device.data.get("calibration_points"))
-                    device.data["schema_version"] = 2
+                    device.data["schema_version"] = 3
                     if aff is not None:
                         device.data["vacuum_position_px"] = _px_point(
                             device.data.get("vacuum_position"), aff
@@ -2065,6 +2608,10 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                         device.data["path_wet_px"] = []
                         for room in device.data.get("rooms", []):
                             room["bbox_px"] = None
+                    _apply_home_frame_contract(
+                        device, path_dry, path_wet,
+                        self._home_frames, self._robot_frame, self._home_frame_room_masks,
+                    )
                     # Legacy mm-space attributes (1.1.0). The card has not read
                     # any of these since Fáze 3 of the canon (docs/14) moved it
                     # onto the px contract — verified by scanning every attribute

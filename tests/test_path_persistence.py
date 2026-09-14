@@ -114,6 +114,7 @@ def _new_coordinator(
     ):
         setattr(coord, attr, _FakeStore())
     coord._paths_store = paths_store or _FakeStore()
+    coord._home_frame_store = _FakeStore()
     coord._history = {}
     coord._was_cleaning = {}
     coord._session_rooms = {}

@@ -4,6 +4,113 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0] - 2026-09-14
+
+Fáze 1 of docs/40 ("home frame" — automatic multi-vacuum map calibration):
+backend home frame, additive kontrakt v3. **Card unchanged** (Fáze 3 will
+adopt it on the card side). First `numpy` pip dependency for the integration
+(HAOS ships it in wheels; standard install).
+
+### Added
+
+**`custom_components/anyvac/homeframe.py`** — the Fáze 0
+`anyvac/tools/homeframe_probe.py` spike promoted into the integration
+(`decode_grid`/`register`/`register_with_fallback`/`kabsch_from_names`
+carried over unchanged, docs/14 rule 1 — the probe now imports them from
+here instead of defining its own copies), plus everything new for Fáze 1:
+`grid_self_test` (decoder self-test against the real library parser's own
+room bboxes — a mismatch permanently disables home-frame registration for
+that vacuum, never a "best effort" geometry); `affine_from_registration`
+(turns a raw `register()` result into a clean, persisted `(rot_deg, tx_mm,
+ty_mm)` triple — rewritten mid-session to REPLAY `register()`'s own rotation
+stage(s) instead of one closed-form formula, after a real pivot/canvas-
+convention bug was caught by cross-checking against an actual floor-mask
+centroid: `register()`'s coarse pass uses `np.rot90`, which swaps height/
+width for a non-square grid at 90°/270°, a different pivot than the fine
+pass's own `_rotate_arbitrary`); `robot_mm_to_frame_mm`/`frame_mm_to_robot_mm`/
+`mm_to_home_px`/`home_px_to_mm` (the mm↔frame↔px transform chain);
+`outline_from_mask` (pixel-exact edge/"crack" boundary tracing — not
+pixel-centre Moore tracing, see "Fixed" below — plus the same RDP simplifier
+`coordinator.py` already uses for path decimation); `room_identity`
+(cross-robot `home_room_id`
+assignment via union-find over per-room mask IoU); `merge_robot_into_frame`
+(point-based mask merging of a registered robot into the shared frame,
+handling growth in every direction including a rare origin-shift-with-
+epoch-bump case); and the `.storage/anyvac.home_frame` (de)serialisation
+(`pack_mask`/`frame_to_storage`/`frames_from_storage`/`grow_frame_canvas`) —
+defensive throughout, a single corrupt frame or robot record is dropped, never
+takes the whole store or integration startup down with it.
+
+**Coordinator integration** — a cache key (`map_index`, `map_sequence`, raw
+sha1) means an unchanged map never re-triggers registration on a plain 30s
+poll; the actual FFT-based work always runs in `hass.async_add_executor_job`
+against an immutable snapshot (frames are copy-on-write end to end, never
+mutated in place, so a concurrent registration holding an older frame
+reference is never corrupted by a later one's result). Full lifecycle per
+docs/40 §4.2: the very first vacuum ever seen founds a frame (`reference`,
+identity transform); every later map change re-registers against the frame
+this vacuum is ALREADY in first (continuity), then, on failure, against
+every other known frame; nothing matching anywhere founds a brand-new frame
+for that vacuum (`unaligned` — a different floor is the expected reading,
+handled automatically, no config); a founder whose own remap stops matching
+its own frame ("genuinely a different apartment") gets a new frame while the
+old one is kept and flagged `stale` rather than silently discarded. New
+persisted Store `.storage/anyvac.home_frame`, debounced (5s) like the
+existing path-persistence store — never on every poll.
+
+**Kontrakt v3** (`schema_version: 3`, additive — every existing `*_px`
+attribute is untouched): `home_frame` (`{id, cell_mm, scale, width_px,
+height_px}`), `registration` (`{status, method, rotation_deg, score, iou}`),
+`vacuum_position_home_px`/`charger_home_px`/`path_dry_home_px`/
+`path_wet_home_px`, and per room `bbox_home_px`/`outline_home_px`/
+`home_room_id` — all `null`/empty for a vacuum with no home-frame assignment
+yet, so single-vacuum setups see no change at all. See README.md.
+
+### Fixed
+
+Three real bugs caught during this session's own validation, before any
+shipped: `outline_from_mask`'s original Moore-neighbour tracing used the
+wrong initial search direction (an opposite-sense off-by-4 in the
+8-neighbour list), causing a filled rectangle to trace only 4 points instead
+of its full perimeter — the immediate fix surfaced a deeper, second problem
+with the same function: tracing pixel *centres* (even with the direction
+fixed) cuts a triangle of area off every corner, which for a simple
+rectangle cancels out (still traced correctly) but for an L-shaped or
+thin-necked "I" room lost 30-40% of the true area — caught by tests written
+directly from a real, non-rectangular room shape and fixed by replacing
+pixel-centre tracing with pixel-exact edge/"crack" tracing (walks the mask's
+actual grid-line boundary, so the resulting polygon's area always equals
+`cell_count * cell_mm ** 2` exactly for any rectilinear shape, thin necks and
+diagonally-touching regions included); and `affine_from_registration`'s
+original closed-form formula assumed one uniform rotation pivot, silently
+mis-locating any non-square robot grid registered near a 90°/270° rotation
+(see "Added" above for the fix). None of these bugs had shipped in any prior
+release — all are internal to Fáze 1 code written and caught within this
+same session.
+
+### Notes
+
+28 new tests this phase — `test_home_frame_lifecycle.py` (20: decoder
+self-test, registration rotation/threshold, full frame lifecycle including
+the stale-frame/origin-shift cases, cache key, kontrakt v3 publication,
+`home_room_id` shared-vs-own-id, `home_px_to_mm`/`mm_to_home_px` round trip)
+and `test_outline_from_mask.py` (8: rectangle/L-shape/I-shape-with-a-thin-neck/
+single-pixel/empty/diagonal-pinch/axis-alignment/RDP-simplification — the
+I-shape and diagonal-pinch cases came directly from a user question
+mid-session about a non-L-shaped real room, and are what caught the
+pixel-centre-tracing area bug above). Full suite: **190/190 green**
+(162 pre-existing baseline + 28 new). Every test uses synthetic raw map
+blobs built in-process — none depend on real device dumps under `samples/`.
+No opencv/scipy/scikit-image; no second RDP/crop-box implementation
+(docs/14 rule 1).
+
+Card unchanged — nothing here is read by `anyvac-card` yet. Fáze 2 (services
+accepting home-frame coordinates: `goto`/`zone_clean`/`clean` with
+`frame: "home"`, snapshot compositing all aligned vacuums, orchestration by
+`home_room_id`) and Fáze 3 (card adoption) are separate future sessions —
+this integration release changes nothing a user notices day to day beyond
+the new read-only sensor attributes above.
+
 ## [1.6.2] - 2026-09-13
 
 Fáze 0 of docs/40 ("home frame" — automatic multi-vacuum map calibration): a

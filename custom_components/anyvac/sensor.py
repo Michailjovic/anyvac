@@ -83,6 +83,10 @@ class AnyVacMapSensor(CoordinatorEntity[AnyVacCoordinator], SensorEntity):
             "debug_map", "schema_version", "vacuum_position_px", "charger_px",
             "path_dry_px", "path_wet_px", "pipeline_ok", "pipeline_error",
             "room_pins", "room_sequence", "dock_status",
+            # Kontrakt v3 (docs/40 §4.2 point 6) — additive, same "large/
+            # fast-changing map payload" reasoning as the v2 *_px attributes above.
+            "home_frame", "registration", "vacuum_position_home_px", "charger_home_px",
+            "path_dry_home_px", "path_wet_home_px",
         }
     )
 
