@@ -689,6 +689,86 @@ def outline_from_mask(
     return [(p["x"], p["y"]) for p in pts]
 
 
+# ── Wall-corner snap (docs/40 §5.B) ───────────────────────────────────────────
+
+
+def wall_corner_points(wall_mask: np.ndarray) -> np.ndarray:
+    """Enumerates every grid-VERTEX (crack coordinate — the same "corner of a
+    cell" coordinate space `outline_from_mask` above traces boundaries in,
+    docs/14 rule 1: one coordinate convention for mask geometry, not two)
+    where `wall_mask`'s boundary genuinely turns a corner, across the WHOLE
+    mask at once — every room's corners, not just one connected region's
+    outer ring. This is deliberately a different QUERY than
+    `outline_from_mask` (a nearest-corner lookup needs every corner
+    anywhere, including interior partition walls and separate wings of the
+    home; a single traced ring would miss all of that), but it reuses that
+    function's exact underlying idea: classify each grid vertex by which of
+    the 4 cells touching it are foreground (wall) — that's the same test
+    `outline_from_mask` applies per cell, just read from the vertex's side
+    instead of accumulated into a directed-edge walk.
+
+    For a vertex touching cells (top-left, top-right, bottom-left,
+    bottom-right), let `count` = how many of those 4 are wall:
+
+    - 0 or 4 -> open space or solid wall interior; not a boundary at all.
+    - 1 or 3 -> a plain convex/concave right-angle turn; always a corner.
+    - 2, opposite corners only (a "bowtie" — two wall cells touching only
+      diagonally, the same ambiguous case `outline_from_mask`'s docstring
+      calls out) -> also a corner: two wall strands genuinely meet there.
+    - 2, an adjacent pair (top row, bottom row, left column, or right
+      column) -> the wall runs straight through this vertex; not a corner.
+
+    Pure vectorised numpy (one padded boolean array + a handful of slices),
+    O(cells), no per-pixel Python loop — same performance discipline as
+    `decode_grid`/`outline_from_mask`. Returns an `(N, 2)` float array of
+    `(x, y)` vertex coordinates in CELL-INDEX units (not mm — multiply by
+    `cell_mm` for that), shape `(0, 2)` for an all-empty mask."""
+    if not wall_mask.any():
+        return np.empty((0, 2), dtype=np.float64)
+    h, w = wall_mask.shape
+    # False border so edge/corner vertices see a real (missing => background)
+    # neighbour instead of needing special-cased bounds checks — same trick
+    # `grow_frame_canvas` already relies on elsewhere in this module.
+    padded = np.zeros((h + 2, w + 2), dtype=bool)
+    padded[1:-1, 1:-1] = wall_mask
+    tl = padded[:-1, :-1]
+    tr = padded[:-1, 1:]
+    bl = padded[1:, :-1]
+    br = padded[1:, 1:]
+    count = tl.astype(np.int8) + tr.astype(np.int8) + bl.astype(np.int8) + br.astype(np.int8)
+    bowtie = (count == 2) & (tl == br) & (tr == bl) & (tl != tr)
+    is_corner = (count == 1) | (count == 3) | bowtie
+    ys, xs = np.nonzero(is_corner)
+    return np.stack([xs.astype(np.float64), ys.astype(np.float64)], axis=1)
+
+
+def nearest_wall_corner_mm(
+    frame: dict[str, Any], x_mm: float, y_mm: float
+) -> tuple[float, float] | None:
+    """Snaps a query point (frame mm) to the nearest wall-corner vertex in
+    `frame["wall_mask"]` — the click-noise fix for cesta B's home-frame side
+    of an N-point calibration pair (docs/40 §5.B): an architecturally
+    distinctive point (a room corner) is pinpointed exactly from the robot's
+    own wall data instead of trusting a hand click's few-pixel imprecision,
+    the way docs/39's per-robot flow always has to. Brute-force nearest
+    neighbour (vectorised, no k-d tree) — a home frame's corner count is at
+    most a few thousand points, so this is comfortably sub-millisecond.
+    Returns `None` when the frame has no wall cells at all yet (freshly
+    founded, no map decoded since restart) — caller falls back to the raw,
+    unsnapped click point rather than failing the whole calibration step."""
+    corners = wall_corner_points(frame["wall_mask"])
+    if corners.shape[0] == 0:
+        return None
+    cell_mm = frame.get("cell_mm", FRAME_CELL_MM)
+    ox_mm, oy_mm = frame["origin_mm"]
+    cx = (x_mm - ox_mm) / cell_mm
+    cy = (y_mm - oy_mm) / cell_mm
+    d2 = (corners[:, 0] - cx) ** 2 + (corners[:, 1] - cy) ** 2
+    i = int(np.argmin(d2))
+    vx, vy = corners[i]
+    return (float(vx * cell_mm + ox_mm), float(vy * cell_mm + oy_mm))
+
+
 # ── Cross-robot room identity (docs/40 §4.1) ──────────────────────────────────
 
 

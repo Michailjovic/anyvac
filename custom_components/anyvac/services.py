@@ -23,6 +23,12 @@ Public command interface for the card (and automations):
                           vacuum's raw Roborock map bytes to disk for the
                           offline home-frame registration probe. No card
                           involvement, no behaviour change to anything else.
+- ``anyvac.snap_wall_corner`` — docs/40 §5.B: given a point in home-frame px,
+                          returns the nearest wall-corner vertex found in
+                          that frame's own wall mask (or the point unchanged
+                          if the frame has no walls yet). Used by the card's
+                          foreign-floorplan N-point calibration to remove
+                          most click noise on the home-frame side of a pair.
 
 Execution model (proven in the field by the card-built v1 plans): a job is a list
 of tasks; a task with no ``after`` runs immediately, the rest run when all their
@@ -35,11 +41,13 @@ from __future__ import annotations
 import hashlib
 import io
 import logging
+import math
 import os
 import re
 import time
 from typing import Any
 
+import numpy as np
 import voluptuous as vol
 
 from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
@@ -71,6 +79,7 @@ SERVICE_DOCK_SELF_CLEAN = "dock_self_clean"
 SERVICE_SNAPSHOT_FLOORPLAN = "snapshot_map_as_floorplan"
 SERVICE_EXPORT_MAP_GUIDE = "export_map_guide"
 SERVICE_DUMP_RAW_MAP = "dump_raw_map"
+SERVICE_SNAP_WALL_CORNER = "snap_wall_corner"
 
 ALL_SERVICES = (
     SERVICE_RUN_JOB,
@@ -92,6 +101,7 @@ ALL_SERVICES = (
     SERVICE_SNAPSHOT_FLOORPLAN,
     SERVICE_EXPORT_MAP_GUIDE,
     SERVICE_DUMP_RAW_MAP,
+    SERVICE_SNAP_WALL_CORNER,
 )
 
 JOB_TIMEOUT_SECONDS = 3 * 3600  # safety: tear down a stuck job after 3 h
@@ -185,22 +195,39 @@ CLEAN_SCHEMA = vol.Schema(
         ),
     }
 )
+# docs/40 §4.3 (Fáze 2): `frame: "home"` targets the point in the SHARED home
+# frame's px space instead of the target robot's own rendered-map percent
+# space — the card re-normalises a floorplan-% click through `crop_box` into
+# home px (same class of computation as `placeRoomInCrop`, kánon docs/14) and
+# never computes robot mm itself; the backend inverts the registration
+# (`coordinator.home_px_to_mm`, Fáze 1) to get there. `x_pct`/`y_pct` stay
+# Optional (not Required) so `frame: "home"` callers can omit them entirely —
+# `_target_mm_for` below enforces that exactly one coordinate style is given,
+# with a clearer error than vol.Exclusive/vol.Inclusive would produce.
 GOTO_SCHEMA = vol.Schema(
     {
         vol.Optional("entity_id"): str,
         vol.Optional("duid"): str,
-        vol.Required("x_pct"): vol.All(vol.Coerce(float), vol.Range(min=0, max=100)),
-        vol.Required("y_pct"): vol.All(vol.Coerce(float), vol.Range(min=0, max=100)),
+        vol.Optional("frame", default="robot"): vol.In(["robot", "home"]),
+        vol.Optional("x_pct"): vol.All(vol.Coerce(float), vol.Range(min=0, max=100)),
+        vol.Optional("y_pct"): vol.All(vol.Coerce(float), vol.Range(min=0, max=100)),
+        vol.Optional("x_home_px"): vol.Coerce(float),
+        vol.Optional("y_home_px"): vol.Coerce(float),
     }
 )
 ZONE_CLEAN_SCHEMA = vol.Schema(
     {
         vol.Optional("entity_id"): str,
         vol.Optional("duid"): str,
-        vol.Required("x1_pct"): vol.All(vol.Coerce(float), vol.Range(min=0, max=100)),
-        vol.Required("y1_pct"): vol.All(vol.Coerce(float), vol.Range(min=0, max=100)),
-        vol.Required("x2_pct"): vol.All(vol.Coerce(float), vol.Range(min=0, max=100)),
-        vol.Required("y2_pct"): vol.All(vol.Coerce(float), vol.Range(min=0, max=100)),
+        vol.Optional("frame", default="robot"): vol.In(["robot", "home"]),
+        vol.Optional("x1_pct"): vol.All(vol.Coerce(float), vol.Range(min=0, max=100)),
+        vol.Optional("y1_pct"): vol.All(vol.Coerce(float), vol.Range(min=0, max=100)),
+        vol.Optional("x2_pct"): vol.All(vol.Coerce(float), vol.Range(min=0, max=100)),
+        vol.Optional("y2_pct"): vol.All(vol.Coerce(float), vol.Range(min=0, max=100)),
+        vol.Optional("x1_home_px"): vol.Coerce(float),
+        vol.Optional("y1_home_px"): vol.Coerce(float),
+        vol.Optional("x2_home_px"): vol.Coerce(float),
+        vol.Optional("y2_home_px"): vol.Coerce(float),
         vol.Optional("repeat", default=1): vol.All(vol.Coerce(int), vol.Range(min=1, max=3)),
     }
 )
@@ -235,6 +262,20 @@ DUMP_RAW_MAP_SCHEMA = vol.Schema(
         vol.Optional("name"): str,
     }
 )
+# docs/40 §5.B: the card resolves a click into home-frame px itself (same
+# floorplan-% -> home-px re-normalisation `frame: "home"` goto/zone_clean
+# already do, kánon docs/14 — no new client-side geometry), then asks the
+# backend to snap that point to the nearest actual wall corner it can see in
+# the frame's own wall mask. `frame_id` is Optional for the same reason as
+# `snapshot_map_as_floorplan`'s: omit it to use the frame with the most
+# registered vacuums.
+SNAP_WALL_CORNER_SCHEMA = vol.Schema(
+    {
+        vol.Optional("frame_id"): str,
+        vol.Required("x_home_px"): vol.Coerce(float),
+        vol.Required("y_home_px"): vol.Coerce(float),
+    }
+)
 # docs/30 §4a field follow-up (2026-07-30): merged mode's per-vacuum auto-seat
 # fit is hard-disabled without a shared floorplan image (`_editorSeat`/
 # `_effectiveSeat` both bail to manual sliders when `image_base.src` is
@@ -247,9 +288,18 @@ DUMP_RAW_MAP_SCHEMA = vol.Schema(
 # backend deliberately does not re-resolve this itself, to guarantee the
 # snapshot matches exactly what the user was previewing) and save it as a
 # static file under `config/www/anyvac/` that `image_base.src` can point at.
+# docs/40 §4.3 (Fáze 2): `frame: "home"` renders a COMPOSITE of every
+# vacuum registered into a shared home frame instead of photographing one
+# vacuum's own rendered map — `image_entity` is then unused (there is no
+# single image entity for "all of them at once"). `image_entity` stays
+# Optional so a `frame: "home"` call can omit it entirely; the handler
+# enforces exactly one of {image_entity} / {frame: "home"}, same pattern as
+# goto/zone_clean's `_target_mm_for`.
 SNAPSHOT_FLOORPLAN_SCHEMA = vol.Schema(
     {
-        vol.Required("image_entity"): str,
+        vol.Optional("image_entity"): str,
+        vol.Optional("frame"): vol.In(["home"]),
+        vol.Optional("frame_id"): str,
         vol.Optional("name"): str,
     }
 )
@@ -259,9 +309,15 @@ SNAPSHOT_FLOORPLAN_SCHEMA = vol.Schema(
 # them over the floorplan photo as tracing layers — the negative space inside
 # the drawn path is where furniture stands. Draws only, never touches config
 # (docs/37 §2 point 4 — unlike the snapshot service, this has no side effects).
+# docs/40 §4.3 (Fáze 2): `frame: "home"` draws layers for EVERY aligned
+# vacuum on one shared canvas (real room outlines, `outline_home_px`,
+# instead of one vacuum's bboxes) — `image_entity` is then unused, same
+# reasoning as `SNAPSHOT_FLOORPLAN_SCHEMA` above.
 EXPORT_MAP_GUIDE_SCHEMA = vol.Schema(
     {
-        vol.Required("image_entity"): str,
+        vol.Optional("image_entity"): str,
+        vol.Optional("frame"): vol.In(["home"]),
+        vol.Optional("frame_id"): str,
         vol.Optional("name"): str,
         vol.Optional("layers", default=["rooms", "dry", "wet"]): [
             vol.In(["rooms", "dry", "wet"])
@@ -416,6 +472,142 @@ def _crop_image_to_bbox(
         return buf.getvalue(), "image/png", box
 
 
+# ── Home frame composite (docs/40 §4.3, Fáze 2) ───────────────────────────────
+
+
+def _select_home_frame(
+    hass: HomeAssistant, frame_id: str | None, *, service: str
+) -> tuple[str, dict[str, Any]]:
+    """Resolve which home frame `frame: "home"` composites (shared by
+    `snapshot_map_as_floorplan` and `export_map_guide`, docs/14 rule 1 — one
+    selection policy, not two). An explicit `frame_id` picks that frame
+    outright (raises if unknown — a typo'd id must never silently fall back
+    to a different apartment's frame). Otherwise picks the frame with the
+    most registered robots among the non-`stale` ones: the "main" home is
+    overwhelmingly the common case (one frame with N robots, everything else
+    a stray `unaligned` single-robot frame from a different floor), and
+    robot-count is a simple, stable proxy for that without needing the user
+    to know frame ids for the everyday call."""
+    frames: dict[str, dict[str, Any]] = {}
+    for coord in _coordinators(hass):
+        frames.update(coord.home_frames_snapshot())
+    if frame_id:
+        frame = frames.get(frame_id)
+        if frame is None:
+            raise HomeAssistantError(f"anyvac.{service}: unknown frame_id '{frame_id}'")
+        return frame_id, frame
+    candidates = [(fid, f) for fid, f in frames.items() if not f.get("stale")]
+    if not candidates:
+        raise HomeAssistantError(
+            f'anyvac.{service}: frame: "home" requires at least one vacuum with a '
+            "home-frame registration (see the 'home_frame'/'registration' sensor "
+            "attributes) — none exists yet"
+        )
+    return max(candidates, key=lambda kv: len(kv[1].get("robots") or {}))
+
+
+def _snap_wall_corner(
+    frame_id: str, frame: dict[str, Any], x_home_px: float, y_home_px: float
+) -> dict[str, Any]:
+    """Blocking (run via `hass.async_add_executor_job`, like
+    `_home_frame_composite_png`) — pure px<->mm shuttle around
+    `homeframe.nearest_wall_corner_mm` (docs/40 §5.B): converts the click
+    into frame mm, asks for the nearest wall-corner vertex, converts the
+    result back to home px. `snapped: False` (point echoed back unchanged)
+    when the frame has no wall data yet, so the card can fall back to the
+    raw click rather than fail the calibration step outright. `distance_px`
+    lets the card show how far the click actually moved, the same kind of
+    visible-effect feedback `_calibPreview`'s live fit-error already gives
+    docs/39's per-robot flow."""
+    from .homeframe import HOME_PX_SCALE, home_px_to_mm, mm_to_home_px, nearest_wall_corner_mm
+
+    cell_mm = frame.get("cell_mm", 50)
+    scale = frame.get("scale") or HOME_PX_SCALE
+    x_mm, y_mm = home_px_to_mm(frame["origin_mm"], cell_mm, scale, x_home_px, y_home_px)
+    snapped_mm = nearest_wall_corner_mm(frame, x_mm, y_mm)
+    if snapped_mm is None:
+        return {
+            "frame_id": frame_id,
+            "snapped": False,
+            "x_home_px": x_home_px,
+            "y_home_px": y_home_px,
+        }
+    sx_px, sy_px = mm_to_home_px(frame["origin_mm"], cell_mm, scale, snapped_mm[0], snapped_mm[1])
+    distance_px = math.hypot(sx_px - x_home_px, sy_px - y_home_px)
+    return {
+        "frame_id": frame_id,
+        "snapped": True,
+        "x_home_px": round(sx_px, 1),
+        "y_home_px": round(sy_px, 1),
+        "distance_px": round(distance_px, 1),
+    }
+
+
+def _home_frame_occupied_crop_px(frame: dict[str, Any]) -> tuple[int, int, int, int]:
+    """Pure helper shared by `_home_frame_composite_png` (the snapshot's
+    background) and `export_map_guide`'s `frame: "home"` branch (which draws
+    only transparent tracing layers, no background — docs/14 rule 1, one
+    crop-box policy for both): the frame's occupied extent (any floor OR
+    wall cell across every robot merged into it), converted to home px and
+    padded/clamped the SAME way a photographed snapshot's crop is
+    (`_padded_crop_box`) — so a guide layer exported without an explicit
+    `crop` lines up with a `frame: "home"` snapshot taken with no explicit
+    `frame_id`/crop either."""
+    from .homeframe import HOME_PX_SCALE
+
+    floor = frame["floor_mask"]
+    wall = frame["wall_mask"]
+    height, width = floor.shape
+    occupied = floor | wall
+    ys, xs = np.nonzero(occupied)
+    if ys.size == 0:
+        bbox_cells = (0, 0, width, height)
+    else:
+        bbox_cells = (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
+    scale = frame.get("scale") or HOME_PX_SCALE
+    full_w = max(1, round(width * scale))
+    full_h = max(1, round(height * scale))
+    bbox_px = tuple(v * scale for v in bbox_cells)
+    return _padded_crop_box(bbox_px, full_w, full_h)
+
+
+def _home_frame_composite_png(frame: dict[str, Any]) -> tuple[bytes, tuple[int, int, int, int]]:
+    """Blocking (run via `hass.async_add_executor_job`, like
+    `_crop_image_to_bbox`) — but RENDERS a floorplan PNG from the frame's own
+    `floor_mask`/`wall_mask` rasters instead of cropping an existing
+    photographed one: there is no single image entity for "every vacuum
+    registered into this frame at once", so this is the composite itself,
+    not a crop of somebody's photo. Builds the RGBA canvas at the frame's
+    native cell resolution (cheap — one boolean-mask assignment per colour,
+    never a per-cell Python loop) and upscales by `HOME_PX_SCALE` with
+    NEAREST resampling (a floorplan background, not a photo — no smoothing
+    across cell boundaries). Crops to `_home_frame_occupied_crop_px` (shared
+    with `export_map_guide`'s home-frame branch, docs/14 rule 1). Returns
+    (png_bytes, crop_box) with crop_box = (left, top, right, bottom) in home
+    px."""
+    from PIL import Image
+
+    from .homeframe import HOME_PX_SCALE
+
+    floor = frame["floor_mask"]
+    wall = frame["wall_mask"]
+    height, width = floor.shape
+
+    rgba = np.zeros((height, width, 4), dtype=np.uint8)
+    rgba[floor] = (235, 235, 235, 255)  # light grey floor
+    rgba[wall] = (60, 60, 60, 255)  # dark grey wall (drawn after floor: disjoint anyway)
+
+    scale = frame.get("scale") or HOME_PX_SCALE
+    img = Image.fromarray(rgba, mode="RGBA").resize(
+        (max(1, round(width * scale)), max(1, round(height * scale))), Image.NEAREST
+    )
+    box = _home_frame_occupied_crop_px(frame)
+    cropped = img.crop(box)
+    buf = io.BytesIO()
+    cropped.save(buf, format="PNG")
+    return buf.getvalue(), box
+
+
 # ── Guide layer export (docs/37) ───────────────────────────────────────────
 # Vivid, non-configurable colours (docs/37 §5) — a tracing aid, not decoration.
 _GUIDE_COLOR: dict[str, tuple[int, int, int, int]] = {
@@ -495,6 +687,42 @@ def _guide_room_rects(
     return out
 
 
+def _guide_room_outline_polygons(
+    rooms: list[Any], crop: tuple[float, float, float, float]
+) -> list[tuple[list[tuple[float, float]], str | None]]:
+    """docs/40 §4.3 (Fáze 2) counterpart of `_guide_room_rects`: each room's
+    actual traced shape (`outline_home_px` — a list of `[x, y]` PAIRS, unlike
+    `bbox_px`'s `{x0, y0, x1, y1}` dict shape, per `_frame_mm_to_home_px` in
+    coordinator.py) translated into crop-local canvas coordinates, paired
+    with its name. A room with no outline yet (mask not available — e.g.
+    right after a remap) is skipped, same as a room with no bbox is skipped
+    by `_guide_room_rects`."""
+    x0, y0, _x1, _y1 = crop
+    out: list[tuple[list[tuple[float, float]], str | None]] = []
+    for room in rooms:
+        if not isinstance(room, dict):
+            continue
+        outline = room.get("outline_home_px")
+        if not outline:
+            continue
+        pts: list[tuple[float, float]] = []
+        ok = True
+        for p in outline:
+            try:
+                px, py = p[0], p[1]
+            except (TypeError, IndexError, KeyError):
+                ok = False
+                break
+            if px is None or py is None:
+                ok = False
+                break
+            pts.append((px - x0, py - y0))
+        if not ok or len(pts) < 3:
+            continue
+        out.append((pts, room.get("name")))
+    return out
+
+
 def _image_pixel_size(content: bytes) -> tuple[int, int]:
     """Blocking: opens `content` only to read its (width, height). docs/37 §6
     point 2 — `_padded_crop_box` needs the map image's real pixel size to
@@ -529,6 +757,7 @@ def _render_guide_layer(
     canvas_size: tuple[int, int],
     *,
     rects: list[tuple[tuple[float, float, float, float], str | None]] | None = None,
+    polygons: list[tuple[list[tuple[float, float]], str | None]] | None = None,
     segments: list[list[tuple[float, float]]] | None = None,
     stroke_px: int = _GUIDE_FALLBACK_STROKE_PX,
     labels: bool = True,
@@ -538,8 +767,17 @@ def _render_guide_layer(
     Draws ONE guide layer onto a fully transparent RGBA canvas sized exactly to
     `canvas_size` (the crop box's own size — geometry is already crop-local by
     the time it reaches here, produced by `_guide_room_rects`/
-    `_guide_path_segments`). Returns PNG bytes, or None when nothing was drawn
-    — the caller does not publish a layer with no data (docs/37 §4).
+    `_guide_room_outline_polygons`/`_guide_path_segments`). Returns PNG
+    bytes, or None when nothing was drawn — the caller does not publish a
+    layer with no data (docs/37 §4).
+
+    `polygons` (docs/40 §4.3, Fáze 2 — a room's real traced shape) takes
+    priority over `rects` (legacy bbox) when both are given, though callers
+    only ever pass one of the two. Drawn as closed line loops via
+    `draw.line`, not `draw.polygon` — `ImageDraw.polygon`'s `width` support
+    for an unfilled outline is Pillow-version-dependent, while `draw.line`
+    reliably supports it and is already how `dry`/`wet` paths below are
+    drawn, so this is one drawing primitive for every non-filled shape here.
     """
     from PIL import Image, ImageDraw
 
@@ -554,14 +792,26 @@ def _render_guide_layer(
 
     if layer == "rooms":
         font = _guide_font() if labels else None
-        for (rx0, ry0, rx1, ry1), name in rects or []:
-            draw.rectangle([rx0, ry0, rx1, ry1], outline=color, width=2)
-            drew = True
-            if labels and name:
-                try:
-                    draw.text((rx0 + 4, ry0 + 4), str(name), fill=color, font=font)
-                except Exception:  # noqa: BLE001 - a label must never sink the export
-                    pass
+        if polygons is not None:
+            for pts, name in polygons:
+                if len(pts) >= 2:
+                    draw.line([*pts, pts[0]], fill=color, width=2, joint="curve")
+                    drew = True
+                if labels and name:
+                    lx, ly = min(p[0] for p in pts), min(p[1] for p in pts)
+                    try:
+                        draw.text((lx + 4, ly + 4), str(name), fill=color, font=font)
+                    except Exception:  # noqa: BLE001 - a label must never sink the export
+                        pass
+        else:
+            for (rx0, ry0, rx1, ry1), name in rects or []:
+                draw.rectangle([rx0, ry0, rx1, ry1], outline=color, width=2)
+                drew = True
+                if labels and name:
+                    try:
+                        draw.text((rx0 + 4, ry0 + 4), str(name), fill=color, font=font)
+                    except Exception:  # noqa: BLE001 - a label must never sink the export
+                        pass
     else:  # "dry" / "wet"
         r = max(1, stroke_px // 2)
         for sub in segments or []:
@@ -965,6 +1215,70 @@ def _mm_for(hass: HomeAssistant, duid: str, x_pct: float, y_pct: float) -> tuple
     )
 
 
+def _home_mm_for(hass: HomeAssistant, duid: str, x_home_px: float, y_home_px: float) -> tuple[int, int]:
+    """docs/40 §4.3: home-frame px -> the TARGET robot's own mm, via the
+    inverse of its registration (`coordinator.home_px_to_mm`, Fáze 1). Same
+    multi-coordinator fan-out as `_mm_for` (a duid belongs to exactly one
+    coordinator; the others just answer None)."""
+    for coord in _coordinators(hass):
+        mm = coord.home_px_to_mm(duid, x_home_px, y_home_px)
+        if mm is not None:
+            return (round(mm[0]), round(mm[1]))
+    raise HomeAssistantError(
+        f"anyvac: vacuum '{duid}' has no home-frame registration right now — "
+        "cannot convert home-frame pixels to coordinates (check its "
+        "'registration' sensor attribute, or use frame: \"robot\" with x_pct/y_pct)"
+    )
+
+
+def _target_mm_for(hass: HomeAssistant, duid: str, call: ServiceCall) -> tuple[int, int]:
+    """Resolve one goto/zone_clean corner to the target robot's own mm, from
+    EITHER its own rendered-map percent space (`frame: "robot"`, default —
+    `x_pct`/`y_pct`) or the shared home frame's px space (`frame: "home"` —
+    `x_home_px`/`y_home_px`). The two coordinate styles are both merely
+    Optional in the schema (so the unused one can be omitted outright) — this
+    is where exactly-one-of is actually enforced, with an error that names
+    which fields were expected instead of vol's more generic one."""
+    if call.data.get("frame") == "home":
+        if "x_home_px" not in call.data or "y_home_px" not in call.data:
+            raise HomeAssistantError(
+                'anyvac: frame: "home" requires x_home_px and y_home_px'
+            )
+        return _home_mm_for(hass, duid, call.data["x_home_px"], call.data["y_home_px"])
+    if "x_pct" not in call.data or "y_pct" not in call.data:
+        raise HomeAssistantError(
+            'anyvac: provide x_pct/y_pct (or frame: "home" with x_home_px/y_home_px)'
+        )
+    return _mm_for(hass, duid, call.data["x_pct"], call.data["y_pct"])
+
+
+def _target_zone_mm_for(
+    hass: HomeAssistant, duid: str, call: ServiceCall
+) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Same frame: "robot"/"home" choice as `_target_mm_for`, for zone_clean's
+    two corners at once (both corners always share one coordinate style —
+    there is no reason to mix them in a single call)."""
+    if call.data.get("frame") == "home":
+        needed = ("x1_home_px", "y1_home_px", "x2_home_px", "y2_home_px")
+        if any(k not in call.data for k in needed):
+            raise HomeAssistantError(
+                'anyvac: frame: "home" requires x1_home_px/y1_home_px/'
+                "x2_home_px/y2_home_px"
+            )
+        a = _home_mm_for(hass, duid, call.data["x1_home_px"], call.data["y1_home_px"])
+        b = _home_mm_for(hass, duid, call.data["x2_home_px"], call.data["y2_home_px"])
+        return a, b
+    needed = ("x1_pct", "y1_pct", "x2_pct", "y2_pct")
+    if any(k not in call.data for k in needed):
+        raise HomeAssistantError(
+            'anyvac: provide x1_pct/y1_pct/x2_pct/y2_pct (or frame: "home" with '
+            "x1_home_px/y1_home_px/x2_home_px/y2_home_px)"
+        )
+    a = _mm_for(hass, duid, call.data["x1_pct"], call.data["y1_pct"])
+    b = _mm_for(hass, duid, call.data["x2_pct"], call.data["y2_pct"])
+    return a, b
+
+
 def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one registrar
     """Register the AnyVac services (idempotent)."""
 
@@ -1055,7 +1369,7 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
 
     async def _handle_goto(call: ServiceCall) -> None:
         duid = _resolve_target_duid(hass, call)
-        x, y = _mm_for(hass, duid, call.data["x_pct"], call.data["y_pct"])
+        x, y = _target_mm_for(hass, duid, call)
         entity = call.data.get("entity_id") or vacuum_entity_for_duid(hass, duid)
         if not entity:
             raise HomeAssistantError(f"anyvac.goto: no vacuum entity for duid '{duid}'")
@@ -1068,8 +1382,7 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
 
     async def _handle_zone_clean(call: ServiceCall) -> None:
         duid = _resolve_target_duid(hass, call)
-        ax, ay = _mm_for(hass, duid, call.data["x1_pct"], call.data["y1_pct"])
-        bx, by = _mm_for(hass, duid, call.data["x2_pct"], call.data["y2_pct"])
+        (ax, ay), (bx, by) = _target_zone_mm_for(hass, duid, call)
         entity = call.data.get("entity_id") or vacuum_entity_for_duid(hass, duid)
         if not entity:
             raise HomeAssistantError(
@@ -1157,6 +1470,47 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
         await _dock_command(call, "app_amethyst_self_check")
 
     async def _handle_snapshot_floorplan(call: ServiceCall) -> dict[str, Any]:
+        if call.data.get("frame") == "home":
+            frame_id, frame = _select_home_frame(
+                hass, call.data.get("frame_id"), service="snapshot_map_as_floorplan"
+            )
+            content, crop_box = await hass.async_add_executor_job(
+                _home_frame_composite_png, frame
+            )
+            filename = _floorplan_filename(call.data.get("name") or "home_frame", "image/png")
+            target_dir = hass.config.path("www", "anyvac")
+            target_path = os.path.join(target_dir, filename)
+
+            def _write_home() -> None:
+                os.makedirs(target_dir, exist_ok=True)
+                with open(target_path, "wb") as f:
+                    f.write(content)
+
+            try:
+                await hass.async_add_executor_job(_write_home)
+            except OSError as err:
+                raise HomeAssistantError(
+                    f"anyvac.snapshot_map_as_floorplan: could not write '{target_path}': {err}"
+                ) from err
+
+            url = f"/local/anyvac/{filename}?t={int(time.time())}"
+            left, top, right, bottom = crop_box
+            _LOGGER.info(
+                "AnyVac: snapshotted home frame %s (%d robots) -> %s",
+                frame_id, len(frame.get("robots") or {}), target_path,
+            )
+            return {
+                "path": url,
+                "frame": "home",
+                "frame_id": frame_id,
+                "crop": {"x0": left, "y0": top, "x1": right, "y1": bottom},
+            }
+
+        if "image_entity" not in call.data:
+            raise HomeAssistantError(
+                'anyvac.snapshot_map_as_floorplan: provide "image_entity" '
+                '(or frame: "home" for a multi-vacuum composite)'
+            )
         entity_id = call.data["image_entity"]
         if hass.states.get(entity_id) is None:
             raise HomeAssistantError(
@@ -1234,7 +1588,135 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
             result["crop"] = {"x0": left, "y0": top, "x1": right, "y1": bottom}
         return result
 
+    async def _export_map_guide_home_frame(call: ServiceCall) -> dict[str, Any]:
+        """docs/40 §4.3 (Fáze 2): the SAME canvas/layers as the legacy path
+        below, but for every vacuum registered into one shared home frame at
+        once, and real room shapes (`outline_home_px`) instead of one
+        vacuum's `bbox_px` rectangles — a separate function (not another
+        `if` branch threaded through the whole legacy body below) because
+        every single step differs: no `image_entity`, no single `device`,
+        geometry already published in home px so no crop-provenance
+        cross-check against a fetched image is needed at all."""
+        frame_id, frame = _select_home_frame(hass, call.data.get("frame_id"), service="export_map_guide")
+        duids = list((frame.get("robots") or {}).keys())
+        devices: list[Any] = []
+        for coord in _coordinators(hass):
+            for duid in duids:
+                d = (coord.data or {}).get(duid)
+                if d is not None:
+                    devices.append(d)
+
+        explicit_crop = call.data.get("crop")
+        if explicit_crop is not None:
+            crop_box: tuple[int, int, int, int] = (
+                int(explicit_crop["x0"]), int(explicit_crop["y0"]),
+                int(explicit_crop["x1"]), int(explicit_crop["y1"]),
+            )
+        else:
+            crop_box = await hass.async_add_executor_job(_home_frame_occupied_crop_px, frame)
+        x0, y0, x1, y1 = crop_box
+        canvas_size = (x1 - x0, y1 - y0)
+        if canvas_size[0] <= 0 or canvas_size[1] <= 0:
+            raise HomeAssistantError(
+                f"anyvac.export_map_guide: crop box for frame '{frame_id}' is empty"
+            )
+        crop_tuple = (float(x0), float(y0), float(x1), float(y1))
+
+        stroke_mm = call.data.get("stroke_mm", 300)
+        cell_mm = frame.get("cell_mm") or 50.0
+        scale = frame.get("scale") or 4.0
+        stroke_px = max(1, round(stroke_mm * (scale / cell_mm)))
+
+        requested_layers: list[str] = list(call.data.get("layers") or ["rooms", "dry", "wet"])
+        labels = call.data.get("labels", True)
+
+        # Rooms: dedupe by home_room_id — two robots' masks that IoU-matched
+        # into the same physical room (docs/40 §4.2 point 6) must draw ONCE,
+        # not twice with (very slightly) different traced outlines.
+        seen_room_ids: set[str] = set()
+        polygons: list[tuple[list[tuple[float, float]], str | None]] = []
+        if "rooms" in requested_layers:
+            for device in devices:
+                rooms = device.data.get("rooms") or []
+                hrid_rooms = [r for r in rooms if isinstance(r, dict) and r.get("home_room_id")]
+                other_rooms = [r for r in rooms if not (isinstance(r, dict) and r.get("home_room_id"))]
+                fresh = []
+                for room in hrid_rooms:
+                    hrid = room["home_room_id"]
+                    if hrid in seen_room_ids:
+                        continue
+                    seen_room_ids.add(hrid)
+                    fresh.append(room)
+                polygons.extend(_guide_room_outline_polygons(fresh + other_rooms, crop_tuple))
+
+        dry_segments: list[list[tuple[float, float]]] = []
+        wet_segments: list[list[tuple[float, float]]] = []
+        for device in devices:
+            if "dry" in requested_layers:
+                dry_segments.extend(
+                    _guide_path_segments(device.data.get("path_dry_home_px") or [], crop_tuple)
+                )
+            if "wet" in requested_layers:
+                wet_segments.extend(
+                    _guide_path_segments(device.data.get("path_wet_home_px") or [], crop_tuple)
+                )
+        points = {
+            "dry": sum(len(s) for s in dry_segments),
+            "wet": sum(len(s) for s in wet_segments),
+        }
+
+        def _render(layer: str) -> bytes | None:
+            if layer == "rooms":
+                return _render_guide_layer("rooms", canvas_size, polygons=polygons, labels=labels)
+            segs = dry_segments if layer == "dry" else wet_segments
+            return _render_guide_layer(layer, canvas_size, segments=segs, stroke_px=stroke_px)
+
+        name = call.data.get("name") or "home_frame"
+        target_dir = hass.config.path("www", "anyvac")
+
+        def _write(path: str, data: bytes) -> None:
+            os.makedirs(target_dir, exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(data)
+
+        paths: dict[str, str] = {}
+        ts = int(time.time())
+        for layer in requested_layers:
+            png = await hass.async_add_executor_job(_render, layer)
+            if png is None:
+                continue
+            filename = _guide_filename(name, layer)
+            target_path = os.path.join(target_dir, filename)
+            try:
+                await hass.async_add_executor_job(_write, target_path, png)
+            except OSError as err:
+                raise HomeAssistantError(
+                    f"anyvac.export_map_guide: could not write '{target_path}': {err}"
+                ) from err
+            paths[layer] = f"/local/anyvac/{filename}?t={ts}"
+
+        _LOGGER.info(
+            "AnyVac: exported home-frame guide layers for frame %s (%d robots) -> %s",
+            frame_id, len(devices), sorted(paths),
+        )
+        return {
+            "paths": paths,
+            "frame": "home",
+            "frame_id": frame_id,
+            "crop": {"x0": x0, "y0": y0, "x1": x1, "y1": y1},
+            "size": {"w": canvas_size[0], "h": canvas_size[1]},
+            "points": points,
+        }
+
     async def _handle_export_map_guide(call: ServiceCall) -> dict[str, Any]:
+        if call.data.get("frame") == "home":
+            return await _export_map_guide_home_frame(call)
+
+        if "image_entity" not in call.data:
+            raise HomeAssistantError(
+                'anyvac.export_map_guide: provide "image_entity" '
+                '(or frame: "home" for a multi-vacuum export)'
+            )
         entity_id = call.data["image_entity"]
         if hass.states.get(entity_id) is None:
             raise HomeAssistantError(
@@ -1410,6 +1892,19 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
             "sha1": sha1,
         }
 
+    async def _handle_snap_wall_corner(call: ServiceCall) -> dict[str, Any]:
+        # docs/40 §5.B: card sends a home-px click, gets back the nearest
+        # actual wall-corner vertex from that frame's own `wall_mask` — the
+        # heavy lifting is `_snap_wall_corner` below (a pure function, unit
+        # tested directly, same split as `_home_frame_composite_png`); this
+        # closure only resolves which frame and offloads to the executor.
+        frame_id, frame = _select_home_frame(
+            hass, call.data.get("frame_id"), service="snap_wall_corner"
+        )
+        return await hass.async_add_executor_job(
+            _snap_wall_corner, frame_id, frame, call.data["x_home_px"], call.data["y_home_px"]
+        )
+
     async def _handle_cancel(call: ServiceCall) -> None:
         started = _cancel_jobs(hass)
         if call.data.get("return_to_base", True) and started:
@@ -1440,6 +1935,7 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
         (SERVICE_SNAPSHOT_FLOORPLAN, _handle_snapshot_floorplan, SNAPSHOT_FLOORPLAN_SCHEMA, SupportsResponse.ONLY),
         (SERVICE_EXPORT_MAP_GUIDE, _handle_export_map_guide, EXPORT_MAP_GUIDE_SCHEMA, SupportsResponse.ONLY),
         (SERVICE_DUMP_RAW_MAP, _handle_dump_raw_map, DUMP_RAW_MAP_SCHEMA, SupportsResponse.ONLY),
+        (SERVICE_SNAP_WALL_CORNER, _handle_snap_wall_corner, SNAP_WALL_CORNER_SCHEMA, SupportsResponse.ONLY),
     ]
     for name, handler, schema, supports in registrations:
         if not hass.services.has_service(DOMAIN, name):

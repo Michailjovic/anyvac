@@ -4,6 +4,46 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.0] - 2026-09-14
+
+Docs/40 §5.B ("cesta B" — calibrating a foreign-origin floorplan against the
+home frame) — the piece deferred out of Fáze 3's core scope, now delivered
+alongside the card's own cesta B support (anyvac-card 1.8.0).
+
+### Added
+
+**`wall_corner_points(wall_mask)` / `nearest_wall_corner_mm(frame, x_mm, y_mm)`
+(`homeframe.py`)** — a new home frame corner-detection algorithm: classifies
+every grid vertex by how many of its 4 touching cells are wall (a bowtie —
+two diagonal wall cells, two diagonal non-wall cells — counts as a corner
+too; a straight adjacent-pair run does not), fully vectorised over a padded
+boolean array (no per-pixel Python loop). Reuses `outline_from_mask`'s
+crack-coordinate CONCEPT (per-cell boundary classification) but is a
+genuinely different query — enumerate every corner vs. trace one ring — so
+it's a new, documented implementation rather than a duplicate (docs/14 rule
+1). `nearest_wall_corner_mm` is a plain vectorised nearest-neighbour lookup
+against those corners (no k-d tree — corner counts are small enough),
+returning `None` for a frame with no wall data yet.
+
+**`anyvac.snap_wall_corner` service** — `{frame_id?, x_home_px, y_home_px}`
+in (response-only), `{frame_id, snapped, x_home_px, y_home_px, distance_px?}`
+back. Resolves the frame via the existing shared `_select_home_frame`
+policy, converts home px → mm → nearest wall corner → back to home px
+(`_snap_wall_corner`, `services.py`, a pure module-level function offloaded
+to the executor same as `_home_frame_composite_png`, and unit-tested
+directly the same way). `snapped: false` echoes the input point unchanged
+when the frame has no wall cells yet, rather than erroring.
+
+13 new tests (`tests/test_wall_corner_snap.py`) — 6 hand-traced geometric
+cases for `wall_corner_points` (a single cell, a solid rectangle, an L-shape
+with one concave corner, a diagonal "bowtie" touch, a straight run), 4 for
+`nearest_wall_corner_mm` (closest-of-several, frame origin offset, no-wall
+frame, custom `cell_mm`), 3 for `_snap_wall_corner`'s px↔mm shuttle. Full
+suite 248/248 (235 baseline + 13 new). No opencv/scipy/scikit-image; no
+second corner-detection or crop-normalisation implementation (docs/14 rule
+1) — `nearest_wall_corner_mm` only calls the existing `home_px_to_mm`/
+`mm_to_home_px` conversions the rest of the coordinate pipeline already uses.
+
 ## [1.8.1] - 2026-09-14
 
 Bugfix, found while designing the card's Fáze 3 ("home frame" identity

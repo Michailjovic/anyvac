@@ -107,8 +107,10 @@ plan:
 goto:
   name: Pin & go
   description: >-
-    Send a vacuum to a single point on its map, given as a percentage of
-    the map image (the integration converts to real coordinates).
+    Send a vacuum to a single point, either as a percentage of its own map
+    image (default) or, with frame: "home", as a pixel position in the
+    shared home frame (docs/40 Fáze 2) — the integration converts either
+    one to the vacuum's own real coordinates.
   fields:
     entity_id:
       name: Vacuum
@@ -121,10 +123,23 @@ goto:
       description: Roborock device id, as an alternative to `entity_id`.
       selector:
         text:
+    frame:
+      name: Coordinate frame
+      description: >-
+        "robot" (default): x_pct/y_pct are percent of this vacuum's own map
+        image. "home": x_home_px/y_home_px are pixels in the shared home
+        frame — requires this vacuum to have a home-frame registration.
+      default: robot
+      selector:
+        select:
+          options:
+            - robot
+            - home
     x_pct:
       name: X (%)
-      description: Target X position as a percentage of the map image width.
-      required: true
+      description: >-
+        Target X, percent of the map image width. Used when frame is
+        "robot" (the default).
       selector:
         number:
           min: 0
@@ -133,20 +148,34 @@ goto:
           unit_of_measurement: "%"
     y_pct:
       name: Y (%)
-      description: Target Y position as a percentage of the map image height.
-      required: true
+      description: >-
+        Target Y, percent of the map image height. Used when frame is
+        "robot" (the default).
       selector:
         number:
           min: 0
           max: 100
           step: 0.1
           unit_of_measurement: "%"
+    x_home_px:
+      name: X (home frame px)
+      description: Target X in the shared home frame's pixel space. Used when frame is "home".
+      selector:
+        number:
+          step: 0.1
+    y_home_px:
+      name: Y (home frame px)
+      description: Target Y in the shared home frame's pixel space. Used when frame is "home".
+      selector:
+        number:
+          step: 0.1
 
 zone_clean:
   name: Zone clean
   description: >-
-    Clean a rectangular zone, given as two opposite corners in percent of
-    the map image (the integration converts to real coordinates).
+    Clean a rectangular zone, given as two opposite corners either in
+    percent of the map image (default) or, with frame: "home", as pixel
+    positions in the shared home frame (docs/40 Fáze 2).
   fields:
     entity_id:
       name: Vacuum
@@ -159,10 +188,22 @@ zone_clean:
       description: Roborock device id, as an alternative to `entity_id`.
       selector:
         text:
+    frame:
+      name: Coordinate frame
+      description: >-
+        "robot" (default): the four *_pct fields are percent of this
+        vacuum's own map image. "home": the four *_home_px fields are
+        pixels in the shared home frame — requires this vacuum to have a
+        home-frame registration.
+      default: robot
+      selector:
+        select:
+          options:
+            - robot
+            - home
     x1_pct:
       name: X1 (%)
-      description: First corner X, percent of map image width.
-      required: true
+      description: First corner X, percent of map image width. Used when frame is "robot".
       selector:
         number:
           min: 0
@@ -171,8 +212,7 @@ zone_clean:
           unit_of_measurement: "%"
     y1_pct:
       name: Y1 (%)
-      description: First corner Y, percent of map image height.
-      required: true
+      description: First corner Y, percent of map image height. Used when frame is "robot".
       selector:
         number:
           min: 0
@@ -181,8 +221,7 @@ zone_clean:
           unit_of_measurement: "%"
     x2_pct:
       name: X2 (%)
-      description: Opposite corner X, percent of map image width.
-      required: true
+      description: Opposite corner X, percent of map image width. Used when frame is "robot".
       selector:
         number:
           min: 0
@@ -191,14 +230,37 @@ zone_clean:
           unit_of_measurement: "%"
     y2_pct:
       name: Y2 (%)
-      description: Opposite corner Y, percent of map image height.
-      required: true
+      description: Opposite corner Y, percent of map image height. Used when frame is "robot".
       selector:
         number:
           min: 0
           max: 100
           step: 0.1
           unit_of_measurement: "%"
+    x1_home_px:
+      name: X1 (home frame px)
+      description: First corner X in the shared home frame's pixel space. Used when frame is "home".
+      selector:
+        number:
+          step: 0.1
+    y1_home_px:
+      name: Y1 (home frame px)
+      description: First corner Y in the shared home frame's pixel space. Used when frame is "home".
+      selector:
+        number:
+          step: 0.1
+    x2_home_px:
+      name: X2 (home frame px)
+      description: Opposite corner X in the shared home frame's pixel space. Used when frame is "home".
+      selector:
+        number:
+          step: 0.1
+    y2_home_px:
+      name: Y2 (home frame px)
+      description: Opposite corner Y in the shared home frame's pixel space. Used when frame is "home".
+      selector:
+        number:
+          step: 0.1
     repeat:
       name: Repeat
       description: Number of passes over the zone.
@@ -473,21 +535,40 @@ snapshot_map_as_floorplan:
     Save a map image entity's current picture as a static file under
     config/www/anyvac/ and return its /local/ URL. Used by the card's Maps
     tab to turn one vacuum's own map into the shared floorplan image for
-    merged mode, without manually saving/uploading a file.
+    merged mode, without manually saving/uploading a file. With frame:
+    "home" (docs/40 Fáze 2), renders a composite of every vacuum registered
+    into the shared home frame instead — image_entity is then unused.
   fields:
     image_entity:
       name: Image entity
       description: >-
         The map image entity to snapshot (e.g. image.s6_kitchen_map_0).
-      required: true
+        Required unless frame is "home".
       selector:
         entity:
           domain: image
+    frame:
+      name: Coordinate frame
+      description: >-
+        Leave unset to snapshot one vacuum's image_entity (default). Set to
+        "home" for a composite of every vacuum in the shared home frame.
+      selector:
+        select:
+          options:
+            - home
+    frame_id:
+      name: Home frame id
+      description: >-
+        Only used with frame: "home". Picks a specific home frame by id
+        (from the 'home_frame' sensor attribute) — omit to use the frame
+        with the most registered vacuums.
+      selector:
+        text:
     name:
       name: Name
       description: >-
         Label used to build the output filename (slugified). Defaults to
-        the image entity's object id.
+        the image entity's object id, or "home_frame" with frame: "home".
       selector:
         text:
 
@@ -498,23 +579,41 @@ export_map_guide:
     PNGs, cropped to the same box as `anyvac.snapshot_map_as_floorplan`. Used
     by the card's Maps tab as a tracing aid for building a custom floorplan by
     hand (e.g. in GIMP) — the gaps inside the drawn path are where furniture
-    stands. Draws only; never changes card config.
+    stands. Draws only; never changes card config. With frame: "home" (docs/40
+    Fáze 2), draws every vacuum in the shared home frame on one canvas, with
+    real room outlines instead of one vacuum's rectangles — image_entity is
+    then unused.
   fields:
     image_entity:
       name: Image entity
       description: >-
         The map image entity whose geometry to export (e.g.
         image.s6_kitchen_map_0). Same entity `anyvac.snapshot_map_as_floorplan`
-        would use for this vacuum.
-      required: true
+        would use for this vacuum. Required unless frame is "home".
       selector:
         entity:
           domain: image
+    frame:
+      name: Coordinate frame
+      description: >-
+        Leave unset to export one vacuum's own geometry (default). Set to
+        "home" to export every vacuum in the shared home frame at once.
+      selector:
+        select:
+          options:
+            - home
+    frame_id:
+      name: Home frame id
+      description: >-
+        Only used with frame: "home". Picks a specific home frame by id —
+        omit to use the frame with the most registered vacuums.
+      selector:
+        text:
     name:
       name: Name
       description: >-
         Label used to build the output filenames (slugified). Defaults to
-        the image entity's object id.
+        the image entity's object id, or "home_frame" with frame: "home".
       selector:
         text:
     layers:
@@ -538,8 +637,8 @@ export_map_guide:
         Width of the drawn dry/wet path, in millimetres — should match the
         vacuum's real footprint so the negative space inside the path lines
         up with actual furniture. Converted to pixels using this vacuum's
-        own map calibration; falls back to a fixed pixel width when
-        calibration is unavailable.
+        own map calibration (or the home frame's, with frame: "home");
+        falls back to a fixed pixel width when calibration is unavailable.
       default: 300
       selector:
         number:
@@ -549,10 +648,11 @@ export_map_guide:
     crop:
       name: Crop override
       description: >-
-        Force a specific `{x0, y0, x1, y1}` crop box (rendered-image pixel
-        space) instead of the one computed from this vacuum's current room
-        geometry. Use this to match guide layers to an EXISTING older
-        floorplan whose crop has since shifted (e.g. after a remap).
+        Force a specific `{x0, y0, x1, y1}` crop box — rendered-image pixel
+        space normally, or home-frame pixel space with frame: "home" —
+        instead of the one computed automatically. Use this to match guide
+        layers to an EXISTING older floorplan whose crop has since shifted
+        (e.g. after a remap).
       example: '{"x0": 412, "y0": 384, "x1": 764, "y1": 1692}'
       selector:
         object:
@@ -583,3 +683,33 @@ dump_raw_map:
         the vacuum entity's object id.
       selector:
         text:
+
+snap_wall_corner:
+  name: Snap point to nearest wall corner
+  description: >-
+    docs/40 §5.B. Given a point in home-frame pixel space, returns the
+    nearest wall-corner vertex found in that frame's own wall mask — used by
+    the card's foreign-floorplan (photo/drawing) N-point calibration to snap
+    the home-frame side of a click pair onto an exact architectural point
+    instead of trusting the click's raw pixel position. Returns the point
+    unchanged (snapped: false) if the frame has no wall data yet.
+  fields:
+    frame_id:
+      name: Home frame id
+      description: >-
+        Picks a specific home frame by id (from the 'home_frame' sensor
+        attribute) — omit to use the frame with the most registered vacuums.
+      selector:
+        text:
+    x_home_px:
+      name: X (home px)
+      description: The point's X coordinate in home-frame pixel space.
+      required: true
+      selector:
+        number:
+    y_home_px:
+      name: Y (home px)
+      description: The point's Y coordinate in home-frame pixel space.
+      required: true
+      selector:
+        number:

@@ -79,6 +79,17 @@ automatically — set up once via the editor's "Snapshot home frame as
 floorplan" button. A vacuum without a current registration (or an older
 card) keeps working exactly as before, per-vacuum.
 
+For a floorplan of your OWN (a photo or drawing, not a home-frame snapshot),
+`anyvac-card` ≥ 1.8.0 offers a second calibration path (docs/40 §5.B): the
+editor's "Calibrate floorplan against home frame" button walks through
+clicking a handful of matching points once against a scratch home-frame
+snapshot (each click snapped to the nearest wall corner via
+`anyvac.snap_wall_corner` above) and once against the floorplan photo, and
+saves the raw clicked pairs as `image_base.home_anchors` — never a solved
+seat. The card re-fits those pairs live every render against the frame's
+*current* size, so it keeps working as the frame's canvas grows (the robots
+exploring further) without asking you to re-click anything.
+
 ### Legacy millimetre attributes
 
 The small mm-space fields — `vacuum_position`, `charger`, `calibration_points`
@@ -155,6 +166,7 @@ closing) — the AnyVac card sends an *intent*, not a pre-built plan:
 | `anyvac.zone_clean` | Zone clean: two corners as percent of the map image, same conversion (or `frame: "home"` + `*_home_px` corners). |
 | `anyvac.snapshot_map_as_floorplan` | Saves a map image entity's picture as the shared floorplan file. With `frame: "home"`, renders a composite of every vacuum registered into the shared home frame instead, straight from their aligned floor/wall masks — no single vacuum's `image_entity` involved. |
 | `anyvac.export_map_guide` | Draws room-boundary/dry/wet tracing-aid layers for one vacuum's map. With `frame: "home"`, draws every vacuum's rooms and paths on one canvas, with each room's real traced outline (`outline_home_px`) instead of one vacuum's bounding box. |
+| `anyvac.snap_wall_corner` | Snaps a home-frame pixel point to the nearest wall corner detected from that frame's own wall mask — response-only, `{frame_id?, x_home_px, y_home_px}` in, `{frame_id, snapped, x_home_px, y_home_px, distance_px?}` back (`snapped: false` echoes the input unchanged when the frame has no wall data yet). Used by the card's editor while calibrating a foreign-origin floorplan against the home frame (docs/40 §5.B) to remove most click noise — not something you'd normally call directly. |
 | `anyvac.cancel` | Stops the running job and (by default) returns started robots to base. |
 | `anyvac.select_rooms` / `anyvac.pin_room` / `anyvac.set_layers` / `anyvac.set_room_sequence` / `anyvac.reset_learning` | UI/learning state — room selection, per-room robot pinning, dry/wet layer visibility, the Roborock app's room order (used for ETA), and clearing bad learned estimates. |
 
