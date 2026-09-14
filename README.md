@@ -56,7 +56,7 @@ any manual "seat" configuration per robot:
 | --- | --- |
 | `home_frame` | `{id, cell_mm, scale, width_px, height_px}` — the shared raster this vacuum currently belongs to, or `null` if it has none yet (just restarted, or its map failed the decoder self-test) |
 | `registration` | `{status, method, rotation_deg, score, iou}` — `status` is `reference` (this vacuum's map founded/still founds the frame), `aligned` (successfully registered onto it), or `unaligned` (its map doesn't currently match anything, e.g. a different floor — it gets its own frame automatically) |
-| `vacuum_position_home_px` / `charger_home_px` | the same points as `vacuum_position_px`/`charger_px`, in the shared frame's px space |
+| `vacuum_position_home_px` / `charger_home_px` | the same points as `vacuum_position_px`/`charger_px`, in the shared frame's px space. `vacuum_position_home_px.a` (heading) is its OWN self-consistent convention — standard image-px `atan2` (0°=+x/right, 90°=+y/down), integration ≥ 1.8.1 — distinct from the legacy `vacuum_position_px.a` contract, where a consumer negates `sin` to undo a flip baked into that contract's solved affine |
 | `path_dry_home_px` / `path_wet_home_px` | the same segmented trajectories, in the shared frame's px space |
 | `rooms[].bbox_home_px` | room bounding box in the shared frame's px space |
 | `rooms[].outline_home_px` | the room's actual traced shape (a simplified polygon, ≤ 60 points) instead of just a bounding box |
@@ -70,10 +70,14 @@ single-vacuum setup behaves.
 (below) all accept this shared frame as an alternative to their normal
 per-vacuum input (`frame: "home"`, Fáze 2 of docs/40), and `clean`/`plan`
 transparently pair up the SAME physical room across two robots that each
-call it something different, once a home frame links them. The card itself
-does not read these attributes or send `frame: "home"` yet — this remains
-usable today only via `anyvac.*` service calls (e.g. from a script or the
-Developer Tools → Actions tab).
+call it something different, once a home frame links them. `anyvac-card`
+≥ 1.7.0 (Fáze 3 core of docs/40) reads these attributes directly in merged
+mode: a home-frame-registered vacuum renders through one shared identity
+crop instead of a per-vacuum seat, room rectangles/outlines come from
+`bbox_home_px`/`outline_home_px`, and Pin & Go / Zone send `frame: "home"`
+automatically — set up once via the editor's "Snapshot home frame as
+floorplan" button. A vacuum without a current registration (or an older
+card) keeps working exactly as before, per-vacuum.
 
 ### Legacy millimetre attributes
 

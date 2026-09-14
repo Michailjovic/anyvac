@@ -22,6 +22,7 @@ from custom_components.anyvac.coordinator import (
     AnyVacDevice,
     _apply_home_frame_contract,
     _compute_home_frame_result,
+    _home_px_heading,
 )
 
 from ._synthetic_raw_map import FakeLibRoom, lib_rooms_for, make_raw_map
@@ -388,6 +389,59 @@ def test_apply_home_frame_contract_populates_home_frame_and_registration() -> No
     assert device.data["registration"]["rotation_deg"] == 0.0
     assert device.data["vacuum_position_home_px"] is not None
     assert device.data["charger_home_px"] is None  # charger was None on the input
+
+
+# ── _home_px_heading (bugfix 2026-09-14: a naive passthrough of `a` shipped in
+# 1.7.0 is only correct at rot_deg == 0 — see the function's own docstring) ──
+
+
+def test_home_px_heading_passes_through_unchanged_at_zero_rotation() -> None:
+    """The reference vacuum (rot_deg=0, tx=ty=0) is the overwhelmingly common
+    case (founder of a fresh frame, or the only vacuum registered so far) —
+    must behave exactly like a plain passthrough here, matching what shipped
+    in 1.7.0 for this specific case (a genuinely correct result, since an
+    identity registration can't rotate anything)."""
+    rec = {"rot_deg": 0.0, "tx_mm": 0.0, "ty_mm": 0.0}
+    frame = {"origin_mm": (0.0, 0.0), "cell_mm": 50.0, "scale": 4.0}
+    for a in (0.0, 45.0, 90.0, 179.9, 270.0):
+        assert _home_px_heading(a, rec, frame) == pytest.approx(a, abs=0.05)
+
+
+def test_home_px_heading_rotates_with_the_registration() -> None:
+    """rot_deg=90: `robot_mm_to_frame_mm` maps a robot-space +x vector
+    (heading 0°) onto frame-space +y (`R(90) @ (1,0) = (0,1)`, verified by
+    hand from that function's own `a*x - s*y, s*x + a*y` formula) — and
+    `mm_to_home_px` applies no further axis flip (a plain scale from
+    `origin_mm`), so the resulting home-px heading must land at exactly 90°
+    (standard atan2, +x=0°, +y=90°) — the additive `a + rot_deg` relationship
+    the docstring claims, not the naive pre-fix passthrough (which would
+    have wrongly kept this at 0°)."""
+    rec = {"rot_deg": 90.0, "tx_mm": 0.0, "ty_mm": 0.0}
+    frame = {"origin_mm": (0.0, 0.0), "cell_mm": 50.0, "scale": 4.0}
+    assert _home_px_heading(0.0, rec, frame) == pytest.approx(90.0, abs=0.05)
+    # And the reverse: a robot-space +y heading (90°) rotates onto frame-space
+    # −x (`R(90) @ (0,1) = (-1,0)`), i.e. home-px heading 180°.
+    assert _home_px_heading(90.0, rec, frame) == pytest.approx(180.0, abs=0.05)
+
+
+def test_apply_home_frame_contract_rotates_vacuum_heading_with_registration() -> None:
+    """End-to-end through `_apply_home_frame_contract`: s6 in the shared
+    two-robot fixture is registered at a 90° rotation — its published
+    `vacuum_position_home_px.a` must reflect that rotation, not a straight
+    copy of the mm-space heading it was given."""
+    frames, robot_frame, room_masks = _registered_two_robot_setup()
+    rec = frames[robot_frame["s6"]]["robots"]["s6"]
+    assert rec["rot_deg"] != 0  # sanity: this fixture only exercises the fix if s6 is actually rotated
+    device = AnyVacDevice(
+        duid="s6", slug="s6", name="s6",
+        data={"vacuum_position": {"x": 20.0, "y": 20.0, "a": 0.0}, "charger": None, "rooms": []},
+    )
+    _apply_home_frame_contract(device, [], [], frames, robot_frame, room_masks)
+
+    frame = frames[robot_frame["s6"]]
+    expected = _home_px_heading(0.0, rec, frame)
+    assert device.data["vacuum_position_home_px"]["a"] == pytest.approx(expected, abs=0.05)
+    assert device.data["vacuum_position_home_px"]["a"] != pytest.approx(0.0, abs=0.5)
 
 
 def test_apply_home_frame_contract_is_none_for_unregistered_duid() -> None:

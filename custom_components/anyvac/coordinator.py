@@ -353,6 +353,44 @@ def _px_point(
     return out
 
 
+def _home_px_heading(a_deg: float, rec: dict[str, Any], frame: dict[str, Any]) -> float:
+    """Transform a heading (degrees, robot-mm convention — same space
+    `vacuum_position`'s `x`/`y` are in) into the home frame's own PX-space
+    heading convention (standard `atan2`: 0° = +x/right, increasing toward
+    +y/down — i.e. the raw image-pixel convention, no extra sign flip
+    needed by whoever draws it, unlike the legacy per-vacuum `*_px` contract
+    where the card itself negates `sin` to undo a flip baked into that
+    contract's own solved affine).
+
+    Found 2026-09-14 while wiring the card's home-frame renderer: the FIRST
+    real consumer of `vacuum_position_home_px.a` — nothing published it
+    correctly before, because nothing had ever needed to read it. A naive
+    passthrough of `a_deg` (what shipped in 1.7.0 by mistake) is only
+    correct at `rot_deg == 0`; any vacuum registered at 90/180/270°
+    (`robot_mm_to_frame_mm`'s own rotation, docs/40 §4.2) would draw its
+    marker facing the wrong way once anything actually read this field.
+
+    Deliberately reuses the exact same `robot_mm_to_frame_mm` +
+    `mm_to_home_px` pipeline `_home_px_point` uses for positions — two
+    points 1mm apart along the heading, transformed exactly like any other
+    coordinate pair — rather than re-deriving the rotation/axis-convention
+    algebra by hand a second time (docs/14 rule 1): whatever rotation or
+    axis convention those already-tested functions apply to a position
+    applies identically here, by construction, with no separate formula to
+    get wrong.
+    """
+    rad = math.radians(a_deg)
+    x0, y0 = homeframe.robot_mm_to_frame_mm(rec["rot_deg"], rec["tx_mm"], rec["ty_mm"], 0.0, 0.0)
+    x1, y1 = homeframe.robot_mm_to_frame_mm(
+        rec["rot_deg"], rec["tx_mm"], rec["ty_mm"], math.cos(rad), math.sin(rad)
+    )
+    cell_mm = frame.get("cell_mm", homeframe.FRAME_CELL_MM)
+    scale = frame.get("scale", homeframe.HOME_PX_SCALE)
+    px0, py0 = homeframe.mm_to_home_px(frame["origin_mm"], cell_mm, scale, x0, y0)
+    px1, py1 = homeframe.mm_to_home_px(frame["origin_mm"], cell_mm, scale, x1, y1)
+    return math.degrees(math.atan2(py1 - py0, px1 - px0)) % 360
+
+
 def _home_px_point(
     p: dict[str, float] | None, rec: dict[str, Any] | None, frame: dict[str, Any] | None
 ) -> dict[str, float] | None:
@@ -362,8 +400,10 @@ def _home_px_point(
     (`homeframe.robot_mm_to_frame_mm`), then the frame's own origin/cell/
     scale maps frame mm -> home px (`homeframe.mm_to_home_px`). Mirrors
     `_px_point`'s shape/rounding so the card treats both contracts
-    identically. None whenever any input is missing (no home-frame
-    registration yet for this duid)."""
+    identically EXCEPT for `a` (see `_home_px_heading` — home-px heading is
+    its own self-consistent convention, not a straight copy of the mm-space
+    value). None whenever any input is missing (no home-frame registration
+    yet for this duid)."""
     if p is None or rec is None or frame is None:
         return None
     x, y = p.get("x"), p.get("y")
@@ -379,7 +419,7 @@ def _home_px_point(
     )
     out: dict[str, float] = {"x": round(px, 1), "y": round(py, 1)}
     if p.get("a") is not None:
-        out["a"] = p["a"]
+        out["a"] = round(_home_px_heading(p["a"], rec, frame), 1)
     return out
 
 
@@ -2285,6 +2325,18 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             fx_mm,
             fy_mm,
         )
+
+    def home_frames_snapshot(self) -> dict[str, dict[str, Any]]:
+        """Read-only view of every known home frame (docs/40 §4.1), keyed by
+        `frame_id` — for services.py's Fáze 2 composite snapshot/export
+        (`snapshot_map_as_floorplan`/`export_map_guide` with `frame: "home"`),
+        which needs the frame's own `floor_mask`/`wall_mask` rasters directly
+        (not per-robot geometry, so `home_px_to_mm`/`mm_to_home_px` don't fit).
+        A shallow copy of the top-level dict — the individual frame dicts
+        themselves are already copy-on-write everywhere they're built
+        (never mutated in place), so handing out references is safe as long
+        as the caller only reads them, which is all services.py does."""
+        return dict(self._home_frames)
 
     def _paths_for_save(self) -> dict[str, dict[str, Any]]:
         """Snapshot of the segmented trace + the bookkeeping needed to resume

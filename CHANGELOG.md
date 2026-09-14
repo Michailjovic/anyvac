@@ -4,6 +4,32 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.1] - 2026-09-14
+
+Bugfix, found while designing the card's Fáze 3 ("home frame" identity
+rendering, docs/40) — the first real consumer of `vacuum_position_home_px.a`.
+
+### Fixed
+
+**`vacuum_position_home_px.a` (heading) was wrong for any vacuum registered
+at a non-zero rotation.** It used to be a naive passthrough of the robot's
+own mm-space heading, but `robot_mm_to_frame_mm` (Fáze 1 registration)
+applies a real coordinate rotation (`rec["rot_deg"]`) to x/y — a heading
+value has to rotate along with it to stay physically consistent, and it
+didn't. Fixed via a new `_home_px_heading()` that transforms a heading by
+running a short probe vector through the exact same, already-tested
+`robot_mm_to_frame_mm` + `mm_to_home_px` pipeline `_home_px_point` uses for
+positions, rather than a hand-derived rotation/axis-convention formula
+(no parallel re-implementation). This also makes `vacuum_position_home_px.a`
+a standard image-px `atan2` angle (0°=+x/right, 90°=+y/down) — its own
+self-consistent convention, distinct from the legacy `vacuum_position_px`
+contract (where the card negates `sin` to undo a flip baked into that
+contract's solved affine); a card consuming the new field uses `+sin`
+instead. Positions (`x`/`y`) were never affected — Fáze 0/1's own synthetic-
+map/IoU tests only ever verified mask/position alignment, never heading, and
+nothing consumed this field until now. 3 new regression tests (hand-verified
+expected angles), full suite 235/235.
+
 ## [1.8.0] - 2026-09-14
 
 Fáze 2 of docs/40 ("home frame" — automatic multi-vacuum map calibration):
