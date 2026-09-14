@@ -4,6 +4,83 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.0] - 2026-09-14
+
+Fáze 2 of docs/40 ("home frame" — automatic multi-vacuum map calibration):
+services that actually USE the shared home frame published in 1.7.0's
+kontrakt v3. **Card unchanged** (Fáze 3 will adopt this on the card side —
+today this is reachable only via direct `anyvac.*` service calls, e.g. from
+a script or Developer Tools → Actions).
+
+### Added
+
+**`frame: "home"` on `goto`/`zone_clean`** — both services accept an
+alternative `x_home_px`/`y_home_px` (or the four zone-corner equivalents)
+target instead of the existing `x_pct`/`y_pct` map-image percentages; the
+integration resolves it through the target vacuum's OWN home-frame
+registration (`coordinator.home_px_to_mm`, Fáze 1) to that vacuum's real mm
+coordinates — same dispatch as today, just a different starting coordinate
+space. Raises a clear `HomeAssistantError` (naming exactly which field is
+missing, or that the vacuum has no home-frame registration yet) rather than
+schema-validator boilerplate.
+
+**`anyvac.snapshot_map_as_floorplan` composite** — `frame: "home"` (+
+optional `frame_id`) renders a floorplan PNG directly from a home frame's
+own aligned `floor_mask`/`wall_mask` rasters (light-grey floor, dark-grey
+wall, transparent background, nearest-neighbour upscaled — a floorplan
+background, not a photo) instead of snapshotting one vacuum's own map image;
+no `image_entity` involved on this path. `_select_home_frame` (new, shared
+with `export_map_guide` below per docs/14 rule 1) picks the frame with the
+most registered vacuums when `frame_id` is omitted, skipping any frame
+flagged `stale`.
+
+**`anyvac.export_map_guide` on the home frame** — `frame: "home"` draws every
+registered vacuum's rooms/dry/wet layers on ONE canvas instead of one
+vacuum's own geometry, and the `rooms` layer now draws each room's actual
+traced shape (`outline_home_px`, already published in kontrakt v3) rather
+than one vacuum's bounding-box rectangle. Rooms are de-duplicated by
+`home_room_id` so a room two robots share is drawn once, not twice.
+
+**`clean`/`plan` orchestration via `home_room_id`** — `CleanPlanner` now
+also indexes rooms by `home_room_id` (`home_room_owners`:
+`{home_room_id: {duid: segment_id}}`, `home_room_id_by_name`:
+`{name: home_room_id}`), so a room requested by ONE robot's name for
+`assign()`/`build_tasks()` now also considers any OTHER robot that owns the
+same physical room under a different name of its own — each robot is still
+dispatched to its OWN segment id for that room. Exact-name matching is tried
+first and remains the only behaviour when no home frame exists yet (fresh
+install, or a robot not yet registered) — nothing changes for a
+single-robot setup or a fleet without a home frame.
+
+### Notes
+
+docs/40 §4.3 describes a fourth possible input — `clean` itself taking
+home-frame pixel coordinates directly, alongside `goto`/`zone_clean`. Scoped
+out this phase: unlike `goto`/`zone_clean`, `clean` takes room names (and
+optionally pins), not a point to convert — a coordinate-based `frame: "home"`
+input doesn't have a natural shape for it. Its actual home-frame benefit —
+letting one `clean` call reach a room regardless of which robot's own name
+it uses — is exactly what `home_room_id` orchestration above provides
+instead, so it's folded into that piece rather than left as a gap.
+
+42 new tests this phase — `test_home_frame_services.py` (11: `goto`/
+`zone_clean` frame dispatch, missing-field errors, no-registration error
+message), `test_home_frame_composite.py` (9: composite PNG floor/wall
+colours, transparent background, padded crop, `_select_home_frame` id/
+most-robots/stale-skip/none-registered), `test_home_frame_guide.py` (10:
+`outline_home_px` → crop-local polygon translation and its malformed/
+degenerate-input skip cases, polygon drawing, occupied-crop padding) and
+`test_planner_home_room_id.py` (12: `__init__`'s `home_room_owners`/
+`home_room_id_by_name` population — including the no-home-frame-yet
+regression case — `_duid_owns_room`/`_segment_for` exact-name vs.
+cross-robot-pairing vs. neither, and end-to-end `assign()`/`build_tasks()`
+dispatching each robot's own segment id for a room paired only by
+`home_room_id`). Full suite: **232/232 green** (190 Fáze 1 baseline + 42
+new). No opencv/scipy/scikit-image; no second crop-box/room-outline/
+frame-selection implementation (docs/14 rule 1 —
+`_select_home_frame`/`_home_frame_occupied_crop_px` are each written and
+tested once, shared by both services that need them).
+
 ## [1.7.0] - 2026-09-14
 
 Fáze 1 of docs/40 ("home frame" — automatic multi-vacuum map calibration):

@@ -64,9 +64,16 @@ any manual "seat" configuration per robot:
 
 Every `*_home_px` field and `home_room_id` are `null`/empty for a vacuum with
 no home-frame registration (`home_frame: null`) — nothing here changes how a
-single-vacuum setup behaves. This is backend-only groundwork for now (Fáze 1
-of docs/40); no service yet accepts home-frame coordinates as input, and the
-card does not read these attributes.
+single-vacuum setup behaves.
+
+`goto`, `zone_clean`, `snapshot_map_as_floorplan` and `export_map_guide`
+(below) all accept this shared frame as an alternative to their normal
+per-vacuum input (`frame: "home"`, Fáze 2 of docs/40), and `clean`/`plan`
+transparently pair up the SAME physical room across two robots that each
+call it something different, once a home frame links them. The card itself
+does not read these attributes or send `frame: "home"` yet — this remains
+usable today only via `anyvac.*` service calls (e.g. from a script or the
+Developer Tools → Actions tab).
 
 ### Legacy millimetre attributes
 
@@ -138,10 +145,12 @@ closing) — the AnyVac card sends an *intent*, not a pre-built plan:
 
 | Service | What it does |
 | --- | --- |
-| `anyvac.clean` | Clean intent: `rooms` + `mode` (`dry`/`wet`/`both`) + optional `vacuums` restriction, per-room `pin`, and `settings`. The integration works out capability, room assignment (LPT-balanced), dry→wet gating and per-room pinning, then executes the resulting task list server-side — a wet-capable robot with 2+ rooms dispatches progressively as rooms become ready instead of waiting for all of them (docs/23). |
+| `anyvac.clean` | Clean intent: `rooms` + `mode` (`dry`/`wet`/`both`) + optional `vacuums` restriction, per-room `pin`, and `settings`. The integration works out capability, room assignment (LPT-balanced), dry→wet gating and per-room pinning, then executes the resulting task list server-side — a wet-capable robot with 2+ rooms dispatches progressively as rooms become ready instead of waiting for all of them (docs/23). Once a home frame links two robots (above), a room name still resolves to whichever robot actually owns that physical room even if that robot calls it something else — no need to repeat the same `clean` call once per robot's own name for it. |
 | `anyvac.plan` | Same planner as `anyvac.clean`, response-only — a preview of the assignment and estimated timeline without starting anything. |
-| `anyvac.goto` | Pin & go: `x_pct`/`y_pct` (percent of the rendered map image) → the integration converts to real coordinates and sends the robot. |
-| `anyvac.zone_clean` | Zone clean: two corners as percent of the map image, same conversion. |
+| `anyvac.goto` | Pin & go: `x_pct`/`y_pct` (percent of the rendered map image) → the integration converts to real coordinates and sends the robot. With `frame: "home"`, `x_home_px`/`y_home_px` (pixels in the shared home frame) instead. |
+| `anyvac.zone_clean` | Zone clean: two corners as percent of the map image, same conversion (or `frame: "home"` + `*_home_px` corners). |
+| `anyvac.snapshot_map_as_floorplan` | Saves a map image entity's picture as the shared floorplan file. With `frame: "home"`, renders a composite of every vacuum registered into the shared home frame instead, straight from their aligned floor/wall masks — no single vacuum's `image_entity` involved. |
+| `anyvac.export_map_guide` | Draws room-boundary/dry/wet tracing-aid layers for one vacuum's map. With `frame: "home"`, draws every vacuum's rooms and paths on one canvas, with each room's real traced outline (`outline_home_px`) instead of one vacuum's bounding box. |
 | `anyvac.cancel` | Stops the running job and (by default) returns started robots to base. |
 | `anyvac.select_rooms` / `anyvac.pin_room` / `anyvac.set_layers` / `anyvac.set_room_sequence` / `anyvac.reset_learning` | UI/learning state — room selection, per-room robot pinning, dry/wet layer visibility, the Roborock app's room order (used for ETA), and clearing bad learned estimates. |
 
