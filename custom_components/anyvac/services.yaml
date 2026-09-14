@@ -571,6 +571,20 @@ snapshot_map_as_floorplan:
         the image entity's object id, or "home_frame" with frame: "home".
       selector:
         text:
+    fiducials:
+      name: Embed fiducial markers
+      description: >-
+        docs/40 §5.A.2, frame: "home" only. Embeds 4 invisible markers in
+        the snapshot's padding border so a copy of the file that's later
+        cropped/resized/rotated in an external editor can resolve its exact
+        scale, offset and rotation via anyvac.detect_floorplan_fiducials —
+        with no clicking. Only works if the file's alpha channel survives
+        the edit (stays PNG, never flattened/re-exported as JPEG). Off by
+        default — invisible either way, but skips the extra drawing step
+        when you don't need it.
+      default: false
+      selector:
+        boolean:
 
 export_map_guide:
   name: Export map guide layers
@@ -713,3 +727,35 @@ snap_wall_corner:
       required: true
       selector:
         number:
+
+detect_floorplan_fiducials:
+  name: Detect floorplan fiducial markers
+  description: >-
+    docs/40 §5.A.2. Scans a floorplan file for the invisible fiducial
+    markers anyvac.snapshot_map_as_floorplan embedded when called with
+    fiducials: true, and returns home_anchors pairs in exactly the shape
+    image_base.home_anchors already stores (docs/40 §5.B) — the card writes
+    them straight into config, calibrated with zero clicks. Requires at
+    least 2 of the 4 markers to still be present and to have kept their
+    alpha channel intact (a file re-exported as JPEG, or flattened in an
+    editor, loses them).
+  fields:
+    path:
+      name: Floorplan file
+      description: >-
+        The /local/anyvac/... file to scan — normally the same file the
+        user has since edited externally after it was first saved by
+        anyvac.snapshot_map_as_floorplan (fiducials: true).
+      required: true
+      selector:
+        text:
+    fiducials:
+      name: Known marker positions
+      description: >-
+        The exact `fiducials` list anyvac.snapshot_map_as_floorplan
+        returned when it embedded the markers — passed through unchanged,
+        never re-derived.
+      required: true
+      example: '[{"id": "tl", "home_px": {"x": 12, "y": 8}}]'
+      selector:
+        object:

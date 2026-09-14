@@ -80,6 +80,7 @@ SERVICE_SNAPSHOT_FLOORPLAN = "snapshot_map_as_floorplan"
 SERVICE_EXPORT_MAP_GUIDE = "export_map_guide"
 SERVICE_DUMP_RAW_MAP = "dump_raw_map"
 SERVICE_SNAP_WALL_CORNER = "snap_wall_corner"
+SERVICE_DETECT_FIDUCIALS = "detect_floorplan_fiducials"
 
 ALL_SERVICES = (
     SERVICE_RUN_JOB,
@@ -102,6 +103,7 @@ ALL_SERVICES = (
     SERVICE_EXPORT_MAP_GUIDE,
     SERVICE_DUMP_RAW_MAP,
     SERVICE_SNAP_WALL_CORNER,
+    SERVICE_DETECT_FIDUCIALS,
 )
 
 JOB_TIMEOUT_SECONDS = 3 * 3600  # safety: tear down a stuck job after 3 h
@@ -276,6 +278,30 @@ SNAP_WALL_CORNER_SCHEMA = vol.Schema(
         vol.Required("y_home_px"): vol.Coerce(float),
     }
 )
+# docs/40 §5.A.2: pairs with `snapshot_map_as_floorplan`'s `fiducials: true` —
+# `fiducials` here is exactly the `{id, home_px}` list that call returned when
+# it embedded the markers (the card just threads it through unmodified), so
+# this service never has to re-derive or store where a marker was placed;
+# `path` is the (possibly now cropped/resized/rotated) floorplan file to scan,
+# same `/local/anyvac/...` shape every snapshot/upload already produces.
+DETECT_FIDUCIALS_SCHEMA = vol.Schema(
+    {
+        vol.Required("path"): str,
+        vol.Required("fiducials"): [
+            vol.Schema(
+                {
+                    vol.Required("id"): str,
+                    vol.Required("home_px"): vol.Schema(
+                        {
+                            vol.Required("x"): vol.Coerce(float),
+                            vol.Required("y"): vol.Coerce(float),
+                        }
+                    ),
+                }
+            )
+        ],
+    }
+)
 # docs/30 §4a field follow-up (2026-07-30): merged mode's per-vacuum auto-seat
 # fit is hard-disabled without a shared floorplan image (`_editorSeat`/
 # `_effectiveSeat` both bail to manual sliders when `image_base.src` is
@@ -301,6 +327,13 @@ SNAPSHOT_FLOORPLAN_SCHEMA = vol.Schema(
         vol.Optional("frame"): vol.In(["home"]),
         vol.Optional("frame_id"): str,
         vol.Optional("name"): str,
+        # docs/40 §5.A.2: opt-in, `frame: "home"` only (ignored otherwise — a
+        # per-vacuum photographed map has no frame-px coordinate space to
+        # place a marker in). Embeds 4 invisible fiducial markers in the
+        # snapshot's own padding border; response gains a `fiducials` list
+        # the card threads straight into `anyvac.detect_floorplan_fiducials`
+        # later, once the file has been cropped/resized externally.
+        vol.Optional("fiducials", default=False): bool,
     }
 )
 # docs/37: draws room-boundary / dry-path / wet-path guides as transparent PNGs
@@ -571,7 +604,69 @@ def _home_frame_occupied_crop_px(frame: dict[str, Any]) -> tuple[int, int, int, 
     return _padded_crop_box(bbox_px, full_w, full_h)
 
 
-def _home_frame_composite_png(frame: dict[str, Any]) -> tuple[bytes, tuple[int, int, int, int]]:
+# docs/40 §5.A.2 — how far a marker sits inset from each corner of the crop
+# box, as a fraction of the box's own smaller dimension, and the clamped
+# range for its drawn half-side (both in home px). Kept small enough to sit
+# inside `FLOORPLAN_CROP_PADDING_FRAC`'s (8%) border on a typical home, large
+# enough to survive a moderate resize.
+FIDUCIAL_INSET_FRAC = 0.035
+FIDUCIAL_MARKER_HALF_PX_RANGE = (4, 20)
+
+
+def _fiducial_marker_specs(box: tuple[int, int, int, int]) -> list[dict[str, Any]]:
+    """Pure helper: where `_embed_fiducial_markers` draws each of the 4
+    fiducial markers (docs/40 §5.A.2), in the SAME home-px coordinate space
+    `box` and every other `*_home_px` value already uses — i.e. BEFORE the
+    crop, so a marker's reported position is a normal absolute point on the
+    frame, unaffected by which crop box a particular snapshot happened to
+    use. Inset from each corner of `box` so markers land inside the cosmetic
+    padding border around the occupied floor, not on top of real floor/wall
+    pixels — though on a home whose explored area already reaches the frame
+    canvas edge (pad clamped near 0 on that side, see `_padded_crop_box`) a
+    marker can still land on real content; harmless for detection (colour,
+    not position, identifies a marker) but not perfectly invisible in that
+    corner — an accepted rough edge of a deliberately cheap, opt-in feature.
+    Returns `[{"id", "x", "y", "half"}, ...]`, one per corner."""
+    left, top, right, bottom = box
+    w, h = right - left, bottom - top
+    inset = min(w, h) * FIDUCIAL_INSET_FRAC
+    lo, hi = FIDUCIAL_MARKER_HALF_PX_RANGE
+    half = max(lo, min(hi, round(min(w, h) * 0.01)))
+    corners = {
+        "tl": (left + inset, top + inset),
+        "tr": (right - inset, top + inset),
+        "bl": (left + inset, bottom - inset),
+        "br": (right - inset, bottom - inset),
+    }
+    return [{"id": mid, "x": x, "y": y, "half": half} for mid, (x, y) in corners.items()]
+
+
+def _embed_fiducial_markers(img: Any, box: tuple[int, int, int, int]) -> list[dict[str, Any]]:
+    """Draws the 4 markers `_fiducial_marker_specs` places onto `img` (the
+    FULL, pre-crop composite canvas `_home_frame_composite_png` builds) at
+    `FIDUCIAL_MARKER_ALPHA` — near-fully-transparent, so invisible once the
+    file is viewed/composited normally, but recoverable at the raw-pixel
+    level by `homeframe.find_fiducial_markers` as long as the alpha channel
+    survives whatever the user does to the file afterwards. Mutates `img`
+    (a PIL RGBA Image) in place; returns `[{"id", "home_px"}, ...]` ready to
+    hand straight back in the service response."""
+    from PIL import ImageDraw
+
+    from .homeframe import FIDUCIAL_MARKER_ALPHA, FIDUCIAL_MARKER_COLORS
+
+    draw = ImageDraw.Draw(img)
+    out: list[dict[str, Any]] = []
+    for spec in _fiducial_marker_specs(box):
+        mid, x, y, half = spec["id"], spec["x"], spec["y"], spec["half"]
+        r, g, b = FIDUCIAL_MARKER_COLORS[mid]
+        draw.rectangle([x - half, y - half, x + half, y + half], fill=(r, g, b, FIDUCIAL_MARKER_ALPHA))
+        out.append({"id": mid, "home_px": {"x": x, "y": y}})
+    return out
+
+
+def _home_frame_composite_png(
+    frame: dict[str, Any], fiducials: bool = False
+) -> tuple[bytes, tuple[int, int, int, int], list[dict[str, Any]]]:
     """Blocking (run via `hass.async_add_executor_job`, like
     `_crop_image_to_bbox`) — but RENDERS a floorplan PNG from the frame's own
     `floor_mask`/`wall_mask` rasters instead of cropping an existing
@@ -582,9 +677,13 @@ def _home_frame_composite_png(frame: dict[str, Any]) -> tuple[bytes, tuple[int, 
     never a per-cell Python loop) and upscales by `HOME_PX_SCALE` with
     NEAREST resampling (a floorplan background, not a photo — no smoothing
     across cell boundaries). Crops to `_home_frame_occupied_crop_px` (shared
-    with `export_map_guide`'s home-frame branch, docs/14 rule 1). Returns
-    (png_bytes, crop_box) with crop_box = (left, top, right, bottom) in home
-    px."""
+    with `export_map_guide`'s home-frame branch, docs/14 rule 1). When
+    `fiducials` is set (docs/40 §5.A.2), draws the 4 invisible markers onto
+    the canvas BEFORE cropping (`_embed_fiducial_markers`) — same crop box,
+    so their reported home_px lines up with everything else `frame: "home"`
+    publishes. Returns (png_bytes, crop_box, markers) with crop_box =
+    (left, top, right, bottom) in home px and markers = `[]` unless
+    `fiducials` was set."""
     from PIL import Image
 
     from .homeframe import HOME_PX_SCALE
@@ -602,10 +701,76 @@ def _home_frame_composite_png(frame: dict[str, Any]) -> tuple[bytes, tuple[int, 
         (max(1, round(width * scale)), max(1, round(height * scale))), Image.NEAREST
     )
     box = _home_frame_occupied_crop_px(frame)
+    markers = _embed_fiducial_markers(img, box) if fiducials else []
     cropped = img.crop(box)
     buf = io.BytesIO()
     cropped.save(buf, format="PNG")
-    return buf.getvalue(), box
+    return buf.getvalue(), box, markers
+
+
+def _resolve_local_www_path(hass: HomeAssistant, path: str) -> str:
+    """Pure helper: resolves a `/local/...` URL (optionally with a `?query`
+    cache-buster, same shape `snapshot_map_as_floorplan` itself returns) back
+    to the real file on disk under `config/www/` — the only location this
+    integration (and docs/39's own manual-upload flow) ever writes/expects a
+    floorplan file. Raises ValueError for anything else (an external URL, an
+    absolute filesystem path, an `image_entity` id) naming what IS supported,
+    rather than silently guessing."""
+    raw = path.split("?", 1)[0]
+    if not raw.startswith("/local/"):
+        raise ValueError(
+            "expected a '/local/...' file path (as returned by "
+            "anyvac.snapshot_map_as_floorplan, or a file uploaded under "
+            f"config/www/), got: {path!r}"
+        )
+    rel = raw[len("/local/") :]
+    return hass.config.path("www", *rel.split("/"))
+
+
+def _detect_fiducials(image_bytes: bytes, known: list[dict[str, Any]]) -> dict[str, Any]:
+    """Blocking (run via executor, same split as `_home_frame_composite_png`)
+    — opens `image_bytes` as RGBA, scans it for the fiducial markers
+    (`homeframe.find_fiducial_markers`), and pairs whatever it finds against
+    `known` (the `{id, home_px}` list `snapshot_map_as_floorplan` returned
+    when it embedded them) to produce `home_anchors` pairs in EXACTLY the
+    `{home_px, floor_pct}` shape cesta B's `image_base.home_anchors` already
+    stores (docs/14 rule 1 — no second anchor format): `floor_pct` is the
+    detected pixel centroid normalised by the image's OWN current
+    width/height, the identical percentage space every other floorplan-%
+    coordinate in this project already uses — so it stays correct no matter
+    how the file was cropped/resized/rotated since the snapshot."""
+    from PIL import Image
+
+    from .homeframe import find_fiducial_markers
+
+    with Image.open(io.BytesIO(image_bytes)) as im:
+        im = im.convert("RGBA")
+        width, height = im.size
+        rgba = np.array(im)
+
+    detected = find_fiducial_markers(rgba)
+    anchors: list[dict[str, Any]] = []
+    missing: list[str] = []
+    for item in known:
+        mid = item["id"]
+        px = detected.get(mid)
+        if px is None:
+            missing.append(mid)
+            continue
+        x, y = px
+        anchors.append(
+            {
+                "home_px": {"x": item["home_px"]["x"], "y": item["home_px"]["y"]},
+                "floor_pct": {"x": x / width * 100.0, "y": y / height * 100.0},
+            }
+        )
+    return {
+        "home_anchors": anchors,
+        "found": len(anchors),
+        "missing": missing,
+        "image_width": width,
+        "image_height": height,
+    }
 
 
 # ── Guide layer export (docs/37) ───────────────────────────────────────────
@@ -1474,8 +1639,8 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
             frame_id, frame = _select_home_frame(
                 hass, call.data.get("frame_id"), service="snapshot_map_as_floorplan"
             )
-            content, crop_box = await hass.async_add_executor_job(
-                _home_frame_composite_png, frame
+            content, crop_box, markers = await hass.async_add_executor_job(
+                _home_frame_composite_png, frame, call.data.get("fiducials", False)
             )
             filename = _floorplan_filename(call.data.get("name") or "home_frame", "image/png")
             target_dir = hass.config.path("www", "anyvac")
@@ -1499,12 +1664,15 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
                 "AnyVac: snapshotted home frame %s (%d robots) -> %s",
                 frame_id, len(frame.get("robots") or {}), target_path,
             )
-            return {
+            result: dict[str, Any] = {
                 "path": url,
                 "frame": "home",
                 "frame_id": frame_id,
                 "crop": {"x0": left, "y0": top, "x1": right, "y1": bottom},
             }
+            if markers:
+                result["fiducials"] = markers
+            return result
 
         if "image_entity" not in call.data:
             raise HomeAssistantError(
@@ -1905,6 +2073,47 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
             _snap_wall_corner, frame_id, frame, call.data["x_home_px"], call.data["y_home_px"]
         )
 
+    async def _handle_detect_fiducials(call: ServiceCall) -> dict[str, Any]:
+        # docs/40 §5.A.2: `fiducials` here is the exact `{id, home_px}` list
+        # `snapshot_map_as_floorplan` returned earlier — the card threads it
+        # through unmodified, no re-derivation. Heavy lifting is
+        # `_detect_fiducials` (pure, unit tested directly, same split as
+        # `_snap_wall_corner`/`_home_frame_composite_png`); this closure only
+        # resolves the file path and reads it.
+        try:
+            target_path = _resolve_local_www_path(hass, call.data["path"])
+        except ValueError as err:
+            raise HomeAssistantError(f"anyvac.detect_floorplan_fiducials: {err}") from err
+
+        def _read() -> bytes:
+            with open(target_path, "rb") as f:
+                return f.read()
+
+        try:
+            image_bytes = await hass.async_add_executor_job(_read)
+        except OSError as err:
+            raise HomeAssistantError(
+                f"anyvac.detect_floorplan_fiducials: could not read '{target_path}': {err}"
+            ) from err
+
+        try:
+            result = await hass.async_add_executor_job(
+                _detect_fiducials, image_bytes, call.data["fiducials"]
+            )
+        except Exception as err:  # noqa: BLE001 - surface as one clear service error
+            raise HomeAssistantError(
+                f"anyvac.detect_floorplan_fiducials: could not read image '{target_path}': {err}"
+            ) from err
+
+        if result["found"] == 0:
+            raise HomeAssistantError(
+                "anyvac.detect_floorplan_fiducials: no fiducial markers found in "
+                f"'{target_path}' — the file may have lost its alpha channel (e.g. "
+                "re-exported as JPEG, or flattened in an editor), or none of the "
+                "marked corners survived the crop"
+            )
+        return result
+
     async def _handle_cancel(call: ServiceCall) -> None:
         started = _cancel_jobs(hass)
         if call.data.get("return_to_base", True) and started:
@@ -1936,6 +2145,7 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
         (SERVICE_EXPORT_MAP_GUIDE, _handle_export_map_guide, EXPORT_MAP_GUIDE_SCHEMA, SupportsResponse.ONLY),
         (SERVICE_DUMP_RAW_MAP, _handle_dump_raw_map, DUMP_RAW_MAP_SCHEMA, SupportsResponse.ONLY),
         (SERVICE_SNAP_WALL_CORNER, _handle_snap_wall_corner, SNAP_WALL_CORNER_SCHEMA, SupportsResponse.ONLY),
+        (SERVICE_DETECT_FIDUCIALS, _handle_detect_fiducials, DETECT_FIDUCIALS_SCHEMA, SupportsResponse.ONLY),
     ]
     for name, handler, schema, supports in registrations:
         if not hass.services.has_service(DOMAIN, name):

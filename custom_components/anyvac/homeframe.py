@@ -769,6 +769,78 @@ def nearest_wall_corner_mm(
     return (float(vx * cell_mm + ox_mm), float(vy * cell_mm + oy_mm))
 
 
+# ── Fiducial markers for cesta A hardening (docs/40 §5.A.2) ──────────────────
+# Deliberately deferred until §5.A.1 (canvas-scale tolerance) and §5.B (cesta
+# B N-point calibration) alone weren't enough — this is the "cheap hack" the
+# original ratification flagged: invisible markers baked into a home-frame
+# snapshot's own 8% padding border, so a floorplan cropped/resized/ROTATED in
+# an external editor can still resolve its exact scale+offset+rotation with
+# zero clicks, PROVIDED the file's alpha channel survives the edit intact (a
+# flattened image, or one re-exported as JPEG, loses the markers — this only
+# works for a non-destructive PNG round-trip). Opt-in (`fiducials: true` on
+# `anyvac.snapshot_map_as_floorplan`) for exactly that reason.
+
+FIDUCIAL_MARKER_COLORS: dict[str, tuple[int, int, int]] = {
+    "tl": (255, 0, 0),  # red
+    "tr": (0, 200, 0),  # green
+    "bl": (0, 0, 255),  # blue
+    "br": (255, 200, 0),  # yellow
+}
+# Out of 255 — a real photographed/scanned floorplan essentially never has a
+# near-fully-transparent pixel, so "low alpha AND close to one of the 4
+# marker colours" is a safe, simple signature; not literally 0 so a marker
+# surviving an interpolated resize still centres on values very close to
+# this rather than snapping to fully opaque on the first blended pixel.
+FIDUCIAL_MARKER_ALPHA = 1
+FIDUCIAL_ALPHA_MAX = 40  # generous margin for resize interpolation
+FIDUCIAL_COLOR_TOLERANCE = 40  # max per-channel-ish distance (squared euclidean below)
+
+
+def find_fiducial_markers(
+    rgba: np.ndarray, colors: dict[str, tuple[int, int, int]] | None = None
+) -> dict[str, tuple[float, float] | None]:
+    """Scans an RGBA image array (H, W, >=4, uint8) for the invisible
+    fiducial markers `services._embed_fiducial_markers` draws into a
+    home-frame snapshot. Colour identity — not position — is what tells the
+    4 markers apart, so this naturally survives the file being rotated or
+    mirrored since the snapshot was taken: the caller pairs whatever it
+    finds against the `{id, home_px}` list the snapshot service returned
+    when it embedded them, and feeds `{detected_px, known_home_px}` straight
+    into the SAME `home_anchors` similarity fit cesta B already computes
+    (`homeAnchorFit`, seatfit.ts) — no second, marker-specific geometry
+    (docs/14 rule 1).
+
+    Vectorised (no per-pixel Python loop, same discipline as
+    `wall_corner_points`): for each of the 4 known colours, mask every pixel
+    within `FIDUCIAL_COLOR_TOLERANCE` (squared euclidean, RGB) of it and at
+    or below `FIDUCIAL_ALPHA_MAX` alpha, then take the centroid of the
+    matching pixels — robust to a moderate resize blurring the marker's
+    edges, since the interior pixels still match closely and dominate the
+    mean.
+
+    Returns `{id: (x, y) | None}` — pixel centroid in THIS array's own
+    coordinate space (+0.5 to land on pixel centres), `None` for a colour no
+    pixel matched at all (marker cropped away, or the file lost its alpha
+    channel — e.g. re-saved without transparency)."""
+    colors = colors or FIDUCIAL_MARKER_COLORS
+    if rgba.ndim != 3 or rgba.shape[2] < 4:
+        return {mid: None for mid in colors}
+    # int32, not int16: a squared 3-channel distance can reach 3*255**2 =
+    # 195_075, which overflows int16 (max 32_767) and silently wraps
+    # negative — int32's ~2.1e9 ceiling leaves no such risk.
+    r = rgba[..., 0].astype(np.int32)
+    g = rgba[..., 1].astype(np.int32)
+    b = rgba[..., 2].astype(np.int32)
+    alpha_ok = rgba[..., 3].astype(np.int32) <= FIDUCIAL_ALPHA_MAX
+    results: dict[str, tuple[float, float] | None] = {}
+    for mid, (mr, mg, mb) in colors.items():
+        dist2 = (r - mr) ** 2 + (g - mg) ** 2 + (b - mb) ** 2
+        mask = alpha_ok & (dist2 <= FIDUCIAL_COLOR_TOLERANCE**2)
+        ys, xs = np.nonzero(mask)
+        results[mid] = None if xs.size == 0 else (float(xs.mean()) + 0.5, float(ys.mean()) + 0.5)
+    return results
+
+
 # ── Cross-robot room identity (docs/40 §4.1) ──────────────────────────────────
 
 

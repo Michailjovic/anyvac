@@ -90,6 +90,21 @@ seat. The card re-fits those pairs live every render against the frame's
 *current* size, so it keeps working as the frame's canvas grows (the robots
 exploring further) without asking you to re-click anything.
 
+For that same floorplan-of-your-own case, `anyvac-card` ≥ 1.9.0 also offers
+a third, zero-click path (docs/40 §5.A.2, "fiducial markers") when clicking
+through calibration isn't convenient — e.g. the file also needs rotating,
+not just cropping. The editor's "Snapshot home frame with markers" button
+saves a home-frame snapshot with 4 invisible markers baked into its own
+border (`anyvac.snapshot_map_as_floorplan`, `fiducials: true`); crop/resize/
+rotate that file in an external editor as needed, keeping it as PNG and
+without flattening it; then "Detect markers in edited file" calls
+`anyvac.detect_floorplan_fiducials` to resolve the exact result and write
+the SAME `image_base.home_anchors` shape the manual flow above produces —
+one less thing for the rest of the card to know about. This only works if
+the file's alpha channel survives the edit; a flattened image or one
+re-exported as JPEG loses the markers, which is exactly why it's opt-in and
+positioned as a last resort in the editor.
+
 ### Legacy millimetre attributes
 
 The small mm-space fields — `vacuum_position`, `charger`, `calibration_points`
@@ -167,6 +182,7 @@ closing) — the AnyVac card sends an *intent*, not a pre-built plan:
 | `anyvac.snapshot_map_as_floorplan` | Saves a map image entity's picture as the shared floorplan file. With `frame: "home"`, renders a composite of every vacuum registered into the shared home frame instead, straight from their aligned floor/wall masks — no single vacuum's `image_entity` involved. |
 | `anyvac.export_map_guide` | Draws room-boundary/dry/wet tracing-aid layers for one vacuum's map. With `frame: "home"`, draws every vacuum's rooms and paths on one canvas, with each room's real traced outline (`outline_home_px`) instead of one vacuum's bounding box. |
 | `anyvac.snap_wall_corner` | Snaps a home-frame pixel point to the nearest wall corner detected from that frame's own wall mask — response-only, `{frame_id?, x_home_px, y_home_px}` in, `{frame_id, snapped, x_home_px, y_home_px, distance_px?}` back (`snapped: false` echoes the input unchanged when the frame has no wall data yet). Used by the card's editor while calibrating a foreign-origin floorplan against the home frame (docs/40 §5.B) to remove most click noise — not something you'd normally call directly. |
+| `anyvac.detect_floorplan_fiducials` | Scans a floorplan file for the invisible fiducial markers `snapshot_map_as_floorplan` embedded (`fiducials: true`) and returns `home_anchors` calibration pairs with zero clicking (docs/40 §5.A.2) — response-only, `{path, fiducials}` in, `{home_anchors, found, missing, image_width, image_height}` back. Only works if the file kept its alpha channel through whatever crop/resize/rotate you did to it externally; not something you'd normally call directly — the editor's "Detect markers in edited file" button does. |
 | `anyvac.cancel` | Stops the running job and (by default) returns started robots to base. |
 | `anyvac.select_rooms` / `anyvac.pin_room` / `anyvac.set_layers` / `anyvac.set_room_sequence` / `anyvac.reset_learning` | UI/learning state — room selection, per-room robot pinning, dry/wet layer visibility, the Roborock app's room order (used for ETA), and clearing bad learned estimates. |
 

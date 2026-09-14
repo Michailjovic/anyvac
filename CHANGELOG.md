@@ -4,6 +4,86 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.10.0] - 2026-09-14
+
+Docs/40 §5.A.2 — fiducial markers, the "cheap hack" hardening path for cesta
+A explicitly deferred at ratification time until the canvas-scale tolerance
+(§5.A.1, 1.7.1) and cesta B's manual N-point calibration (§5.B, 1.9.0) alone
+weren't enough. Paired with anyvac-card 1.9.0.
+
+### Added
+
+**`homeframe.find_fiducial_markers(rgba, colors=None)`** — a vectorised
+colour/alpha scan (no per-pixel Python loop, no opencv/scipy/scikit-image)
+that locates each of 4 invisible markers in an RGBA image array by centroid:
+"low alpha (≤40) AND close to one of 4 highly saturated, mutually distinct
+colours" is a safe signature a real photographed/scanned floorplan is
+vanishingly unlikely to contain by accident. Colour identity — not
+position — is what tells the 4 corners apart, so detection naturally
+survives the file being rotated or mirrored after the snapshot was taken.
+
+**`anyvac.snapshot_map_as_floorplan` gained `fiducials: true`** (`frame:
+"home"` only, opt-in, off by default) — draws the 4 markers into the
+composite's own padding border before cropping (`_embed_fiducial_markers`/
+`_fiducial_marker_specs`, `services.py`) at `alpha=1/255`, functionally
+invisible once the file is viewed or composited normally (max pixel drift
+≤2/255 when flattened onto a solid background — verified by test, not
+assumed). The response gains a `fiducials: [{id, home_px}]` list recording
+exactly where each marker was placed, in the same absolute home-px space
+every other `*_home_px` value already uses.
+
+**New service `anyvac.detect_floorplan_fiducials`** — `{path, fiducials}`
+in (`fiducials` is the exact list the snapshot call above returned,
+threaded through unmodified), `{home_anchors, found, missing, image_width,
+image_height}` back. `path` must be a `/local/anyvac/...` file (the same
+snapshot, now possibly cropped/resized/rotated in an external editor, or
+any other file already under `config/www/` — `_resolve_local_www_path`
+resolves either back to the real filesystem path, rejecting anything else
+with a clear error naming what IS supported). `_detect_fiducials` (pure,
+unit-tested directly like `_snap_wall_corner`) pairs whatever markers it
+finds against the known `home_px` positions to produce `home_anchors` pairs
+in EXACTLY the `{home_px, floor_pct}` shape cesta B's own
+`image_base.home_anchors` already stores (docs/14 rule 1 — no second anchor
+format) — the card writes the result straight into config, calibrated with
+zero clicks. Raises a clear `HomeAssistantError` when nothing was found
+(most likely cause: the file lost its alpha channel — re-exported as JPEG,
+or flattened in an editor) rather than silently writing an empty/degenerate
+calibration.
+
+This only works for a non-destructive PNG round-trip — deliberately opt-in
+and positioned as a last-resort option in the card's UI, exactly the "cheap
+hack" framing from the original docs/40 ratification.
+
+17 new tests: 3 in `tests/test_home_frame_composite.py` (embedding —
+byte-identical output with `fiducials=False`, all 4 markers land inside the
+crop box at their drawn colour, and the visual-negligibility claim above is
+itself asserted, not just described), `tests/test_fiducial_markers.py`
+(new, 14 — `find_fiducial_markers` colour/alpha/tolerance/rotation-agnostic
+behaviour, `_resolve_local_www_path`'s URL shuttle, `_detect_fiducials`'
+home_anchors/floor_pct math and missing-marker handling), plus every
+pre-existing `_home_frame_composite_png` call site updated for its new
+3-tuple return (`png, box, markers`) with `fiducials` left at its default
+elsewhere. Full suite 265/265 (248 + 17 new — see also the housekeeping
+note below).
+
+A real bug was caught by the new tests before release: the first version of
+`find_fiducial_markers` computed the squared 3-channel colour distance in
+`int16`, which overflows (max 32,767) for a genuinely distant colour pair
+(up to 3×255² = 195,075) and silently wraps negative — every colour matched
+every marker. Fixed by widening to `int32`.
+
+### Fixed (housekeeping)
+
+Three existing, already-passing test files from Fáze 2
+(`test_home_frame_composite.py`, `test_home_frame_guide.py`,
+`test_home_frame_services.py` — `_home_frame_composite_png`/
+`_select_home_frame`, the `export_map_guide` home-frame drawing half, and
+`_target_mm_for`/`_target_zone_mm_for`'s `frame: "home"` targeting,
+respectively) had never actually been committed to the repository, despite
+their test counts being included in every prior CHANGELOG's running total —
+a gap from that phase's own closing step, not anything broken. Committed
+now alongside this release; no code changes needed, they passed as-is.
+
 ## [1.9.0] - 2026-09-14
 
 Docs/40 §5.B ("cesta B" — calibrating a foreign-origin floorplan against the
