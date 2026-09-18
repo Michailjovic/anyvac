@@ -40,6 +40,7 @@ or mm math on the card side:
 | `rooms_progress` | per-room debug progress: `{room: {spatial_pct, visited_cells, total_cells, time_pct, elapsed_s, est_s}}` |
 | `rooms_last_cleaned` | per-room last-cleaned info by clean type (mirrors the timestamp sensors below) |
 | `room_sequence` / `room_pins` / `selected_rooms` / `view_layers` | orchestration/UI state the card reads and writes via services below |
+| `floorplan_seats` | Align mode manual seating override layer (docs/41), keyed by floorplan `image_base.src` — set/cleared via `anyvac.set_floorplan_seat`, merged over config by the card |
 | `pipeline_ok` / `pipeline_error` | integration self-diagnostic for the current poll |
 | `duid`, `calib_debug`, `transit_cells` | diagnostics — device id, calibration solve debug info, "seen but not counted" cells outside the active job's room scope |
 
@@ -185,6 +186,7 @@ closing) — the AnyVac card sends an *intent*, not a pre-built plan:
 | `anyvac.detect_floorplan_fiducials` | Scans a floorplan file for the invisible fiducial markers `snapshot_map_as_floorplan` embedded (`fiducials: true`) and returns `home_anchors` calibration pairs with zero clicking (docs/40 §5.A.2) — response-only, `{path, fiducials}` in, `{home_anchors, found, missing, image_width, image_height}` back. Only works if the file kept its alpha channel through whatever crop/resize/rotate you did to it externally; not something you'd normally call directly — the editor's "Detect markers in edited file" button does. |
 | `anyvac.cancel` | Stops the running job and (by default) returns started robots to base. |
 | `anyvac.select_rooms` / `anyvac.pin_room` / `anyvac.set_layers` / `anyvac.set_room_sequence` / `anyvac.reset_learning` | UI/learning state — room selection, per-room robot pinning, dry/wet layer visibility, the Roborock app's room order (used for ETA), and clearing bad learned estimates. |
+| `anyvac.set_floorplan_seat` | Save or clear a manual Align mode floorplan seating override (docs/41 §4.6) — `vacuum` + `map` for one vacuum's seat, or `image_base` alone for the card-level floorplan override; either set to `null` clears it. Shared across every dashboard/browser showing that floorplan. |
 
 A task started by `anyvac.clean` runs once its gating conditions (`anyvac_room_done` per
 room, or `anyvac_clean_finished` per vacuum) are met, so a wet robot follows a dry robot per

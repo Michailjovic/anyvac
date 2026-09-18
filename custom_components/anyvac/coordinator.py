@@ -1165,6 +1165,18 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # same way as the room selection). Persisted across restarts.
         self._layers_store: Store = Store(hass, 1, f"{DOMAIN}_view_layers")
         self._view_layers: dict[str, bool] = {"dry": True, "wet": False}
+        # Align mode manual seating override layer (docs/41 §4.6), keyed by
+        # floorplan identity (`image_base.src`, exactly as the config has it —
+        # no normalization): {src: {"vacuums": {entity: {rotation, scale,
+        # scale_y?, offset_x, offset_y}}, "image_base": dict|None, "updated":
+        # iso}}. `image_base`'s own shape (crop_box/home_anchors) is phase G —
+        # stored/returned opaquely, never interpreted here. Shared across
+        # devices/dashboards like room_pins/view_layers above, for the same
+        # reason: one alignment should apply to every card showing that
+        # floorplan, not be duplicated per-dashboard. Persisted across
+        # restarts.
+        self._seats_store: Store = Store(hass, 1, f"{DOMAIN}_floorplan_seats")
+        self._floorplan_seats: dict[str, dict[str, Any]] = {}
         # Debug watermarks (docs/17 §2): goto/predicted paths are TRANSIENT — they only
         # exist while the robot navigates and are gone by the time anyone reads the
         # sensor manually. Remember the last non-empty sighting per vacuum so a regular
@@ -1375,6 +1387,78 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         if wet is not None:
             self._view_layers["wet"] = bool(wet)
         self._layers_store.async_delay_save(lambda: dict(self._view_layers), 2)
+        self.async_update_listeners()
+
+    @property
+    def floorplan_seats(self) -> dict[str, dict[str, Any]]:
+        """Align mode override layer (docs/41 §4.6), keyed by floorplan `src`."""
+        return {
+            src: {
+                "vacuums": {ent: dict(m) for ent, m in entry.get("vacuums", {}).items()},
+                "image_base": dict(entry["image_base"]) if entry.get("image_base") else None,
+                "updated": entry.get("updated"),
+            }
+            for src, entry in self._floorplan_seats.items()
+        }
+
+    def set_floorplan_seat(
+        self,
+        floorplan: str,
+        vacuum: str | None = None,
+        map: dict[str, float] | None = None,
+        image_base: dict[str, Any] | None = None,
+    ) -> None:
+        """Set or clear a manual floorplan seat override (anyvac.set_floorplan_seat,
+        docs/41 §4.6).
+
+        `vacuum` given → this call is about that vacuum's `map` (``None``
+        clears just that vacuum's override). `vacuum` omitted → this call is
+        about the card-level `image_base` override instead (``None`` clears
+        it). The two never mix in one call, matching how the card always
+        sends one or the other (never both) — see §4.6's service contract.
+        `image_base`'s own shape (crop_box/home_anchors, phase G) is opaque
+        here: stored and returned as-is, never interpreted.
+        """
+        floorplan = str(floorplan)
+        if vacuum:
+            vacuum = str(vacuum)
+            if map is None:
+                entry = self._floorplan_seats.get(floorplan)
+                if entry is not None:
+                    entry.get("vacuums", {}).pop(vacuum, None)
+            else:
+                entry = self._floorplan_seats.setdefault(
+                    floorplan, {"vacuums": {}, "image_base": None}
+                )
+                rounded: dict[str, float] = {
+                    "rotation": round(float(map["rotation"]), 2),
+                    "scale": round(float(map["scale"]), 2),
+                    "offset_x": round(float(map["offset_x"]), 2),
+                    "offset_y": round(float(map["offset_y"]), 2),
+                }
+                if map.get("scale_y") is not None:
+                    rounded["scale_y"] = round(float(map["scale_y"]), 2)
+                entry["vacuums"][vacuum] = rounded
+        else:
+            if image_base is None:
+                entry = self._floorplan_seats.get(floorplan)
+                if entry is not None:
+                    entry["image_base"] = None
+            else:
+                entry = self._floorplan_seats.setdefault(
+                    floorplan, {"vacuums": {}, "image_base": None}
+                )
+                entry["image_base"] = dict(image_base)
+        # Prune once an entry holds nothing at all — otherwise renaming or
+        # removing floorplans over time would leave an ever-growing pile of
+        # dead `src` keys in the store.
+        entry = self._floorplan_seats.get(floorplan)
+        if entry is not None:
+            if not entry.get("vacuums") and not entry.get("image_base"):
+                self._floorplan_seats.pop(floorplan, None)
+            else:
+                entry["updated"] = dt_util.utcnow().isoformat(timespec="seconds")
+        self._seats_store.async_delay_save(lambda: self._floorplan_seats, 2)
         self.async_update_listeners()
 
     @property
@@ -2087,6 +2171,59 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 "dry": bool(lay.get("dry", True)),
                 "wet": bool(lay.get("wet", False)),
             }
+        seats = await self._seats_store.async_load()
+        if isinstance(seats, dict):
+            loaded: dict[str, dict[str, Any]] = {}
+            for src, entry in seats.items():
+                if not isinstance(entry, dict):
+                    continue
+                vacs: dict[str, dict[str, float]] = {}
+                vacs_raw = entry.get("vacuums")
+                if isinstance(vacs_raw, dict):
+                    for ent, m in vacs_raw.items():
+                        if not isinstance(m, dict):
+                            continue
+                        try:
+                            rotation = float(m["rotation"])
+                            scale = float(m["scale"])
+                            offset_x = float(m["offset_x"])
+                            offset_y = float(m["offset_y"])
+                        except (KeyError, TypeError, ValueError):
+                            continue
+                        if not (
+                            math.isfinite(rotation)
+                            and math.isfinite(offset_x)
+                            and math.isfinite(offset_y)
+                            and math.isfinite(scale)
+                            and scale > 0
+                        ):
+                            continue
+                        parsed: dict[str, float] = {
+                            "rotation": rotation,
+                            "scale": scale,
+                            "offset_x": offset_x,
+                            "offset_y": offset_y,
+                        }
+                        scale_y_raw = m.get("scale_y")
+                        if scale_y_raw is not None:
+                            try:
+                                scale_y = float(scale_y_raw)
+                            except (TypeError, ValueError):
+                                scale_y = None
+                            if scale_y is not None and math.isfinite(scale_y) and scale_y > 0:
+                                parsed["scale_y"] = scale_y
+                        vacs[str(ent)] = parsed
+                image_base = entry.get("image_base")
+                if not isinstance(image_base, dict):
+                    image_base = None
+                if vacs or image_base:
+                    updated = entry.get("updated")
+                    loaded[str(src)] = {
+                        "vacuums": vacs,
+                        "image_base": image_base,
+                        "updated": updated if isinstance(updated, str) else None,
+                    }
+            self._floorplan_seats = loaded
         cov = await self._cov_store.async_load()
         if isinstance(cov, dict):
             self._cov_baseline = {

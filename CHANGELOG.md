@@ -4,6 +4,58 @@ All notable changes to the AnyVac companion integration are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [1.11.0] - 2026-09-18
+
+### Added
+
+- **Align mode, Phase B (docs/41 §7): backend override layer for manual
+  floorplan seating.** New service `anyvac.set_floorplan_seat` + store
+  `anyvac_floorplan_seats` + sensor attribute `floorplan_seats`
+  (`_unrecorded_attributes`, `schema_version` unchanged — additive), keyed
+  by floorplan identity (`image_base.src`, exactly as the card config has
+  it, no normalization) — same precedent as `view_layers`/`room_pins`:
+  shared across every dashboard/browser, not per-card state.
+  - `vacuum` + `map` sets/clears one vacuum's seat (`{rotation, scale,
+    scale_y?, offset_x, offset_y}`, same shape as the card's `vacuums[].map`
+    config); `map: null` clears it. `vacuum` omitted targets the
+    card-level `image_base` override instead (`image_base: null` clears
+    it) — the two never mix in one call (docs/41 §4.6). A `src` entry with
+    nothing left in it (no per-vacuum overrides, no `image_base`) is
+    pruned from the store automatically.
+  - Values are validated (`rotation`/`offset_x`/`offset_y` finite;
+    `scale`/`scale_y` finite and > 0 — plain `vol.Coerce(float)`/`vol.Range`
+    do not reject NaN/Infinity, so `set_floorplan_seat` gets its own
+    `_finite_float`/`_positive_finite_float` validators) and rounded to
+    0.01 on save (docs/41 §5 bod 4).
+  - `image_base`'s own shape (`crop_box`/`home_anchors`, docs/41 phase G)
+    is accepted and stored opaquely — never interpreted at this layer,
+    out of scope for this phase.
+  - `services.yaml` entry added (a missing entry is a hard integration-load
+    ERROR — 0.80.2 lesson).
+  - New `tests/test_floorplan_seats.py`: schema validation, set/get
+    roundtrip, `_async_setup` reload from a stored value (with malformed
+    entries defensively dropped, never crashing startup — same pattern as
+    the `room_pins` migration path), `map: null` / `image_base: null`
+    clearing (including whole-entry pruning), and publication on
+    `extra_state_attributes`.
+
+Card-side wiring (reading this attribute and merging it into the rendered
+config) is Phase C, not this phase — nothing changes on the dashboard yet.
+
+Full suite: 286/297 (254 pre-existing + 32 new, 0 regressions from this
+phase). The 11 failures are pre-existing and unrelated — all in
+`tests/test_planner_home_room_id.py`, reproducible identically against
+this repo's own committed source with zero changes from this session
+(this sandbox's Python 3.13 / homeassistant 2026.2.3 combination;
+not investigated further, out of Phase B's scope). Three pre-existing
+test helpers (`test_room_pins.py`, `test_homeframe_persistence.py`,
+`test_path_persistence.py`) needed a `_seats_store` fake added to their
+bare-coordinator setup, since `_async_setup` now loads one more store —
+no behavior change, just keeping their `object.__new__` coordinators
+complete.
+
 ## [1.10.0] - 2026-09-14
 
 Docs/40 §5.A.2 — fiducial markers, the "cheap hack" hardening path for cesta

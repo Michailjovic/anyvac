@@ -135,6 +135,7 @@ async def _load_pins(load_value: Any) -> dict[str, dict[str, str]]:
     coord._pins_store = _FakeStore(load_value)
     coord._seq_store = _FakeStore()
     coord._layers_store = _FakeStore()
+    coord._seats_store = _FakeStore()
     coord._cov_store = _FakeStore()
     coord._cov_pct_store = _FakeStore()
     coord._est_store = _FakeStore()

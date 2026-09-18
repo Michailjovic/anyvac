@@ -110,7 +110,7 @@ def _new_coordinator(
     coord.hass = _FakeHass()
     for attr in (
         "_store", "_est_store", "_cov_store", "_cov_pct_store", "_sel_store",
-        "_pins_store", "_seq_store", "_layers_store",
+        "_pins_store", "_seq_store", "_layers_store", "_seats_store",
     ):
         setattr(coord, attr, _FakeStore())
     coord._paths_store = paths_store or _FakeStore()

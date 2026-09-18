@@ -81,6 +81,7 @@ SERVICE_EXPORT_MAP_GUIDE = "export_map_guide"
 SERVICE_DUMP_RAW_MAP = "dump_raw_map"
 SERVICE_SNAP_WALL_CORNER = "snap_wall_corner"
 SERVICE_DETECT_FIDUCIALS = "detect_floorplan_fiducials"
+SERVICE_SET_FLOORPLAN_SEAT = "set_floorplan_seat"
 
 ALL_SERVICES = (
     SERVICE_RUN_JOB,
@@ -104,6 +105,7 @@ ALL_SERVICES = (
     SERVICE_DUMP_RAW_MAP,
     SERVICE_SNAP_WALL_CORNER,
     SERVICE_DETECT_FIDUCIALS,
+    SERVICE_SET_FLOORPLAN_SEAT,
 )
 
 JOB_TIMEOUT_SECONDS = 3 * 3600  # safety: tear down a stuck job after 3 h
@@ -144,6 +146,51 @@ SET_LAYERS_SCHEMA = vol.Schema(
     {
         vol.Optional("dry"): bool,
         vol.Optional("wet"): bool,
+    }
+)
+
+
+def _finite_float(value: Any) -> float:
+    """Coerce to float, rejecting NaN/Infinity (docs/41 §4.6 "čísla konečná") —
+    plain `vol.Coerce(float)` lets both through, and `vol.Range` does not catch
+    them either (NaN compares False against both bounds; an unbounded field like
+    `rotation`/`offset_x`/`offset_y` has no Range at all)."""
+    v = float(value)
+    if not math.isfinite(v):
+        raise vol.Invalid("must be a finite number")
+    return v
+
+
+def _positive_finite_float(value: Any) -> float:
+    v = _finite_float(value)
+    if v <= 0:
+        raise vol.Invalid("must be > 0")
+    return v
+
+
+# docs/41 §4.6 — Align mode manual floorplan seating, stored as a backend
+# override layer (see AnyVacCoordinator.set_floorplan_seat). `map` fields
+# mirror the card's `SeatParams` (camelCase `scaleY` there is `scale_y` here,
+# same as the existing `vacuums[].map` config shape).
+_FLOORPLAN_SEAT_MAP_SCHEMA = vol.Schema(
+    {
+        vol.Required("rotation"): _finite_float,
+        vol.Required("scale"): _positive_finite_float,
+        vol.Optional("scale_y"): _positive_finite_float,
+        vol.Required("offset_x"): _finite_float,
+        vol.Required("offset_y"): _finite_float,
+    }
+)
+SET_FLOORPLAN_SEAT_SCHEMA = vol.Schema(
+    {
+        vol.Required("floorplan"): str,
+        # Omitted → this call is about the card-level `image_base` override
+        # instead of a per-vacuum `map` override (docs/41 §4.6).
+        vol.Optional("vacuum"): str,
+        vol.Optional("map"): vol.Any(_FLOORPLAN_SEAT_MAP_SCHEMA, None),
+        # Opaque here (crop_box/home_anchors, docs/41 phase G) — stored and
+        # returned as-is, never interpreted at this layer.
+        vol.Optional("image_base"): vol.Any(dict, None),
     }
 )
 SET_ROOM_SEQUENCE_SCHEMA = vol.Schema(
@@ -1466,6 +1513,15 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
         for coord in _coordinators(hass):
             coord.set_layers(call.data.get("dry"), call.data.get("wet"))
 
+    async def _handle_set_floorplan_seat(call: ServiceCall) -> None:
+        for coord in _coordinators(hass):
+            coord.set_floorplan_seat(
+                call.data["floorplan"],
+                vacuum=call.data.get("vacuum"),
+                map=call.data.get("map"),
+                image_base=call.data.get("image_base"),
+            )
+
     async def _handle_set_room_sequence(call: ServiceCall) -> None:
         rooms = [str(r) for r in call.data.get("rooms", [])]
         for coord in _coordinators(hass):
@@ -2129,6 +2185,7 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
         (SERVICE_SELECT_ROOMS, _handle_select_rooms, SELECT_ROOMS_SCHEMA, SupportsResponse.NONE),
         (SERVICE_PIN_ROOM, _handle_pin_room, PIN_ROOM_SCHEMA, SupportsResponse.NONE),
         (SERVICE_SET_LAYERS, _handle_set_layers, SET_LAYERS_SCHEMA, SupportsResponse.NONE),
+        (SERVICE_SET_FLOORPLAN_SEAT, _handle_set_floorplan_seat, SET_FLOORPLAN_SEAT_SCHEMA, SupportsResponse.NONE),
         (SERVICE_SET_ROOM_SEQUENCE, _handle_set_room_sequence, SET_ROOM_SEQUENCE_SCHEMA, SupportsResponse.NONE),
         (SERVICE_RESET_LEARNING, _handle_reset_learning, RESET_LEARNING_SCHEMA, SupportsResponse.NONE),
         (SERVICE_CLEAN, _handle_clean, CLEAN_SCHEMA, SupportsResponse.NONE),

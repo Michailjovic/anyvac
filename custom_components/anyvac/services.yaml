@@ -357,6 +357,49 @@ set_layers:
       selector:
         boolean:
 
+set_floorplan_seat:
+  name: Set floorplan seat
+  description: >-
+    Save or clear a manual Align mode floorplan seating override (docs/41),
+    synced across every dashboard/browser showing that floorplan. Give
+    `vacuum` + `map` to set/clear one vacuum's seat (`map: null` clears it);
+    omit `vacuum` and give `image_base` instead to set/clear the card-level
+    floorplan override (`image_base: null` clears it). The two never mix in
+    one call.
+  fields:
+    floorplan:
+      name: Floorplan
+      description: >-
+        Floorplan identity — exactly the `image_base.src` path as it appears
+        in the card config.
+      required: true
+      example: "/local/anyvac/floorplan.png"
+      selector:
+        text:
+    vacuum:
+      name: Vacuum
+      description: >-
+        Vacuum this seat applies to. Omit to target the card-level
+        `image_base` override instead.
+      selector:
+        entity:
+          domain: vacuum
+    map:
+      name: Seat
+      description: >-
+        `{rotation, scale, scale_y?, offset_x, offset_y}`, same shape as the
+        card's `vacuums[].map` config. `null` clears this vacuum's override.
+      example: '{"rotation": 91.5, "scale": 312.4, "offset_x": -3.25, "offset_y": 1.1}'
+      selector:
+        object:
+    image_base:
+      name: Image base override
+      description: >-
+        Card-level floorplan override (`crop_box`/`home_anchors`, docs/41
+        phase G). `null` clears it. Not used yet — accepted and stored as-is.
+      selector:
+        object:
+
 set_room_sequence:
   name: Set room sequence
   description: >-

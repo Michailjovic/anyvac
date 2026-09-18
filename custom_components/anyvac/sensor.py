@@ -82,7 +82,7 @@ class AnyVacMapSensor(CoordinatorEntity[AnyVacCoordinator], SensorEntity):
             "status_state", "transit", "transit_cells", "vacuuming", "view_layers",
             "debug_map", "schema_version", "vacuum_position_px", "charger_px",
             "path_dry_px", "path_wet_px", "pipeline_ok", "pipeline_error",
-            "room_pins", "room_sequence", "dock_status",
+            "room_pins", "room_sequence", "dock_status", "floorplan_seats",
             # Kontrakt v3 (docs/40 §4.2 point 6) — additive, same "large/
             # fast-changing map payload" reasoning as the v2 *_px attributes above.
             "home_frame", "registration", "vacuum_position_home_px", "charger_home_px",
@@ -136,6 +136,7 @@ class AnyVacMapSensor(CoordinatorEntity[AnyVacCoordinator], SensorEntity):
             "view_layers": self.coordinator.view_layers,
             "room_pins": self.coordinator.room_pins,
             "room_sequence": self.coordinator.room_sequence,
+            "floorplan_seats": self.coordinator.floorplan_seats,
         }
 
 
