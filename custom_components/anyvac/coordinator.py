@@ -333,6 +333,155 @@ def _solve_affine(calib: Any) -> tuple[float, float, float, float, float, float]
     return (a, b, c, d, e, f)
 
 
+# docs/42 §9 (fáze pre-H) — defensive re-validation of a stored appearance
+# override on load, mirroring `_FLOORPLAN_SEAT_APPEARANCE_SCHEMA` in
+# services.py (same duplication posture the `map` fields above already
+# have: the schema validates on the way IN via the service call, this
+# re-validates on the way OUT of the store in case the on-disk JSON was
+# hand-edited or written by an older/different version). Unknown keys and
+# invalid values are silently dropped field-by-field, never crashing
+# `_async_setup` — an empty result means "nothing survived", which the
+# caller treats as "no appearance override".
+_APPEARANCE_BLEND_VALUES = ("normal", "lighten", "screen", "plus-lighter")
+
+
+def _parse_stored_appearance(raw: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+
+    def _bool(key: str) -> None:
+        v = raw.get(key)
+        if isinstance(v, bool):
+            out[key] = v
+
+    def _ranged_float(key: str, lo: float, hi: float) -> None:
+        v = raw.get(key)
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return
+        v = float(v)
+        if math.isfinite(v) and lo <= v <= hi:
+            out[key] = v
+
+    def _nullable_str(key: str) -> None:
+        if key not in raw:
+            return
+        v = raw.get(key)
+        if v is None or isinstance(v, str):
+            out[key] = v
+
+    _bool("hide_map")
+    _ranged_float("overlay_opacity", 0, 100)
+    blend = raw.get("overlay_blend")
+    if blend in _APPEARANCE_BLEND_VALUES:
+        out["overlay_blend"] = blend
+    _nullable_str("path_color")
+    _ranged_float("path_width", 20, 300)
+    _nullable_str("mop_path_color")
+    _ranged_float("mop_band_opacity", 0, 100)
+    _ranged_float("mop_band_width", 20, 400)
+    _bool("robot_image_on_map")
+    _ranged_float("robot_size", 40, 220)
+    _ranged_float("robot_image_rotation", -180, 180)
+    return out
+
+
+# docs/42 §4.4/§8 bod 1 (fáze K) — defensive re-validation of a stored room
+# override on load, mirroring `_FLOORPLAN_SEAT_ROOM_SCHEMA` in services.py,
+# same posture as `_parse_stored_appearance` above: the schema validates on
+# the way IN via the service call, this re-validates on the way OUT of the
+# store. Unknown keys and invalid values are silently dropped field-by-field;
+# an empty result means "nothing survived for this room".
+def _parse_stored_room(raw: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+
+    def _finite(key: str) -> None:
+        v = raw.get(key)
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return
+        v = float(v)
+        if math.isfinite(v):
+            out[key] = v
+
+    def _positive_finite(key: str) -> None:
+        v = raw.get(key)
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return
+        v = float(v)
+        if math.isfinite(v) and v > 0:
+            out[key] = v
+
+    _finite("map_x")
+    _finite("map_y")
+    _positive_finite("map_w")
+    _positive_finite("map_h")
+    area_id = raw.get("area_id")
+    if area_id is None or isinstance(area_id, str):
+        if "area_id" in raw:
+            out["area_id"] = area_id
+    return out
+
+
+def _parse_stored_rooms(raw: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Re-validate a stored per-vacuum `rooms` map (room_key -> room dict),
+    dropping any room_key whose stored value isn't a dict, and any room_key
+    whose validated fields all failed re-validation (nothing left to keep)."""
+    out: dict[str, dict[str, Any]] = {}
+    for room_key, room_raw in raw.items():
+        if not isinstance(room_raw, dict):
+            continue
+        parsed = _parse_stored_room(room_raw)
+        if parsed:
+            out[str(room_key)] = parsed
+    return out
+
+
+# docs/42 §3.3/§9 (fáze I addendum) — defensive re-validation of the stored
+# card-level `room_style` override, same posture as `_parse_stored_appearance`/
+# `_parse_stored_room` above (schema validates on the way IN, this re-validates
+# on the way OUT of the store).
+def _parse_stored_room_style(raw: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+
+    def _ranged_float(key: str) -> None:
+        v = raw.get(key)
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return
+        v = float(v)
+        if math.isfinite(v) and 0 <= v <= 12:
+            out[key] = v
+
+    _ranged_float("border_normal")
+    _ranged_float("border_selected")
+    return out
+
+
+def _merge_room_overrides(
+    existing: dict[str, dict[str, Any]] | None, rooms: dict[str, dict[str, Any] | None]
+) -> dict[str, dict[str, Any]]:
+    """Apply one `set_floorplan_seat(rooms=...)` call's per-room_key merge
+    onto an existing stored `rooms` map — shared by both the per-vacuum
+    branch (split mode) and the card-level branch (merged mode) of
+    `AnyVacCoordinator.set_floorplan_seat`, since the merge semantics
+    (docs/42 §4.4, fáze K) are identical either way: a dict value sets/
+    replaces that one room's override, ``None`` clears just that one room's
+    override, and any room_key not mentioned in `rooms` is left untouched.
+    Values are already validated by SET_FLOORPLAN_SEAT_SCHEMA's
+    `_FLOORPLAN_SEAT_ROOMS_SCHEMA` before this is called."""
+    stored_rooms: dict[str, dict[str, Any]] = dict(existing or {})
+    for room_key, room_val in rooms.items():
+        room_key = str(room_key)
+        if room_val is None:
+            stored_rooms.pop(room_key, None)
+            continue
+        rounded_room: dict[str, Any] = {}
+        for geo_key in ("map_x", "map_y", "map_w", "map_h"):
+            if room_val.get(geo_key) is not None:
+                rounded_room[geo_key] = round(float(room_val[geo_key]), 2)
+        if "area_id" in room_val:
+            rounded_room["area_id"] = room_val["area_id"]
+        stored_rooms[room_key] = rounded_room
+    return stored_rooms
+
+
 def _px_point(
     p: dict[str, float] | None, aff: tuple[float, float, float, float, float, float]
 ) -> dict[str, float] | None:
@@ -1165,16 +1314,32 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # same way as the room selection). Persisted across restarts.
         self._layers_store: Store = Store(hass, 1, f"{DOMAIN}_view_layers")
         self._view_layers: dict[str, bool] = {"dry": True, "wet": False}
-        # Align mode manual seating override layer (docs/41 §4.6), keyed by
-        # floorplan identity (`image_base.src`, exactly as the config has it —
-        # no normalization): {src: {"vacuums": {entity: {rotation, scale,
-        # scale_y?, offset_x, offset_y}}, "image_base": dict|None, "updated":
-        # iso}}. `image_base`'s own shape (crop_box/home_anchors) is phase G —
-        # stored/returned opaquely, never interpreted here. Shared across
-        # devices/dashboards like room_pins/view_layers above, for the same
-        # reason: one alignment should apply to every card showing that
-        # floorplan, not be duplicated per-dashboard. Persisted across
-        # restarts.
+        # Visual editor override layer (docs/41 §4.6 + docs/42 appearance +
+        # rooms extensions), keyed by floorplan identity (`image_base.src`,
+        # exactly as the config has it — no normalization): {src: {"vacuums":
+        # {entity: {"map": {rotation, scale, scale_y?, offset_x, offset_y},
+        # "appearance": {...}, "rooms": {room_key: {map_x?, map_y?, map_w?,
+        # map_h?, area_id?}}}}, "image_base": dict|None, "rooms": {room_key:
+        # {...}} (card-level, merged mode — sibling of "image_base", NOT
+        # nested under "vacuums"), "updated": iso}}. "map", "appearance" and
+        # "rooms" are each independently optional per vacuum entry — any
+        # subset present is normal (a vacuum with only an appearance override
+        # and no seat override, or vice versa, etc.). `rooms` (both the
+        # per-vacuum and the card-level one) further merges at the room_key
+        # level rather than being a single atomic value (docs/42 §4.4, fáze K
+        # — see `set_floorplan_seat`'s own docstring for why, and for how it
+        # relates to `image_base`'s OWN atomic clear-on-omit contract when
+        # both live in the same card-level branch). `image_base`'s own shape
+        # (crop_box/home_anchors) is phase G — stored/returned opaquely,
+        # never interpreted here. Shared across devices/dashboards like
+        # room_pins/view_layers above, for the same reason: one alignment
+        # should apply to every card showing that floorplan, not be
+        # duplicated per-dashboard. Persisted across restarts. BREAKING
+        # (integration 1.12.0): the per-vacuum shape changed from a flat
+        # `{rotation,...}` dict to this nested `{"map": ..., "appearance":
+        # ...}` shape — no migration, any previously stored data is discarded
+        # at load time (docs/42). `rooms` (1.13.0, fáze K) is purely additive
+        # on top of that 1.12.0 shape — not another breaking change.
         self._seats_store: Store = Store(hass, 1, f"{DOMAIN}_floorplan_seats")
         self._floorplan_seats: dict[str, dict[str, Any]] = {}
         # Debug watermarks (docs/17 §2): goto/predicted paths are TRANSIENT — they only
@@ -1391,11 +1556,41 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
 
     @property
     def floorplan_seats(self) -> dict[str, dict[str, Any]]:
-        """Align mode override layer (docs/41 §4.6), keyed by floorplan `src`."""
+        """Visual editor override layer (docs/41 §4.6 + docs/42 appearance/
+        rooms/room_style extensions), keyed by floorplan `src`. Each per-vacuum
+        entry carries an optional "map" key, an optional "appearance" key and an
+        optional "rooms" key, independently — any subset, or (defensively)
+        none. The top-level entry ALSO carries its own card-level "rooms" key
+        (sibling of "image_base"), for merged mode — set/cleared per room_key
+        via a `set_floorplan_seat` call with `vacuum` omitted, same "vacuum
+        given = per-vacuum, omitted = card-level" split `image_base` already
+        uses (docs/42 §4.4) — and a card-level-only "room_style" key (fáze I
+        addendum, §9), for the Rooms tool's global border-width sliders."""
         return {
             src: {
-                "vacuums": {ent: dict(m) for ent, m in entry.get("vacuums", {}).items()},
+                "vacuums": {
+                    ent: {
+                        **({"map": dict(v["map"])} if "map" in v else {}),
+                        **({"appearance": dict(v["appearance"])} if "appearance" in v else {}),
+                        **(
+                            {"rooms": {rk: dict(rv) for rk, rv in v["rooms"].items()}}
+                            if "rooms" in v
+                            else {}
+                        ),
+                    }
+                    for ent, v in entry.get("vacuums", {}).items()
+                },
                 "image_base": dict(entry["image_base"]) if entry.get("image_base") else None,
+                **(
+                    {"rooms": {rk: dict(rv) for rk, rv in entry["rooms"].items()}}
+                    if entry.get("rooms")
+                    else {}
+                ),
+                **(
+                    {"room_style": dict(entry["room_style"])}
+                    if entry.get("room_style")
+                    else {}
+                ),
                 "updated": entry.get("updated"),
             }
             for src, entry in self._floorplan_seats.items()
@@ -1407,29 +1602,85 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         vacuum: str | None = None,
         map: dict[str, float] | None = None,
         image_base: dict[str, Any] | None = None,
+        appearance: dict[str, Any] | None = None,
+        rooms: dict[str, dict[str, Any] | None] | None = None,
+        room_style: dict[str, Any] | None = None,
     ) -> None:
-        """Set or clear a manual floorplan seat override (anyvac.set_floorplan_seat,
-        docs/41 §4.6).
+        """Set or clear a manual floorplan/appearance/rooms/room_style override
+        (anyvac.set_floorplan_seat, docs/41 §4.6 + docs/42 appearance + rooms +
+        room_style extensions).
 
-        `vacuum` given → this call is about that vacuum's `map` (``None``
-        clears just that vacuum's override). `vacuum` omitted → this call is
-        about the card-level `image_base` override instead (``None`` clears
-        it). The two never mix in one call, matching how the card always
-        sends one or the other (never both) — see §4.6's service contract.
+        `vacuum` given → this call is about that vacuum's per-vacuum entry.
+        `map` and `appearance` are two fully independent nullable fields on
+        that entry, symmetric with each other: ``None`` clears just that
+        part of the override, a dict sets it — exactly like `map` always
+        worked, now also true for `appearance`. The card always sends both
+        together on every Save (the current draft state for each), so a
+        partial update from the UI never happens in practice, but the API
+        itself does not assume that — a caller sending only one of the two
+        legitimately clears the other.
+
+        `rooms` is DIFFERENT on purpose (docs/42 §4.4, fáze K): it is a MAP of
+        room_key -> (room override dict | ``None``), not a single atomic
+        value like `map`/`appearance`. Each room_key in that map is merged
+        independently into this vacuum's existing stored `rooms` map — a dict
+        value sets/replaces just that one room's override, ``None`` clears
+        just that one room's override, and any room_key this vacuum already
+        has an override for but that isn't mentioned in THIS call is left
+        completely untouched. `rooms` omitted entirely from a call (its
+        Python default, ``None``) means "this call doesn't touch rooms at
+        all" — unlike `map`/`appearance`, omitting `rooms` never clears
+        anything. This asymmetry is deliberate: `map`/`appearance` are each
+        one whole-record edit the card always resends in full on every Save,
+        while Rooms-tool edits are inherently per-room (drag one room, delete
+        another) and forcing every unrelated room's override to be resent on
+        every single-room edit would be exactly the kind of accidental-wipe
+        footgun the "no sentinel" `map`/`appearance` design has to work
+        around by resending everything — rooms avoids it structurally
+        instead, by keying the merge.
+
+        `vacuum` omitted → this call is about the card-level entry instead:
+        `image_base` (``None`` clears it, same atomic "no sentinel" contract
+        as `map`/`appearance` — a caller that cares about an existing
+        `image_base` override must resend it in the same call or it's
+        cleared), `room_style` (fáze I addendum, §9 — the SAME atomic "no
+        sentinel" contract as `image_base`: it is a whole-record override,
+        not per-key like `rooms`, since it only ever has two fields the card
+        always edits/sends together, mirroring `appearance`'s "card always
+        sends both together on every Save" precedent) and/or `rooms` (same
+        per-room_key merge/omit-is-untouched semantics described above, just
+        stored as a sibling of `image_base` on the floorplan entry itself
+        instead of nested under one vacuum — docs/42 §4.4: "stejná vacuum/
+        card-level volba jako u map"). `map`/`appearance` are ignored when
+        `vacuum` is omitted — those two only ever have per-vacuum meaning,
+        unlike `rooms`/`image_base`/`room_style`. `room_style` is likewise
+        ignored when `vacuum` IS given — it is a global setting (applies to
+        every vacuum's rooms), there is no per-vacuum `room_style`. A caller
+        never mixes `vacuum`+`map`/`appearance` with a card-level-only call
+        in practice (the card's tools are per-vacuum XOR card-level), but a
+        `rooms`-only (or `room_style`-only) card-level Save (e.g. the Rooms
+        tool editing one room's geometry, or just dragging a border-width
+        slider) DOES still clear `image_base`/`room_style` if either isn't
+        resent, by the same "no sentinel" logic — `image_base`, `room_style`
+        and `rooms` are independent of EACH OTHER within this branch, but
+        none of the three gets a free pass from its own resend-to-keep rule
+        just because a different one was the one being edited; the card's
+        Rooms tool Save handler is responsible for always resending the
+        other two's current draft alongside whichever one actually changed
+        (same discipline `_alignSave` already applies to `map`+`appearance`).
         `image_base`'s own shape (crop_box/home_anchors, phase G) is opaque
         here: stored and returned as-is, never interpreted.
         """
         floorplan = str(floorplan)
         if vacuum:
             vacuum = str(vacuum)
+            entry = self._floorplan_seats.setdefault(
+                floorplan, {"vacuums": {}, "image_base": None}
+            )
+            vac_entry = dict(entry["vacuums"].get(vacuum) or {})
             if map is None:
-                entry = self._floorplan_seats.get(floorplan)
-                if entry is not None:
-                    entry.get("vacuums", {}).pop(vacuum, None)
+                vac_entry.pop("map", None)
             else:
-                entry = self._floorplan_seats.setdefault(
-                    floorplan, {"vacuums": {}, "image_base": None}
-                )
                 rounded: dict[str, float] = {
                     "rotation": round(float(map["rotation"]), 2),
                     "scale": round(float(map["scale"]), 2),
@@ -1438,23 +1689,64 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 }
                 if map.get("scale_y") is not None:
                     rounded["scale_y"] = round(float(map["scale_y"]), 2)
-                entry["vacuums"][vacuum] = rounded
-        else:
-            if image_base is None:
-                entry = self._floorplan_seats.get(floorplan)
-                if entry is not None:
-                    entry["image_base"] = None
+                vac_entry["map"] = rounded
+            if appearance is None:
+                vac_entry.pop("appearance", None)
             else:
-                entry = self._floorplan_seats.setdefault(
-                    floorplan, {"vacuums": {}, "image_base": None}
-                )
+                # Already validated by SET_FLOORPLAN_SEAT_SCHEMA's
+                # _FLOORPLAN_SEAT_APPEARANCE_SCHEMA before this is called —
+                # stored as-is, no further coercion/rounding here.
+                vac_entry["appearance"] = dict(appearance)
+            if rooms is not None:
+                stored_rooms = _merge_room_overrides(vac_entry.get("rooms"), rooms)
+                if stored_rooms:
+                    vac_entry["rooms"] = stored_rooms
+                else:
+                    vac_entry.pop("rooms", None)
+            if vac_entry:
+                entry["vacuums"][vacuum] = vac_entry
+            else:
+                entry["vacuums"].pop(vacuum, None)
+        else:
+            entry = self._floorplan_seats.setdefault(
+                floorplan, {"vacuums": {}, "image_base": None}
+            )
+            if image_base is None:
+                entry["image_base"] = None
+            else:
                 entry["image_base"] = dict(image_base)
+            if rooms is not None:
+                # docs/42 §4.4 — card-level `rooms` (merged mode): same
+                # per-room_key merge as the per-vacuum branch above, just
+                # stored as a sibling of "image_base" instead of nested under
+                # one vacuum's own entry. `vacuum` omitted is what selects
+                # this branch (§4.4: "stejná vacuum/card-level volba jako u
+                # map"), same as `image_base` already works.
+                stored_rooms = _merge_room_overrides(entry.get("rooms"), rooms)
+                if stored_rooms:
+                    entry["rooms"] = stored_rooms
+                else:
+                    entry.pop("rooms", None)
+            # docs/42 §3.3/§9 (fáze I addendum) — same atomic "no sentinel"
+            # contract as `image_base` immediately above: whole-record,
+            # `None`/omitted clears it.
+            if room_style is None:
+                entry.pop("room_style", None)
+            else:
+                # Already validated by SET_FLOORPLAN_SEAT_SCHEMA's
+                # _FLOORPLAN_SEAT_ROOM_STYLE_SCHEMA before this is called.
+                entry["room_style"] = dict(room_style)
         # Prune once an entry holds nothing at all — otherwise renaming or
         # removing floorplans over time would leave an ever-growing pile of
         # dead `src` keys in the store.
         entry = self._floorplan_seats.get(floorplan)
         if entry is not None:
-            if not entry.get("vacuums") and not entry.get("image_base"):
+            if (
+                not entry.get("vacuums")
+                and not entry.get("image_base")
+                and not entry.get("rooms")
+                and not entry.get("room_style")
+            ):
                 self._floorplan_seats.pop(floorplan, None)
             else:
                 entry["updated"] = dt_util.utcnow().isoformat(timespec="seconds")
@@ -2177,50 +2469,97 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             for src, entry in seats.items():
                 if not isinstance(entry, dict):
                     continue
-                vacs: dict[str, dict[str, float]] = {}
+                vacs: dict[str, dict[str, Any]] = {}
                 vacs_raw = entry.get("vacuums")
                 if isinstance(vacs_raw, dict):
-                    for ent, m in vacs_raw.items():
-                        if not isinstance(m, dict):
+                    for ent, v in vacs_raw.items():
+                        # BREAKING (integration 1.12.0, docs/42): the
+                        # per-vacuum shape is now {"map": {...}, "appearance":
+                        # {...}}, both independently optional. A stored entry
+                        # that isn't a dict, or is still the pre-1.12.0 flat
+                        # `{rotation,...}` shape (no "map"/"appearance" keys
+                        # at all), is silently discarded — no migration, same
+                        # defensive-load posture as every other malformed
+                        # shape here.
+                        if not isinstance(v, dict):
                             continue
-                        try:
-                            rotation = float(m["rotation"])
-                            scale = float(m["scale"])
-                            offset_x = float(m["offset_x"])
-                            offset_y = float(m["offset_y"])
-                        except (KeyError, TypeError, ValueError):
-                            continue
-                        if not (
-                            math.isfinite(rotation)
-                            and math.isfinite(offset_x)
-                            and math.isfinite(offset_y)
-                            and math.isfinite(scale)
-                            and scale > 0
-                        ):
-                            continue
-                        parsed: dict[str, float] = {
-                            "rotation": rotation,
-                            "scale": scale,
-                            "offset_x": offset_x,
-                            "offset_y": offset_y,
-                        }
-                        scale_y_raw = m.get("scale_y")
-                        if scale_y_raw is not None:
+                        vac_entry: dict[str, Any] = {}
+                        m = v.get("map")
+                        if isinstance(m, dict):
                             try:
-                                scale_y = float(scale_y_raw)
-                            except (TypeError, ValueError):
-                                scale_y = None
-                            if scale_y is not None and math.isfinite(scale_y) and scale_y > 0:
-                                parsed["scale_y"] = scale_y
-                        vacs[str(ent)] = parsed
+                                rotation = float(m["rotation"])
+                                scale = float(m["scale"])
+                                offset_x = float(m["offset_x"])
+                                offset_y = float(m["offset_y"])
+                            except (KeyError, TypeError, ValueError):
+                                rotation = scale = offset_x = offset_y = None  # type: ignore[assignment]
+                            if (
+                                rotation is not None
+                                and math.isfinite(rotation)
+                                and math.isfinite(offset_x)
+                                and math.isfinite(offset_y)
+                                and math.isfinite(scale)
+                                and scale > 0
+                            ):
+                                parsed: dict[str, float] = {
+                                    "rotation": rotation,
+                                    "scale": scale,
+                                    "offset_x": offset_x,
+                                    "offset_y": offset_y,
+                                }
+                                scale_y_raw = m.get("scale_y")
+                                if scale_y_raw is not None:
+                                    try:
+                                        scale_y = float(scale_y_raw)
+                                    except (TypeError, ValueError):
+                                        scale_y = None
+                                    if scale_y is not None and math.isfinite(scale_y) and scale_y > 0:
+                                        parsed["scale_y"] = scale_y
+                                vac_entry["map"] = parsed
+                        appearance_raw = v.get("appearance")
+                        if isinstance(appearance_raw, dict):
+                            parsed_appearance = _parse_stored_appearance(appearance_raw)
+                            if parsed_appearance:
+                                vac_entry["appearance"] = parsed_appearance
+                        # docs/42 §4.4 (fáze K): "rooms" added alongside
+                        # "map"/"appearance" above — same defensive-load
+                        # posture, per-room_key re-validation via
+                        # `_parse_stored_rooms`.
+                        rooms_raw = v.get("rooms")
+                        if isinstance(rooms_raw, dict):
+                            parsed_rooms = _parse_stored_rooms(rooms_raw)
+                            if parsed_rooms:
+                                vac_entry["rooms"] = parsed_rooms
+                        if vac_entry:
+                            vacs[str(ent)] = vac_entry
                 image_base = entry.get("image_base")
                 if not isinstance(image_base, dict):
                     image_base = None
-                if vacs or image_base:
+                # docs/42 §4.4 (fáze K): card-level "rooms" — sibling of
+                # "image_base" on the entry itself, NOT nested under
+                # "vacuums". Same defensive re-validation as the per-vacuum
+                # one above.
+                card_rooms_raw = entry.get("rooms")
+                card_rooms = (
+                    _parse_stored_rooms(card_rooms_raw)
+                    if isinstance(card_rooms_raw, dict)
+                    else {}
+                )
+                # docs/42 §3.3/§9 (fáze I addendum) — card-level "room_style",
+                # same sibling-of-"image_base" posture as "rooms" above.
+                room_style_raw = entry.get("room_style")
+                room_style = (
+                    _parse_stored_room_style(room_style_raw)
+                    if isinstance(room_style_raw, dict)
+                    else {}
+                )
+                if vacs or image_base or card_rooms or room_style:
                     updated = entry.get("updated")
                     loaded[str(src)] = {
                         "vacuums": vacs,
                         "image_base": image_base,
+                        **({"rooms": card_rooms} if card_rooms else {}),
+                        **({"room_style": room_style} if room_style else {}),
                         "updated": updated if isinstance(updated, str) else None,
                     }
             self._floorplan_seats = loaded

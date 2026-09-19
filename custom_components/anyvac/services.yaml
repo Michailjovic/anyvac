@@ -360,12 +360,19 @@ set_layers:
 set_floorplan_seat:
   name: Set floorplan seat
   description: >-
-    Save or clear a manual Align mode floorplan seating override (docs/41),
-    synced across every dashboard/browser showing that floorplan. Give
-    `vacuum` + `map` to set/clear one vacuum's seat (`map: null` clears it);
-    omit `vacuum` and give `image_base` instead to set/clear the card-level
-    floorplan override (`image_base: null` clears it). The two never mix in
-    one call.
+    Save or clear a manual Visual editor floorplan override (docs/41 +
+    docs/42), synced across every dashboard/browser showing that floorplan.
+    Give `vacuum` with `map`/`appearance`/`rooms` to set/clear one vacuum's
+    seat geometry, its appearance style and/or its per-room overrides (`map`
+    and `appearance` are each independently nullable; `rooms` merges per
+    room_key instead — see the `rooms` field below); omit `vacuum` to target
+    the card-level entry instead — `image_base` (`null` clears it), `rooms`
+    (merged mode's shared room list, same per-room_key merge as the
+    per-vacuum case) and/or `room_style` (the two global room border-width
+    fields, `null` clears it). `map`/`appearance` only ever have per-vacuum
+    meaning and are ignored when `vacuum` is omitted; `room_style` only ever
+    has card-level meaning and is ignored when `vacuum` is given; `rooms`
+    works either way.
   fields:
     floorplan:
       name: Floorplan
@@ -379,8 +386,9 @@ set_floorplan_seat:
     vacuum:
       name: Vacuum
       description: >-
-        Vacuum this seat applies to. Omit to target the card-level
-        `image_base` override instead.
+        Vacuum this seat/appearance/rooms override applies to. Omit to
+        target the card-level `image_base`/`rooms`/`room_style` override
+        instead (merged mode).
       selector:
         entity:
           domain: vacuum
@@ -388,15 +396,65 @@ set_floorplan_seat:
       name: Seat
       description: >-
         `{rotation, scale, scale_y?, offset_x, offset_y}`, same shape as the
-        card's `vacuums[].map` config. `null` clears this vacuum's override.
+        card's `vacuums[].map` config. `null` clears this vacuum's seat
+        override. Independent of `appearance` — clearing one never clears
+        the other.
       example: '{"rotation": 91.5, "scale": 312.4, "offset_x": -3.25, "offset_y": 1.1}'
+      selector:
+        object:
+    appearance:
+      name: Appearance
+      description: >-
+        Map-overlay style for this vacuum — `hide_map`, `overlay_opacity`,
+        `overlay_blend`, `path_color`, `path_width`, `mop_path_color`,
+        `mop_band_opacity`, `mop_band_width`, `robot_image_on_map`,
+        `robot_size`, `robot_image_rotation` — same fields as the card's
+        `VacuumConfig` Appearance section. `null` (or omitting this field
+        entirely) clears any existing appearance override for this vacuum.
+        The card's Visual editor always sends this together with `map`.
+      example: '{"path_color": "#4fc3f7", "path_width": 140, "robot_size": 90}'
+      selector:
+        object:
+    rooms:
+      name: Rooms
+      description: >-
+        Per-room overrides — a map of room_key to either a room dict
+        (`{map_x?, map_y?, map_w?, map_h?, area_id?}`, matching the card's
+        `RoomConfig` rect fields) or `null`. With `vacuum` given, applies to
+        that vacuum's own rooms (split mode); with `vacuum` omitted, applies
+        to the card-level shared room list instead (merged mode). Either
+        way, unlike `map`/`appearance`, this merges per room_key: a dict
+        sets/replaces just that one room's override, `null` clears just
+        that one room's override, and any room_key not mentioned in this
+        call is left untouched — omitting `rooms` entirely from a call
+        never clears anything (including when it's a card-level call that
+        only touches `image_base` — the two are independent of each other).
+      example: '{"living_room": {"map_x": 12.5, "map_y": 30, "map_w": 40, "map_h": 25}, "hallway": null}'
       selector:
         object:
     image_base:
       name: Image base override
       description: >-
         Card-level floorplan override (`crop_box`/`home_anchors`, docs/41
-        phase G). `null` clears it. Not used yet — accepted and stored as-is.
+        phase G). `null` (or omitting this field on a card-level call) clears
+        it — same atomic "no sentinel" rule `map`/`appearance` use, so a
+        card-level call that only means to touch `rooms`/`room_style` must
+        still resend `image_base` if it wants to keep an existing one. Not
+        used yet — accepted and stored as-is.
+      selector:
+        object:
+    room_style:
+      name: Room border style
+      description: >-
+        Card-level, global room border widths — `{border_normal?,
+        border_selected?}` in px (0–12), matching the card's
+        `room_border_normal`/`room_border_selected` config fields. Card-level
+        only (ignored when `vacuum` is given — there is no per-vacuum room
+        border width). `null` (or omitting this field on a card-level call)
+        clears it — same atomic "no sentinel" rule `image_base` uses, so a
+        card-level call that only means to touch `rooms`/`image_base` must
+        still resend `room_style` if it wants to keep an existing one.
+      example: '{"border_normal": 2, "border_selected": 4}'
       selector:
         object:
 

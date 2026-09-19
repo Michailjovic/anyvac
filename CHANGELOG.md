@@ -6,6 +6,153 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.31.0] - 2026-09-19
+
+### Added
+
+- **docs/42 §3.3/§9 (fáze I addendum): `anyvac.set_floorplan_seat` /
+  `floorplan_seats` gain a card-level-only `room_style` override.** Found
+  while implementing the card's Rooms tool (fáze I): the tool's global
+  border-width sliders (`room_border_normal`/`room_border_selected`,
+  `types.ts`) have no per-vacuum meaning and the Visual editor can be opened
+  from a live dashboard, where the card cannot write its own YAML — the same
+  reason `appearance`/`rooms` already persist through this service instead
+  of a plain config edit. `room_style` is `{border_normal?, border_selected?}`
+  (0–12 px, mirroring the editor's existing slider bounds), card-level only
+  (`vacuum` omitted; ignored if given — there is no per-vacuum room border
+  width), and follows the SAME atomic "no sentinel" contract as
+  `image_base`: a dict sets it, `null`/omission clears it. Independent of
+  `image_base`/`rooms` within the card-level branch, same posture those two
+  already have with each other — a card-level Save that only means to touch
+  one of the three must still resend the other two's current draft or they
+  get cleared (documented in `AnyVacCoordinator.set_floorplan_seat`'s
+  docstring). Defensive re-validation on load (`_parse_stored_room_style`),
+  same posture as `appearance`/`rooms`. 20 new tests
+  (`test_floorplan_seats.py`), full suite: **365/365 green**
+  (`pytest tests/ --ignore=tests/test_planner_home_room_id.py`; that one file
+  has its own 11 pre-existing, unrelated failures — see the 1.30.0/1.12.0
+  entries below). Purely additive — no breaking change.
+
+## [1.30.0] - 2026-09-19
+
+### Notes
+
+- **Deliberate version jump, no functional changes.** Bumped from 1.13.0
+  straight to 1.30.0 at the user's explicit request, purely to leave a
+  visible dividing line in the version history at this point in the
+  docs/42 rollout (fáze G2/K done, fáze I next on the card) — not a
+  release for any code change. This is a one-off exception to the docs/42
+  §9 versioning rule ("each phase gets its own version on its own repo,
+  card and integration are not paired except at the final 2.0.0 gate") —
+  see docs/42 §9 for the note on this exception. Both `anyvac` and
+  `anyvac-card` were bumped to the same 1.30.0 together for this one
+  marker; normal per-phase, per-repo, non-paired versioning resumes from
+  here.
+
+## [1.13.0] - 2026-09-19
+
+### Added
+
+- **docs/42 §4.4/§8 bod 1 (fáze K): `anyvac.set_floorplan_seat` /
+  `floorplan_seats` gain a `rooms` override, independent of `map`/
+  `appearance`.** A vacuum entry may now also carry a `rooms` key: a map of
+  `room_key -> ({map_x?, map_y?, map_w?, map_h?, area_id?} | null)`,
+  mirroring the card's `RoomConfig` rect/anchor fields. This is the backend
+  half of the upcoming card Rooms tool (docs/42 phase I) — it lets a room's
+  position/size/HA-area be dragged and saved from the Visual editor the same
+  way seat geometry already is, without waiting on that card work to ship;
+  the schema, validation and persistence are usable standalone via the
+  service today. `rooms` works both ways `set_floorplan_seat` already
+  branches on: `vacuum` given → that vacuum's own rooms (split mode);
+  `vacuum` omitted → the card-level shared room list instead (merged mode,
+  a sibling of `image_base` on the floorplan entry), same split
+  `image_base` already uses.
+- **`rooms` has its OWN merge semantics — deliberately NOT the `map`/
+  `appearance` "omit the whole field to clear it" convention.** `map` and
+  `appearance` are each one atomic override the caller always resends in
+  full to keep; `rooms` instead merges per `room_key`: a dict value
+  sets/replaces just that one room's override, `null` clears just that one
+  room's override, and any room_key not mentioned in a given call is left
+  completely untouched — including when the call doesn't mention `rooms` at
+  all (e.g. a plain seat-geometry Save from the Seat & Appearance tool never
+  touches room overrides). This avoids forcing every room's override to be
+  resent on every single-room edit, the same footgun the "no sentinel"
+  `map`/`appearance` design has to work around by resending everything.
+  Full contract in `AnyVacCoordinator.set_floorplan_seat`'s docstring.
+- Defensive load re-validation for `rooms` (`_parse_stored_rooms`/
+  `_parse_stored_room`), mirroring the existing `appearance` re-validation —
+  a corrupted or hand-edited store drops individual bad rooms/fields rather
+  than crashing `_async_setup` or discarding the whole vacuum entry. Applies
+  to both the per-vacuum and the card-level `rooms` map.
+- 38 new tests in `test_floorplan_seats.py` covering the per-room_key merge/
+  clear semantics (per-vacuum AND card-level), schema validation, and reload
+  re-validation. Full suite: 345/345 passing.
+
+### Notes
+
+- Purely additive on top of the 1.12.0 nested `{"map": ..., "appearance":
+  ...}` per-vacuum shape — not another breaking change. A vacuum entry with
+  no `rooms` override behaves exactly as it did in 1.12.0.
+- Card support (docs/42 phase I, Rooms tool) has not shipped yet as of this
+  release — this version only adds the backend service/schema/persistence.
+- **`image_base` and `rooms` are independent of EACH OTHER in a card-level
+  call, but neither is exempt from its own resend-to-keep rule.** `image_base`
+  keeps its pre-existing atomic "no sentinel" contract (omit or `null` both
+  clear it) regardless of whether the same call also sets `rooms`; a
+  `rooms`-only card-level Save (e.g. from a future Rooms tool in merged mode)
+  will still clear an existing `image_base` override if it isn't resent in
+  that same call. `rooms` itself never has this problem (per-room_key merge,
+  omission is always "untouched"). See `AnyVacCoordinator
+  .set_floorplan_seat`'s docstring for the full reasoning — this note exists
+  because the two fields now live side by side on the same card-level entry
+  for the first time.
+
+## [1.12.0] - 2026-09-19
+
+### Changed (BREAKING)
+
+- **docs/42 (pre-Phase-H): `anyvac.set_floorplan_seat` / `floorplan_seats`
+  now carry an independent `appearance` override alongside `map`, per
+  vacuum.** The per-vacuum entry shape changes from a flat seat dict
+  (`{rotation, scale, scale_y?, offset_x, offset_y}`) to a nested one -
+  `vacuums[entity] = {"map": {...}, "appearance": {...}}` - with `map` and
+  `appearance` each independently optional and independently nullable
+  (`null`, or simply omitting the key, clears just that half; the other
+  is left untouched). This is a breaking change to the store's on-disk
+  shape: **there is no migration** - a pre-1.12.0 flat-shaped entry has
+  neither a `map` nor an `appearance` key, so it does not match either
+  branch and is silently discarded the first time the integration loads
+  after this update (same as any other malformed/unrecognised entry -
+  the store simply starts empty for any floorplan whose only saved data
+  predates this release). Re-aligning after updating is a one-time cost;
+  see docs/42 §9 (faze pre-H) for the rationale.
+  - New `appearance` schema (all fields optional, 11 total): `hide_map`
+    (bool), `overlay_opacity` (0-100), `overlay_blend` (one of `normal`,
+    `lighten`, `screen`, `plus-lighter`), `path_color` (hex string or
+    `null`), `path_width` (20-300), `mop_path_color` (hex string or
+    `null`), `mop_band_opacity` (0-100), `mop_band_width` (20-400),
+    `robot_image_on_map` (bool), `robot_size` (40-220),
+    `robot_image_rotation` (-180 to 180).
+  - `set_floorplan_seat`'s `map` and `appearance` parameters are fully
+    independent - a call can set/clear either, both, or neither in one
+    request; passing neither leaves both untouched (docs/42 §8 bod 3).
+  - `services.yaml` updated with the new `appearance` field.
+  - `tests/test_floorplan_seats.py` rewritten in full for the nested
+    shape - no old-shape/migration tests remain - with new coverage for
+    independent set/clear of `appearance`, `map`+`appearance` together,
+    schema validation (including rejecting an invalid `overlay_blend`
+    and out-of-range numeric fields), and defensive load-time discarding
+    of malformed `map`/`appearance` sub-values (never crashes startup).
+  - `schema_version` is unchanged - this is a store-content change, not
+    a config-entry migration.
+
+### Added
+
+- Card-side consumer: the `anyvac-card` Visual editor's Seat & Appearance
+  tool (card 1.14.0+) saves through this extended service instead of the
+  Config editor's Maps tab, which no longer writes these fields directly
+  into vacuum config (docs/42 §3/§9).
+
 ## [1.11.0] - 2026-09-18
 
 ### Added

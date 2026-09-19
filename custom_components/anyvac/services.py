@@ -181,13 +181,103 @@ _FLOORPLAN_SEAT_MAP_SCHEMA = vol.Schema(
         vol.Required("offset_y"): _finite_float,
     }
 )
+# docs/42 §9 (fáze pre-H) — Visual editor's Seat & Appearance tool persists
+# its Appearance fields the same way it already persists the seat geometry
+# above: as a backend override, keyed the same way, on the same per-vacuum
+# entry. These 11 fields mirror the card's `VacuumConfig` Appearance fields
+# 1:1 (types.ts) — nothing here is computed or interpreted, only validated
+# and stored opaquely, same posture as `map`.
+_FLOORPLAN_SEAT_APPEARANCE_SCHEMA = vol.Schema(
+    {
+        vol.Optional("hide_map"): bool,
+        vol.Optional("overlay_opacity"): vol.All(vol.Coerce(float), vol.Range(min=0, max=100)),
+        vol.Optional("overlay_blend"): vol.In(["normal", "lighten", "screen", "plus-lighter"]),
+        vol.Optional("path_color"): vol.Any(str, None),
+        vol.Optional("path_width"): vol.All(vol.Coerce(float), vol.Range(min=20, max=300)),
+        vol.Optional("mop_path_color"): vol.Any(str, None),
+        vol.Optional("mop_band_opacity"): vol.All(vol.Coerce(float), vol.Range(min=0, max=100)),
+        vol.Optional("mop_band_width"): vol.All(vol.Coerce(float), vol.Range(min=20, max=400)),
+        vol.Optional("robot_image_on_map"): bool,
+        vol.Optional("robot_size"): vol.All(vol.Coerce(float), vol.Range(min=40, max=220)),
+        vol.Optional("robot_image_rotation"): vol.All(vol.Coerce(float), vol.Range(min=-180, max=180)),
+    }
+)
+# docs/42 §4.4/§8 bod 1 (fáze K) — one room's Rooms-tool override. Mirrors the
+# card's `RoomConfig` rect/anchor fields 1:1 (types.ts `map_x/map_y/map_w/map_h`,
+# `area_id`) — all optional since a caller may set only the geometry, only
+# `area_id`, or both together. `map_x`/`map_y` are unbounded (a room's anchor can
+# legitimately sit outside 0–100% while its dashboard is mid-drag/mid-resize,
+# same posture as `map`'s `offset_x`/`offset_y`); `map_w`/`map_h` must be
+# strictly positive, same posture as `map`'s `scale`.
+_FLOORPLAN_SEAT_ROOM_SCHEMA = vol.Schema(
+    {
+        vol.Optional("map_x"): _finite_float,
+        vol.Optional("map_y"): _finite_float,
+        vol.Optional("map_w"): _positive_finite_float,
+        vol.Optional("map_h"): _positive_finite_float,
+        vol.Optional("area_id"): vol.Any(str, None),
+    }
+)
+# docs/42 §4.4 (fáze K) — `rooms` is a MAP of room_key -> (room override |
+# `null`), unlike `map`/`appearance` which are each a single atomic override.
+# Each key is independent: a dict sets/replaces that one room's override, `null`
+# clears just that one room's override, and a room_key simply not mentioned in
+# a given call is left completely untouched (see `set_floorplan_seat`'s
+# docstring in coordinator.py for why this deliberately does NOT follow the
+# map/appearance "omit the whole field to clear it" convention).
+_FLOORPLAN_SEAT_ROOMS_SCHEMA = vol.Schema({str: vol.Any(_FLOORPLAN_SEAT_ROOM_SCHEMA, None)})
+# docs/42 §3.3/§9 (fáze I addendum, found while implementing the Rooms tool's
+# border-width sliders — not itself in the original §4.4 schema) — the two
+# GLOBAL border-width fields (`room_border_normal`/`room_border_selected`,
+# `types.ts`, previously only settable as plain YAML on the card config) are
+# card-level only (they apply to every vacuum, there is no per-vacuum notion
+# of "this vacuum's room border width") and, like `image_base`, the Rooms
+# tool can only persist them through this backend override layer — the
+# Visual editor is openable from a live dashboard, where the card cannot
+# write its own YAML (docs/41 §0), the same reason `appearance`/`rooms`
+# already go through this service instead of a `config-changed` event. Reuses
+# the editor's existing slider bounds (0–12 px, `editor.ts` `_numberSlider`
+# calls) rather than inventing new ones.
+_FLOORPLAN_SEAT_ROOM_STYLE_SCHEMA = vol.Schema(
+    {
+        vol.Optional("border_normal"): vol.All(vol.Coerce(float), vol.Range(min=0, max=12)),
+        vol.Optional("border_selected"): vol.All(vol.Coerce(float), vol.Range(min=0, max=12)),
+    }
+)
 SET_FLOORPLAN_SEAT_SCHEMA = vol.Schema(
     {
         vol.Required("floorplan"): str,
         # Omitted → this call is about the card-level `image_base` override
-        # instead of a per-vacuum `map` override (docs/41 §4.6).
+        # instead of a per-vacuum `map`/`appearance`/`rooms` override (docs/41 §4.6).
         vol.Optional("vacuum"): str,
         vol.Optional("map"): vol.Any(_FLOORPLAN_SEAT_MAP_SCHEMA, None),
+        # docs/42 — independent of `map`; the card's Visual editor always
+        # sends both together on Save (current draft state for each), but
+        # this field can be set/cleared on its own. Omitted (like `None`)
+        # clears any existing appearance override for this vacuum — see
+        # `AnyVacCoordinator.set_floorplan_seat`'s docstring and the
+        # `appearance` field's own description in services.yaml.
+        vol.Optional("appearance"): vol.Any(_FLOORPLAN_SEAT_APPEARANCE_SCHEMA, None),
+        # docs/42 §4.4 (fáze K) — independent of `map`/`appearance`, and with
+        # its OWN merge semantics (per room_key, see _FLOORPLAN_SEAT_ROOMS_SCHEMA
+        # above) rather than the whole-field "omit = clear" rule `map`/
+        # `appearance` use. Omitting `rooms` entirely from a call (e.g. a plain
+        # seat-geometry Save from the Seat & Appearance tool) leaves every
+        # existing room override untouched. Valid with `vacuum` given (split
+        # mode, per-vacuum rooms) OR omitted (merged mode, card-level rooms —
+        # same "vacuum given = per-vacuum, omitted = card-level" split
+        # `image_base` already uses); see `AnyVacCoordinator
+        # .set_floorplan_seat`'s docstring for how it interacts with
+        # `image_base` when both apply to a card-level call.
+        vol.Optional("rooms"): _FLOORPLAN_SEAT_ROOMS_SCHEMA,
+        # docs/42 §3.3/§9 (fáze I addendum) — card-level only (ignored when
+        # `vacuum` is given, same as `image_base`); follows the SAME atomic
+        # "no sentinel" contract as `image_base`/`map`/`appearance`: omitted
+        # (or explicit `null`) clears any existing `room_style` override, so
+        # a card-level call that wants to KEEP it (e.g. a pure rooms-geometry
+        # or image_base Save) must resend the current draft every time — see
+        # `AnyVacCoordinator.set_floorplan_seat`'s docstring.
+        vol.Optional("room_style"): vol.Any(_FLOORPLAN_SEAT_ROOM_STYLE_SCHEMA, None),
         # Opaque here (crop_box/home_anchors, docs/41 phase G) — stored and
         # returned as-is, never interpreted at this layer.
         vol.Optional("image_base"): vol.Any(dict, None),
@@ -1520,6 +1610,9 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
                 vacuum=call.data.get("vacuum"),
                 map=call.data.get("map"),
                 image_base=call.data.get("image_base"),
+                appearance=call.data.get("appearance"),
+                rooms=call.data.get("rooms"),
+                room_style=call.data.get("room_style"),
             )
 
     async def _handle_set_room_sequence(call: ServiceCall) -> None:
