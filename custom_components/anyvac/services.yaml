@@ -479,7 +479,7 @@ set_room_sequence:
 reset_learning:
   name: Reset learning
   description: >-
-    Clear learned clean-time estimates and/or coverage baselines, e.g.
+    Clear learned clean-time estimates and/or the stored per-room completion %, e.g.
     after moving furniture or resetting a robot's map. Without filters,
     clears everything for every known vacuum/room/kind.
   fields:
@@ -507,7 +507,7 @@ reset_learning:
       selector:
         boolean:
     baselines:
-      name: Clear coverage baselines
+      name: Clear stored completion %
       default: true
       selector:
         boolean:

@@ -6,6 +6,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.45.0] - 2026-09-30
+
+Pairs with card **1.45.0** (docs/45 — room completion). Version jumps from
+1.39.0 to the card's number per the pairing rule.
+
+### Changed
+
+- **A room's % now means "how much of the ordered work is done".** New module
+  `coverage.py` replaces the docs/29 method (cells the robot's centre crossed,
+  divided by a baseline learned from earlier cleans — which measured "like last
+  time", saturated in the first of two passes, and read ~83 % on an empty
+  rectangular room). Now:
+  - the room is its floor cells from the robot's own raw map (docs/40 decoder),
+    only the part a robot body can sweep (morphological opening with the
+    robot's footprint) — no learning, furniture changes show up immediately;
+  - the numerator is the robot footprint stamped along the trajectory;
+  - passes come from the status's `repeat`: pass 1 is measured spatially, every
+    further pass as path length relative to pass 1 (pass 1 ends where coverage
+    saturates). Verified on a real 2-pass S7 run against the firmware's own
+    `clean_percent`: within 10 points throughout.
+  - Without a decoded grid (self-test failure) a room falls back to its bounding
+    box on the same 50 mm grid.
+- **Rooms the robot only drives through never get a number.** The run's
+  targets come from the map's `BLOCKS` block (the segments of the running clean,
+  present for every segment clean however it was started) united with the job
+  scope. A target room becomes the active one only after a dwell — 1.5 m of path
+  for the room the configured sequence says is next, 6 m otherwise — so a
+  corridor crossed on the way is ignored even in a whole-home clean.
+- **The last seconds of a room are no longer dropped.** The firmware refreshes
+  the map on the state change, so they arrive in the poll that already reports
+  `returning_home` / the end of the run; that poll is now attributed to the
+  active room (coverage only, its time stays unattributed as before).
+- `rooms_progress[room]`: `dry_pct`/`wet_pct` = completion; new `dry_floor`,
+  `wet_floor`, `dry_pass`, `wet_pass`, `passes`, `active`, `done`;
+  `*_calibrating` is always `false`; `dry_visited`/`wet_visited`/`total_cells`/
+  `*_baseline` removed. Only rooms the run really cleaned appear.
+- `rooms_coverage[room]`: `dry`/`wet` = completion of the last run that cleaned
+  the room (100 for a room the robot left for the next target, 90+ snaps to 100
+  for the room a run ended in), new `dry_floor`/`wet_floor`. New store
+  `anyvac_room_completion`; the old `anyvac_coverage_baseline` and
+  `anyvac_room_coverage_pct` files are removed at startup (different meaning).
+- Time calibration learns only from rooms completed to 100 %; room-done /
+  history evidence requires the room to have been really cleaned (≥ 30 % of its
+  reachable floor).
+- `anyvac.reset_learning`'s `baselines` flag now clears the stored completion %.
+
+### Added
+
+- `coverage_debug` attribute (run targets, active and finished rooms, passes,
+  path ignored per room) — replaces `transit_cells`.
+- `repeat` and `target_segments` attributes.
+
+### Removed
+
+- The learned coverage baselines (`_learn_coverage`) and `COVERAGE_CELL_MM`.
+
 ## [1.39.0] - 2026-09-30
 
 Pairs with card **1.39.0** (docs/44 F2 — the card's hero bar). Version jumps

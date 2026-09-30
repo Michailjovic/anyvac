@@ -4,13 +4,12 @@ A job dispatched progressively (docs/23) docks between its batches, and a
 firmware path reset can happen mid-clean when the robot comes back for another
 pass through a room. Both look like a fresh ``in_cleaning`` edge / a fresh
 trajectory, but neither is a new CLEAN — and everything that measures the clean
-(coverage cells, per-room active time, the run's start time, the learned
-"full clean" baseline, the persisted coverage %) has to span the whole run.
+(the run's `RunTracker` with its footprint cells, per-room active time, the
+run's start time, the persisted completion %) has to span the whole run.
 
 Before docs/36 each sortie was harvested as if it were a complete clean, so a
-room cleaned across a dock trip persisted a partial % and its ~60 %-of-a-clean
-cell count was fed to `_learn_coverage`, dragging the baseline down towards the
-size of one batch until every room eventually read 100 %.
+room cleaned across a dock trip persisted a partial %. (The learned "full
+clean" baseline this file originally also guarded is gone since docs/45.)
 
 Harness copied from `test_room_coverage_pct.py` (established per-file
 duplication convention in this test suite).
@@ -62,7 +61,7 @@ def _new_coordinator(monkeypatch: pytest.MonkeyPatch, clock: _Clock) -> AnyVacCo
     coord = object.__new__(AnyVacCoordinator)
     coord.hass = _FakeHass()
     for attr in (
-        "_store", "_est_store", "_cov_store", "_cov_pct_store", "_sel_store",
+        "_store", "_est_store", "_cov_store", "_cov_pct_store", "_cov_legacy_pct_store", "_sel_store",
         "_pins_store", "_seq_store", "_layers_store", "_paths_store",
     ):
         setattr(coord, attr, _FakeStore())
@@ -82,15 +81,16 @@ def _new_coordinator(monkeypatch: pytest.MonkeyPatch, clock: _Clock) -> AnyVacCo
     coord._room_sequence = {}
     coord._room_elapsed = {}
     coord._last_poll = {}
-    coord._room_cells = {}
+    coord._runs = {}
     coord._job_rooms = {}
     coord._job_seq = 0
     coord._job_id = {}
     coord._path_job_id = {}
     coord._run_pending = {}
-    coord._transit_cells = {}
+    coord._run_targets_seen = {}
     coord._path_seen = {}
-    coord._cov_baseline = {}
+    coord._cov_gate = {}
+    coord._geo = {}
     coord._room_coverage = {}
     coord._dry_path = {}
     coord._dry_path_open = {}
@@ -107,20 +107,27 @@ def _new_coordinator(monkeypatch: pytest.MonkeyPatch, clock: _Clock) -> AnyVacCo
     return coord
 
 
-# Hall spans 0..1000 mm on both axes -> 5x5 = 25 cells of COVERAGE_CELL_MM, so a
-# 5-cell baseline sits exactly AT the 20 %-of-bbox poison guard instead of
-# tripping it (same geometry as test_room_coverage_pct.py). Kitchen is the
-# neighbouring room the robot only ever drives through.
+# Hall is the room being cleaned; Kitchen the neighbour the robot only ever
+# drives through. Every real segment clean carries its targets in the map's
+# BLOCKS (docs/45), so `_device` defaults `target_segments` to Hall.
 ROOMS = [
     {"segment_id": 1, "name": "Hall", "x0": 0, "y0": 0, "x1": 1000, "y1": 1000},
     {"segment_id": 2, "name": "Kitchen", "x0": 1000, "y0": 0, "x1": 2000, "y1": 1000},
 ]
 
-# Five points, each in its own 250 mm cell of Hall.
-HALL5 = [
-    {"x": 100, "y": 100}, {"x": 400, "y": 100}, {"x": 700, "y": 100},
-    {"x": 100, "y": 400}, {"x": 100, "y": 700},
-]
+
+def _lawn() -> list[dict[str, float]]:
+    """Hall cleaned boustrophedon, 117 mm lanes, a point every 150 mm."""
+    pts: list[dict[str, float]] = []
+    for i in range(8):
+        y = 80 + i * 117
+        xs = [80 + j * 150 for j in range(6)] + [920]
+        pts += [{"x": x, "y": y} for x in (xs if i % 2 == 0 else xs[::-1])]
+    return pts
+
+
+HALL = _lawn()
+HALF = len(HALL) // 2
 
 
 def _device(duid: str, **overrides: Any) -> AnyVacDevice:
@@ -132,6 +139,7 @@ def _device(duid: str, **overrides: Any) -> AnyVacDevice:
         "vacuum_room_name": None,
         "rooms": [dict(r) for r in ROOMS],
         "cleaned_rooms": [],
+        "target_segments": [1],
         "_path_dry": [],
         "_path_wet": [],
     }
@@ -148,17 +156,24 @@ def _poll(coord: AnyVacCoordinator, device: AnyVacDevice) -> None:
 
 def _sortie(
     coord: AnyVacCoordinator, clock: _Clock, duid: str, points: list[dict[str, float]],
-    room: str = "Hall", dock: bool = True,
+    room: str = "Hall", dock: bool = True, step: int = 8,
 ) -> None:
-    """One outing: cleans `room` point by point (confirmed from the 2nd poll on,
-    the same debounce pattern the other pipeline tests use), then docks."""
-    _poll(coord, _device(duid, vacuum_room_name=room, _path_dry=points[:1]))
-    for i in range(2, len(points) + 1):
-        clock.advance(minutes=5)
+    """One outing: cleans `room` in polls of `step` new points, 1 min apart,
+    then docks."""
+    i = 0
+    while i < len(points):
+        i = min(len(points), i + step)
         _poll(coord, _device(duid, vacuum_room_name=room, _path_dry=points[:i]))
+        clock.advance(minutes=1)
     if dock:
-        clock.advance(minutes=5)
+        clock.advance(minutes=1)
         _poll(coord, _device(duid, in_cleaning=False))
+
+
+def _hall_cells(coord: AnyVacCoordinator, duid: str) -> int:
+    run = coord._runs.get(duid)
+    kr = ((run.rooms if run else {}).get("Hall") or {}).get("dry")
+    return len(kr.cells) if kr else 0
 
 
 @pytest.fixture
@@ -171,34 +186,24 @@ def test_split_job_measures_the_whole_run_not_one_batch(
 ) -> None:
     """The regression this file exists for. One job, two batches with a dock trip
     in between, together covering exactly what a single-outing clean covers: the
-    persisted % must read 100 % and the learned baseline must not move."""
+    persisted % must read 100 %, and nothing may be persisted mid-job."""
     coord = _new_coordinator(monkeypatch, clock)
     duid = "d1"
-
-    # Reference clean in one outing -> baseline 5 cells.
     coord.set_job_rooms(duid, {"Hall"})
-    _sortie(coord, clock, duid, HALL5)
-    coord.set_job_rooms(duid, None)
-    clock.advance(minutes=5)
-    _poll(coord, _device(duid, in_cleaning=False))  # scope cleared -> run harvested
-    assert coord._cov_baseline[duid]["Hall"]["dry"] == 5
-
-    # The same clean, this time dispatched as 3 cells + 2 cells.
-    clock.advance(minutes=5)
-    coord.set_job_rooms(duid, {"Hall"})
-    _sortie(coord, clock, duid, HALL5[:3])
-    # Mid-job: nothing harvested yet — no partial % written, baseline untouched.
+    _sortie(coord, clock, duid, HALL[:HALF])
+    # Mid-job: nothing harvested yet — no partial % written.
     assert coord._room_coverage.get("Hall", {}).get("dry") is None
-    assert coord._cov_baseline[duid]["Hall"]["dry"] == 5
+    assert duid in coord._run_pending
 
     clock.advance(minutes=5)
-    _sortie(coord, clock, duid, HALL5[3:])
+    # The firmware restarts its trajectory for the second batch.
+    _sortie(coord, clock, duid, HALL[HALF:])
     coord.set_job_rooms(duid, None)
     clock.advance(minutes=5)
     _poll(coord, _device(duid, in_cleaning=False))
 
-    assert coord._room_coverage["Hall"]["dry"] == 100  # 5 of 5 cells, both batches
-    assert coord._cov_baseline[duid]["Hall"]["dry"] == 5  # a full clean, not a batch
+    assert coord._room_coverage["Hall"]["dry"] == 100  # both batches together
+    assert coord._room_coverage["Hall"]["dry_floor"] >= 95
 
 
 def test_run_events_fire_once_per_run(monkeypatch: pytest.MonkeyPatch, clock: _Clock) -> None:
@@ -208,9 +213,9 @@ def test_run_events_fire_once_per_run(monkeypatch: pytest.MonkeyPatch, clock: _C
     coord = _new_coordinator(monkeypatch, clock)
     duid = "d2"
     coord.set_job_rooms(duid, {"Hall"})
-    _sortie(coord, clock, duid, HALL5[:3])
+    _sortie(coord, clock, duid, HALL[:HALF])
     clock.advance(minutes=5)
-    _sortie(coord, clock, duid, HALL5[3:])
+    _sortie(coord, clock, duid, HALL[HALF:])
     coord.set_job_rooms(duid, None)
     clock.advance(minutes=5)
     _poll(coord, _device(duid, in_cleaning=False))
@@ -232,11 +237,11 @@ def test_manual_sortie_without_job_scope_closes_immediately(
     before docs/36 — same events, same accumulator reset."""
     coord = _new_coordinator(monkeypatch, clock)
     duid = "d3"
-    _sortie(coord, clock, duid, HALL5)
+    _sortie(coord, clock, duid, HALL)
 
     assert coord._run_pending == {}
-    assert coord._room_cells[duid] == {}  # harvested and cleared on the dock poll
-    assert coord._cov_baseline[duid]["Hall"]["dry"] == 5
+    assert _hall_cells(coord, duid) == 0  # harvested and cleared on the dock poll
+    assert coord._room_coverage["Hall"]["dry"] == 100
     assert coord.hass.bus.names() == [
         "anyvac_clean_started", "anyvac_room_done",
         "anyvac_clean_finished", "anyvac_run_finished",
@@ -247,83 +252,73 @@ def test_midrun_path_reset_keeps_the_coverage_cells(
     monkeypatch: pytest.MonkeyPatch, clock: _Clock
 ) -> None:
     """A firmware path reset inside a run (the robot returning for another pass
-    through a room) is stitched for the drawn trace by docs/27 — the coverage
-    cells now follow the same verdict instead of being wiped unconditionally."""
+    through a room) is stitched for the drawn trace by docs/27 — the run's
+    coverage follows the same verdict instead of being wiped."""
     coord = _new_coordinator(monkeypatch, clock)
     duid = "d4"
     coord.set_job_rooms(duid, {"Hall"})
-    _sortie(coord, clock, duid, HALL5[:3], dock=False)
-    assert len(coord._room_cells[duid]["Hall"]["dry"]) == 3
+    _sortie(coord, clock, duid, HALL[:HALF], dock=False)
+    before = _hall_cells(coord, duid)
+    assert before > 0
 
     # The robot's own array restarts (shorter than what we have already seen).
-    clock.advance(minutes=5)
-    _poll(coord, _device(duid, vacuum_room_name="Hall", _path_dry=HALL5[3:4]))
-    clock.advance(minutes=5)
-    _poll(coord, _device(duid, vacuum_room_name="Hall", _path_dry=HALL5[3:]))
+    _poll(coord, _device(duid, vacuum_room_name="Hall", _path_dry=HALL[HALF:HALF + 1]))
+    clock.advance(minutes=1)
+    _poll(coord, _device(duid, vacuum_room_name="Hall", _path_dry=HALL[HALF:]))
 
-    assert len(coord._room_cells[duid]["Hall"]["dry"]) == 5
+    assert _hall_cells(coord, duid) > before
     # ...and the trace is stitched, not bridged: two segments, nothing lost.
-    assert [len(s) for s in coord._dry_path[duid]] == [3, 2]
+    assert sum(len(s) for s in coord._dry_path[duid]) == len(HALL)
+    assert len(coord._dry_path[duid]) == 2
 
 
 def test_path_reset_outside_a_job_still_wipes_the_cells(
     monkeypatch: pytest.MonkeyPatch, clock: _Clock
 ) -> None:
     """Mirror of the docs/27 guard for the trace: with no job scope a restarted
-    trajectory IS an unrelated new clean, so its cells must start over."""
+    trajectory IS an unrelated new clean, so its coverage must start over."""
     coord = _new_coordinator(monkeypatch, clock)
     duid = "d5"
-    _sortie(coord, clock, duid, HALL5[:3], dock=False)
-    assert len(coord._room_cells[duid]["Hall"]["dry"]) == 3
+    _sortie(coord, clock, duid, HALL[:HALF], dock=False)
+    assert _hall_cells(coord, duid) > 0
 
-    clock.advance(minutes=5)
-    _poll(coord, _device(duid, vacuum_room_name="Hall", _path_dry=HALL5[3:4]))
-    assert len(coord._room_cells[duid]["Hall"]["dry"]) == 1
-    assert coord._dry_path[duid] == [[HALL5[3]]]
+    _poll(coord, _device(duid, vacuum_room_name="Hall", _path_dry=HALL[HALF:HALF + 1]))
+    assert _hall_cells(coord, duid) == 0  # a fresh run: not even activated yet
+    assert coord._dry_path[duid] == [[HALL[HALF]]]
 
 
 def test_drive_through_room_gets_no_live_gauge(
     monkeypatch: pytest.MonkeyPatch, clock: _Clock
 ) -> None:
-    """docs/36: outside an orchestrated job there is no room scope to filter
-    plan-transit, so a corridor crossed with the fan on collects real cells. The
-    live gauge must not turn those into a per-room %: a room qualifies only once
-    it is in the job's scope, debounce-confirmed, or in `cleaned_rooms`."""
+    """docs/36 → docs/45: a corridor crossed with the fan on is not a target of
+    the run, so it never becomes coverage and never gets a number."""
     coord = _new_coordinator(monkeypatch, clock)
     duid = "d6"
-    pts = HALL5[:3] + [{"x": 1100, "y": 100}, {"x": 1400, "y": 100}]
-
-    for i in range(1, len(pts) + 1):
-        clock.advance(minutes=1)
-        _poll(coord, _device(duid, vacuum_room_name="Hall", _path_dry=pts[:i]))
-
-    # The cells are collected (they are what the trace is made of)...
-    assert "Kitchen" in coord._room_cells[duid]
-    # ...but only the room actually being cleaned gets a number.
+    pts = HALL + [{"x": 1100 + 150 * i, "y": 500} for i in range(5)]
+    _sortie(coord, clock, duid, pts, dock=False)
     progress = coord._build_progress(_device(duid, vacuum_room_name="Hall"))
     assert set(progress) == {"Hall"}
+    assert coord._runs[duid].ignored.get("Kitchen", 0) > 0
 
 
 def test_stuck_job_scope_cannot_hold_a_run_open_forever(
     monkeypatch: pytest.MonkeyPatch, clock: _Clock
 ) -> None:
     """Safety net: a job runner torn down without its cleanup path leaves the
-    scope set. The elapsed cap closes the run anyway, so the coverage % is never
-    lost to a scope that will never clear."""
+    scope set. The elapsed cap closes the run anyway, so the completion % is
+    never lost to a scope that will never clear."""
     coord = _new_coordinator(monkeypatch, clock)
     duid = "d7"
     coord.set_job_rooms(duid, {"Hall"})
-    _sortie(coord, clock, duid, HALL5)  # baseline run
-    coord._run_pending.clear()
-    coord._harvest_run(_device(duid, in_cleaning=False))
-    clock.advance(minutes=5)
-    _sortie(coord, clock, duid, HALL5)
+    _sortie(coord, clock, duid, HALL)
     assert duid in coord._run_pending  # deferred: the scope is still set
+    assert coord._room_coverage.get("Hall") is None
 
     clock.advance(hours=4)  # past _RUN_DEFER_MAX_S
     _poll(coord, _device(duid, in_cleaning=False))
     assert coord._run_pending == {}
-    assert coord._room_cells[duid] == {}
+    assert coord._room_coverage["Hall"]["dry"] == 100
+    assert _hall_cells(coord, duid) == 0
 
 
 def test_job_releasing_the_vacuum_mid_flight_still_closes_the_run(
@@ -336,15 +331,15 @@ def test_job_releasing_the_vacuum_mid_flight_still_closes_the_run(
     coord = _new_coordinator(monkeypatch, clock)
     duid = "d8"
     coord.set_job_rooms(duid, {"Hall"})
-    _sortie(coord, clock, duid, HALL5[:3])
+    _sortie(coord, clock, duid, HALL[:HALF])
     assert duid in coord._run_pending  # batch 1 deferred, job still holds the scope
 
     clock.advance(minutes=5)
-    _sortie(coord, clock, duid, HALL5[3:], dock=False)
+    _sortie(coord, clock, duid, HALL[HALF:], dock=False)
     coord.set_job_rooms(duid, None)  # job closes out while the robot drives home
-    clock.advance(minutes=5)
+    clock.advance(minutes=1)
     _poll(coord, _device(duid, in_cleaning=False))
 
     assert coord._run_pending == {}
     assert coord.hass.bus.names().count("anyvac_run_finished") == 1
-    assert coord._cov_baseline[duid]["Hall"]["dry"] == 5  # whole run, both batches
+    assert coord._room_coverage["Hall"]["dry"] == 100  # whole run, both batches

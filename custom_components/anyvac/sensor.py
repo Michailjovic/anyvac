@@ -79,7 +79,7 @@ class AnyVacMapSensor(CoordinatorEntity[AnyVacCoordinator], SensorEntity):
             "vacuum_room", "vacuum_room_name", "in_cleaning", "clean_type", "mop_signal", "duid",
             "path_points", "mop_path_points", "calib_debug", "selected_rooms",
             "rooms_progress", "rooms_coverage", "path_dry", "path_dry_points", "path_wet", "path_wet_points",
-            "status_state", "transit", "transit_cells", "vacuuming", "view_layers",
+            "status_state", "transit", "coverage_debug", "repeat", "target_segments", "vacuuming", "view_layers",
             "debug_map", "schema_version", "vacuum_position_px", "charger_px",
             "path_dry_px", "path_wet_px", "pipeline_ok", "pipeline_error",
             "room_pins", "room_sequence", "dock_status", "floorplan_seats",

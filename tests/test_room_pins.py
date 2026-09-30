@@ -138,6 +138,7 @@ async def _load_pins(load_value: Any) -> dict[str, dict[str, str]]:
     coord._seats_store = _FakeStore()
     coord._cov_store = _FakeStore()
     coord._cov_pct_store = _FakeStore()
+    coord._cov_legacy_pct_store = _FakeStore()
     coord._est_store = _FakeStore()
     coord._paths_store = _FakeStore()
     coord._home_frame_store = _FakeStore()
@@ -188,7 +189,7 @@ def _pin_lifecycle_coordinator(clock_now: datetime) -> AnyVacCoordinator:
     `_new_coordinator`/`_poll` pattern, trimmed to what this path touches."""
     coord = object.__new__(AnyVacCoordinator)
     coord.hass = _FakeHass()
-    for attr in ("_store", "_est_store", "_cov_store", "_cov_pct_store", "_sel_store", "_seq_store", "_layers_store", "_paths_store"):
+    for attr in ("_store", "_est_store", "_cov_store", "_cov_pct_store", "_cov_legacy_pct_store", "_sel_store", "_seq_store", "_layers_store", "_paths_store"):
         setattr(coord, attr, _FakeStore())
     coord._pins_store = _FakeStore()
     coord._history = {}
@@ -207,15 +208,16 @@ def _pin_lifecycle_coordinator(clock_now: datetime) -> AnyVacCoordinator:
     coord._room_sequence = {}
     coord._room_elapsed = {}
     coord._last_poll = {}
-    coord._room_cells = {}
+    coord._runs = {}
     coord._job_rooms = {}
     coord._job_seq = 0
     coord._job_id = {}
     coord._path_job_id = {}
     coord._run_pending = {}
-    coord._transit_cells = {}
+    coord._run_targets_seen = {}
     coord._path_seen = {}
-    coord._cov_baseline = {}
+    coord._cov_gate = {}
+    coord._geo = {}
     coord._room_coverage = {}
     coord._dry_path = {}
     coord._dry_path_open = {}

@@ -82,7 +82,7 @@ def _new_coordinator(monkeypatch: pytest.MonkeyPatch, clock: _Clock) -> AnyVacCo
     coord = object.__new__(AnyVacCoordinator)
     coord.hass = _FakeHass()
     for attr in (
-        "_store", "_est_store", "_cov_store", "_cov_pct_store", "_sel_store",
+        "_store", "_est_store", "_cov_store", "_cov_pct_store", "_cov_legacy_pct_store", "_sel_store",
         "_pins_store", "_seq_store", "_layers_store", "_paths_store",
     ):
         setattr(coord, attr, _FakeStore())
@@ -102,15 +102,16 @@ def _new_coordinator(monkeypatch: pytest.MonkeyPatch, clock: _Clock) -> AnyVacCo
     coord._room_sequence = {}
     coord._room_elapsed = {}
     coord._last_poll = {}
-    coord._room_cells = {}
+    coord._runs = {}
     coord._job_rooms = {}
     coord._job_seq = 0
     coord._job_id = {}
     coord._path_job_id = {}
     coord._run_pending = {}
-    coord._transit_cells = {}
+    coord._run_targets_seen = {}
     coord._path_seen = {}
-    coord._cov_baseline = {}
+    coord._cov_gate = {}
+    coord._geo = {}
     coord._room_coverage = {}
     coord._dry_path = {}
     coord._dry_path_open = {}
@@ -126,13 +127,28 @@ def _new_coordinator(monkeypatch: pytest.MonkeyPatch, clock: _Clock) -> AnyVacCo
     return coord
 
 
-# Two non-overlapping room bboxes (mm), sized so a handful of well-spread points
-# clear the coverage-evidence floor (>=3 distinct 250mm cells, docs/16 §_evidence_kinds)
-# without needing a learned baseline.
+# Two non-overlapping room bboxes (mm) with a strip of plain floor between them
+# (1000..2000 mm belongs to no room). Paths are boustrophedon lanes 117 mm apart
+# with a point every 150 mm — what the firmware records (docs/45 §3.1) — so a
+# room's completion is real footprint coverage, not a handful of sample points.
 ROOMS = [
     {"segment_id": 1, "name": "Hall", "x0": 0, "y0": 0, "x1": 1000, "y1": 1000},
     {"segment_id": 2, "name": "Bathroom", "x0": 2000, "y0": 0, "x1": 3000, "y1": 1000},
 ]
+
+
+def _lawn(x0: float) -> list[dict[str, float]]:
+    """A full clean of the 1 m room starting at `x0`."""
+    pts: list[dict[str, float]] = []
+    for i in range(8):
+        y = 80 + i * 117
+        xs = [x0 + 80 + j * 150 for j in range(6)] + [x0 + 920]
+        pts += [{"x": x, "y": y} for x in (xs if i % 2 == 0 else xs[::-1])]
+    return pts
+
+
+HALL = _lawn(0)
+BATH = _lawn(2000)
 
 
 def _device(duid: str, **overrides: Any) -> AnyVacDevice:
@@ -146,6 +162,7 @@ def _device(duid: str, **overrides: Any) -> AnyVacDevice:
         "vacuum_room_name": None,
         "rooms": [dict(r) for r in ROOMS],
         "cleaned_rooms": [],
+        "target_segments": [1, 2],
         "_path_dry": [],
         "_path_wet": [],
     }
@@ -172,76 +189,48 @@ def test_mop_wash_freezes_attribution_and_room_done(
     monkeypatch: pytest.MonkeyPatch, clock: _Clock
 ) -> None:
     """A mid-clean mop wash (`transit=True`, still `in_cleaning=True`) must not
-    accrue coverage cells or elapsed time, and must not fire `anyvac_room_done`
-    — docs/13 A1+A2 / docs/14 rule 4: HA maps mop-wash to `docked`, so only our
-    own `transit` flag can protect the room confirmation and single-room
-    calibration from a false "left the room" read mid-wash.
+    accrue elapsed time or fire `anyvac_room_done` — docs/13 A1+A2 / docs/14
+    rule 4: HA maps mop-wash to `docked`, so only our own `transit` flag can
+    protect the room confirmation and single-room calibration from a false
+    "left the room" read mid-wash.
 
-    The gap's OWN duration (poll C -> poll D, 5 min 6 s) must not appear in the
-    final estimate either — the mop-wash poll's delta is dropped entirely
-    rather than deferred, so the learned estimate should reflect exactly the
-    two genuinely-cleaning deltas (5 min + 5 min), not the wall-clock span of
-    the whole session (20 min)."""
+    docs/45 changed ONE thing here on purpose: the new points that arrive with
+    the transit poll ARE credited as coverage (restricted to the room being
+    cleaned) — the firmware refreshes the map on that state change, so they are
+    the last seconds of cleaning before the robot turned for the dock. Their
+    time delta still stays unattributed, so the learned estimate is exactly the
+    two genuinely-cleaning deltas (5 min + 5 min), not the 20 min wall clock."""
     coord = _new_coordinator(monkeypatch, clock)
     duid = "d1"
+    dev = lambda n, **kw: _device(duid, vacuum_room_name="Hall", target_segments=[1],
+                                  _path_dry=HALL[:n], **kw)
 
-    # Poll A: first ever poll, cleaning Hall, one point (cell (0,0)).
-    _poll(coord, _device(duid, vacuum_room_name="Hall", _path_dry=[{"x": 100, "y": 100}]))
+    _poll(coord, dev(12))
     assert coord._room_elapsed.get(duid, {}) == {}  # first poll has no "last" to diff against
 
-    # Poll B (+5 min): still Hall, confirmed now (2nd consecutive raw match), one
-    # new point in a new cell -> 5 min attributed.
     clock.advance(minutes=5)
-    _poll(coord, _device(
-        duid, vacuum_room_name="Hall",
-        _path_dry=[{"x": 100, "y": 100}, {"x": 400, "y": 100}],
-    ))
+    _poll(coord, dev(28))
     assert coord._confirmed_room[duid] == "Hall"
     assert coord._room_elapsed[duid]["Hall"] == pytest.approx(300.0)
+    cells_before = len(coord._runs[duid].rooms["Hall"]["dry"].cells)
 
-    # Poll C (+5 min 6 s): mop wash starts (transit=True) — but the trajectory
-    # keeps growing (the robot is still physically moving toward the dock),
-    # with TWO new points that would land in two brand-new cells if counted.
-    # This is the actual guard under test: `_attribute_points` marks new
-    # points "seen" regardless of `transit` (so they can never be replayed
-    # later either), but only accrues cells/elapsed when `not transit` — a
-    # weaker test that fed no new points during this poll would pass even if
-    # that gate were deleted, since there'd be nothing to (mis)attribute.
-    before_cells = {k: dict(v) for k, v in coord._room_cells[duid].items()}
+    # Poll C (+5 min 6 s): mop wash starts; the trajectory grew by 12 points.
     clock.advance(minutes=5, seconds=6)
-    _poll(coord, _device(
-        duid, vacuum_room_name="Hall", transit=True, vacuuming=False,
-        _path_dry=[
-            {"x": 100, "y": 100}, {"x": 400, "y": 100},
-            {"x": 700, "y": 100}, {"x": 100, "y": 400},
-        ],
-    ))
-    assert coord._room_elapsed[duid]["Hall"] == pytest.approx(300.0)  # unchanged
-    assert coord._room_cells[duid] == before_cells  # unchanged despite 2 new points
-    assert coord._path_seen[duid]["dry"] == 4  # ...which are gone for good, not deferred
+    _poll(coord, dev(40, transit=True, vacuuming=False))
+    assert coord._room_elapsed[duid]["Hall"] == pytest.approx(300.0)  # no time
+    assert len(coord._runs[duid].rooms["Hall"]["dry"].cells) == cells_before  # vacuuming off
+    assert coord._path_seen[duid]["dry"] == 40  # seen once, never replayed
     assert coord.hass.bus.names() == ["anyvac_clean_started"]  # no room_done during transit
-    assert coord._confirmed_room[duid] == "Hall"  # not reset by the transit poll either
+    assert coord._confirmed_room[duid] == "Hall"
 
-    # Poll D (+5 min): mop wash ends, resumes cleaning Hall with one genuinely
-    # new point (the two from poll C are gone — see `_path_seen` above).
-    # Delta is measured from poll C's timestamp, so it's exactly 5 min — the
-    # mop-wash gap itself was never "pending", it was dropped outright at C.
+    # Poll D (+5 min): the wash ends, cleaning resumes and finishes the room.
     clock.advance(minutes=5)
-    _poll(coord, _device(
-        duid, vacuum_room_name="Hall",
-        _path_dry=[
-            {"x": 100, "y": 100}, {"x": 400, "y": 100},
-            {"x": 700, "y": 100}, {"x": 100, "y": 400}, {"x": 900, "y": 700},
-        ],
-    ))
+    _poll(coord, dev(len(HALL)))
     assert coord._room_elapsed[duid]["Hall"] == pytest.approx(600.0)
-    assert len(coord._room_cells[duid]["Hall"]["dry"]) == 3
 
-    # Poll E (+5 min): docks. Evidence (3 cells) clears the floor -> room_done +
-    # history stamp fire; session end calibrates exactly 10 minutes (not the 20
-    # minutes of wall-clock session length, which included the mop-wash gap).
+    # Poll E (+5 min): docks -> room_done + history stamp; calibrates 10 minutes.
     clock.advance(minutes=5)
-    _poll(coord, _device(duid, in_cleaning=False))
+    _poll(coord, _device(duid, in_cleaning=False, target_segments=[1], _path_dry=HALL))
     assert coord.hass.bus.names() == [
         "anyvac_clean_started", "anyvac_room_done", "anyvac_clean_finished",
         # docs/36: with no orchestrated job scope the run closes on the same poll,
@@ -257,51 +246,34 @@ def test_mop_wash_freezes_attribution_and_room_done(
 def test_transit_drive_through_not_counted_as_completed(
     monkeypatch: pytest.MonkeyPatch, clock: _Clock
 ) -> None:
-    """A robot whose dock sits in (or whose path merely crosses) a room it never
-    actually cleans this session must not have that room calibrated — even
-    though `_attribute_points` picks up a few cells there just from the
-    trajectory passing through, evidence-gated by `completed` (firmware
-    `cleaned_rooms` OR the debounced room-confirmation), never by cell count
-    alone. Docs/13 A2/B8: this is the guard field-confirmed via the
-    "not completed (transit only?)" rejection reason."""
+    """A robot whose dock sits in (or whose path merely crosses) a room it does
+    not clean this run must not get that room calibrated, stamped or released
+    as done. docs/45: the room is not in the run's targets (map BLOCKS), so its
+    points are ignored at attribution time and it never becomes coverage."""
     coord = _new_coordinator(monkeypatch, clock)
     duid = "d2"
-
-    # The robot is cleaning Bathroom the entire session — `vacuum_room_name`
-    # never once reports "Hall", so Hall can never pass the 2-consecutive-poll
-    # confirmation debounce. Its cells nonetheless accrue because a few path
-    # points geometrically land inside Hall's bbox along the way.
-    _poll(coord, _device(duid, vacuum_room_name="Bathroom", _path_dry=[{"x": 2100, "y": 100}]))
-
+    path = HALL[:14] + BATH  # drives out through Hall, then cleans Bathroom
+    dev = lambda n: _device(duid, vacuum_room_name="Bathroom", target_segments=[2],
+                            _path_dry=path[:n])
+    _poll(coord, dev(20))
     clock.advance(minutes=5)
-    _poll(coord, _device(
-        duid, vacuum_room_name="Bathroom",
-        _path_dry=[{"x": 2100, "y": 100}, {"x": 2400, "y": 100}, {"x": 100, "y": 100}],
-    ))
+    _poll(coord, dev(40))
     assert coord._confirmed_room[duid] == "Bathroom"
+    clock.advance(minutes=5)
+    _poll(coord, dev(len(path)))
+    assert "Hall" not in coord._runs[duid].rooms
+    assert coord._runs[duid].ignored["Hall"] > 0
 
     clock.advance(minutes=5)
-    _poll(coord, _device(
-        duid, vacuum_room_name="Bathroom",
-        _path_dry=[
-            {"x": 2100, "y": 100}, {"x": 2400, "y": 100}, {"x": 100, "y": 100},
-            {"x": 400, "y": 100}, {"x": 700, "y": 100}, {"x": 2700, "y": 100},
-        ],
-    ))
-    assert len(coord._room_cells[duid]["Hall"]["dry"]) == 3  # clears the bare evidence floor
-
-    clock.advance(minutes=5)
-    _poll(coord, _device(duid, in_cleaning=False))
+    _poll(coord, _device(duid, in_cleaning=False, target_segments=[2], _path_dry=path))
 
     rooms = coord._last_calib[duid]["rooms"]
     assert rooms["Bathroom"]["dry"]["accepted"] is True
-    assert rooms["Hall"]["dry"]["cells"] == 3  # evidence existed...
-    assert rooms["Hall"]["dry"]["accepted"] is False
-    assert rooms["Hall"]["dry"]["reason"] == "not completed (transit only?)"  # ...but rejected
+    assert "Hall" not in rooms
+    assert "Hall" in coord._last_calib[duid]["ignored_mm"]
     assert "Hall" not in coord.rooms_estimate.get(duid, {})
     assert coord.rooms_estimate[duid]["Bathroom"]["dry"] > 0
-    # No room_done ever fires for Hall either — it never got confirmed as the
-    # robot's current room in the first place.
+    assert "Hall" not in coord._room_coverage
     room_done_rooms = [e["room"] for name, e in coord.hass.bus.events if name == "anyvac_room_done"]
     assert room_done_rooms == ["Bathroom"]
 
@@ -315,47 +287,32 @@ def test_multi_room_calibration_in_one_session(
     time — not the whole session's duration split evenly, and not just the
     last room cleaned."""
     coord = _new_coordinator(monkeypatch, clock)
+    coord._room_sequence = {"Hall": 1, "Bathroom": 2}
     duid = "d3"
+    path = HALL + BATH
+    half = len(HALL) // 2
 
-    _poll(coord, _device(
-        duid, vacuum_room_name="Hall",
-        _path_dry=[{"x": 100, "y": 100}, {"x": 400, "y": 100}],
-    ))
+    _poll(coord, _device(duid, vacuum_room_name="Hall", _path_dry=path[:half]))
     clock.advance(minutes=5)
-    _poll(coord, _device(
-        duid, vacuum_room_name="Hall",
-        _path_dry=[{"x": 100, "y": 100}, {"x": 400, "y": 100}, {"x": 700, "y": 100}],
-    ))
+    _poll(coord, _device(duid, vacuum_room_name="Hall", _path_dry=path[:len(HALL)]))
     assert coord._confirmed_room[duid] == "Hall"
 
     # Robot moves on to Bathroom; new points now land there instead of Hall.
     clock.advance(minutes=5)
-    _poll(coord, _device(
-        duid, vacuum_room_name="Bathroom",
-        _path_dry=[
-            {"x": 100, "y": 100}, {"x": 400, "y": 100}, {"x": 700, "y": 100},
-            {"x": 2100, "y": 100},
-        ],
-    ))
+    _poll(coord, _device(duid, vacuum_room_name="Bathroom", _path_dry=path[:len(HALL) + half]))
     # Bathroom not yet confirmed (only 1 consecutive poll) — Hall's room_done
     # hasn't fired yet either.
     assert coord._confirmed_room[duid] == "Hall"
 
     clock.advance(minutes=5)
-    _poll(coord, _device(
-        duid, vacuum_room_name="Bathroom",
-        _path_dry=[
-            {"x": 100, "y": 100}, {"x": 400, "y": 100}, {"x": 700, "y": 100},
-            {"x": 2100, "y": 100}, {"x": 2400, "y": 100}, {"x": 2700, "y": 100},
-        ],
-    ))
+    _poll(coord, _device(duid, vacuum_room_name="Bathroom", _path_dry=path))
     # Bathroom now confirmed (2nd consecutive) -> Hall's room_done fires ("left").
     assert coord._confirmed_room[duid] == "Bathroom"
     assert coord.hass.bus.names() == ["anyvac_clean_started", "anyvac_room_done"]
     assert coord.hass.bus.events[-1][1]["room"] == "Hall"
 
     clock.advance(minutes=5)
-    _poll(coord, _device(duid, in_cleaning=False))
+    _poll(coord, _device(duid, in_cleaning=False, _path_dry=path))
 
     finished = coord.hass.bus.events[-1][1]
     assert sorted(finished["rooms"]) == ["Bathroom", "Hall"]
@@ -365,63 +322,45 @@ def test_multi_room_calibration_in_one_session(
     }
     assert coord.rooms_estimate[duid]["Hall"]["dry"] == 5
     assert coord.rooms_estimate[duid]["Bathroom"]["dry"] == 10
+    assert coord._room_coverage["Hall"]["dry"] == 100  # left for the next target
+    assert coord._room_coverage["Bathroom"]["dry"] == 100
     # A second `anyvac_room_done` for Bathroom fires on docking.
     room_done_rooms = [e["room"] for name, e in coord.hass.bus.events if name == "anyvac_room_done"]
     assert room_done_rooms == ["Hall", "Bathroom"]
 
 
 def test_plan_scope_transit_labeling(monkeypatch: pytest.MonkeyPatch, clock: _Clock) -> None:
-    """Docs/17 §1.3: a room outside the CURRENT JOB's scope must be labeled
-    transit at attribution time — a finer, earlier guard than the
-    `completed`-at-calibration check `test_transit_drive_through_...` covers.
-    Crucially this must catch drive-through even when the vacuum's raw state
-    is NOT a TRANSIT_STATE at all (`transit=False`, genuinely "cleaning" per
-    the firmware) — that's exactly the case the state-only gate cannot see,
-    since `_job_rooms` is a knowledge only an orchestrated `anyvac.clean` job
-    provides (docs/14 §5), not something derivable from vacuum state."""
+    """Docs/17 §1.3: a room outside the CURRENT JOB's scope must be treated as
+    transit at attribution time — even when the vacuum's raw state is NOT a
+    TRANSIT_STATE at all (`transit=False`, genuinely "cleaning" per the
+    firmware). docs/45: the job scope is united with the map's BLOCKS into the
+    run's targets; a room outside them is ignored for the whole run, and the
+    next run (new targets) attributes it normally again."""
     coord = _new_coordinator(monkeypatch, clock)
     duid = "d4"
-
-    # Job scope: only Bathroom belongs to this job — Hall is a room the robot
-    # happens to physically cross without it being part of the plan at all.
     coord.set_job_rooms(duid, {"Bathroom"})
+    path = HALL[:20] + BATH
 
-    _poll(coord, _device(
-        duid, vacuum_room_name="Bathroom",
-        _path_dry=[{"x": 2100, "y": 100}, {"x": 100, "y": 100}],
-    ))
-    assert coord._room_cells[duid].get("Hall") is None  # never touched
-    assert "Bathroom" in coord._room_cells[duid]
-    assert len(coord._transit_cells[duid]["Hall"]) == 1
+    _poll(coord, _device(duid, vacuum_room_name="Bathroom", target_segments=[],
+                         _path_dry=path[:30]))
+    assert "Hall" not in coord._runs[duid].rooms
+    assert coord._runs[duid].ignored["Hall"] > 0
 
     clock.advance(minutes=5)
-    _poll(coord, _device(
-        duid, vacuum_room_name="Bathroom",
-        _path_dry=[
-            {"x": 2100, "y": 100}, {"x": 100, "y": 100},
-            {"x": 2400, "y": 100}, {"x": 400, "y": 100},
-        ],
-    ))
-    # Elapsed time went entirely to Bathroom — Hall's out-of-scope point
-    # contributed zero weight, it didn't just get excluded from cells.
+    _poll(coord, _device(duid, vacuum_room_name="Bathroom", target_segments=[],
+                         _path_dry=path))
+    # Elapsed time went entirely to Bathroom.
     assert coord._room_elapsed[duid] == {"Bathroom": pytest.approx(300.0)}
-    assert coord._room_cells[duid].get("Hall") is None
-    assert len(coord._transit_cells[duid]["Hall"]) == 2
+    assert "Hall" not in coord._runs[duid].rooms
 
-    # Once the job's scope is cleared (mirrors _JobRunner.finish()), the SAME
-    # room reverts to normal state-only gating — a later manual/native run
-    # through Hall is attributed normally again, not permanently blacklisted.
+    # Job over, robot docks; a later manual run of Hall is attributed normally —
+    # the room is not blacklisted beyond the run it was out of scope for.
     coord.set_job_rooms(duid, None)
     clock.advance(minutes=5)
-    _poll(coord, _device(
-        duid, vacuum_room_name="Bathroom",
-        _path_dry=[
-            {"x": 2100, "y": 100}, {"x": 100, "y": 100}, {"x": 2400, "y": 100},
-            {"x": 400, "y": 100}, {"x": 700, "y": 100},
-        ],
-    ))
-    assert "Hall" in coord._room_cells[duid]
-    assert len(coord._transit_cells[duid]["Hall"]) == 2  # unchanged, no new out-of-scope points
+    _poll(coord, _device(duid, in_cleaning=False, target_segments=[], _path_dry=path))
+    clock.advance(minutes=5)
+    _poll(coord, _device(duid, vacuum_room_name="Hall", target_segments=[1], _path_dry=HALL))
+    assert "Hall" in coord._runs[duid].rooms
 
 
 def test_two_households_share_one_coordinator(
@@ -431,7 +370,7 @@ def test_two_households_share_one_coordinator(
     to the same HA instance -> one shared AnyVacCoordinator, docs/14) must not
     cross-pollute PER-DUID state even when they coincidentally name a room the
     same thing ("Hall" in both homes here). Learned time estimates, sessions,
-    and coverage cells are all keyed by duid and must stay isolated.
+    and run trackers are all keyed by duid and must stay isolated.
 
     `_history` (last-cleaned timestamps) is the one deliberate exception —
     it's documented as "aggregates across all vacuums" (keyed by room NAME
@@ -442,60 +381,32 @@ def test_two_households_share_one_coordinator(
     to `_history`'s keying is a deliberate decision, not a silent regression
     either way."""
     coord = _new_coordinator(monkeypatch, clock)
+    q = len(HALL) // 4
 
-    # Household A: duid "home-a", a fast robot, 10-minute Hall clean.
-    _poll(coord, _device(
-        "home-a", vacuum_room_name="Hall",
-        _path_dry=[{"x": 100, "y": 100}, {"x": 400, "y": 100}],
-    ))
+    # Household A: a fast robot, 5-minute Hall clean.
+    _poll(coord, _device("home-a", vacuum_room_name="Hall", target_segments=[1], _path_dry=HALL[:2 * q]))
     clock.advance(minutes=5)
-    _poll(coord, _device(
-        "home-a", vacuum_room_name="Hall",
-        _path_dry=[{"x": 100, "y": 100}, {"x": 400, "y": 100}, {"x": 700, "y": 100}],
-    ))
+    _poll(coord, _device("home-a", vacuum_room_name="Hall", target_segments=[1], _path_dry=HALL))
     clock.advance(minutes=1)
-    _poll(coord, _device("home-a", in_cleaning=False))
+    _poll(coord, _device("home-a", in_cleaning=False, target_segments=[1], _path_dry=HALL))
 
-    # Household B: duid "home-b", also has a room called "Hall" (unrelated
-    # physical home, coincidental name) — a slower robot, longer session.
+    # Household B: also has a room called "Hall" — a slower robot, 15 minutes.
     clock.advance(minutes=1)
-    _poll(coord, _device(
-        "home-b", vacuum_room_name="Hall",
-        _path_dry=[{"x": 100, "y": 100}, {"x": 400, "y": 100}],
-    ))
-    clock.advance(minutes=5)
-    _poll(coord, _device(
-        "home-b", vacuum_room_name="Hall",
-        _path_dry=[{"x": 100, "y": 100}, {"x": 400, "y": 100}, {"x": 700, "y": 100}],
-    ))
-    clock.advance(minutes=5)
-    _poll(coord, _device(
-        "home-b", vacuum_room_name="Hall",
-        _path_dry=[
-            {"x": 100, "y": 100}, {"x": 400, "y": 100}, {"x": 700, "y": 100},
-            {"x": 100, "y": 400},
-        ],
-    ))
-    clock.advance(minutes=5)
-    _poll(coord, _device(
-        "home-b", vacuum_room_name="Hall",
-        _path_dry=[
-            {"x": 100, "y": 100}, {"x": 400, "y": 100}, {"x": 700, "y": 100},
-            {"x": 100, "y": 400}, {"x": 400, "y": 400},
-        ],
-    ))
-    clock.advance(minutes=1)
-    _poll(coord, _device("home-b", in_cleaning=False))
+    for n in (q, 2 * q, 3 * q, len(HALL)):
+        _poll(coord, _device("home-b", vacuum_room_name="Hall", target_segments=[1], _path_dry=HALL[:n]))
+        clock.advance(minutes=5)
+    clock.advance(minutes=-4)
+    _poll(coord, _device("home-b", in_cleaning=False, target_segments=[1], _path_dry=HALL))
 
     # Per-duid learned estimates stayed independent despite the identical room name.
     assert coord.rooms_estimate["home-a"]["Hall"]["dry"] == 5
     assert coord.rooms_estimate["home-b"]["Hall"]["dry"] == 15
-    # Session/tracking dicts never leaked across duids either (both cleared to
-    # empty at their own session end, independently).
+    # Session/tracking state never leaked across duids either (both reset at
+    # their own session end, independently).
     assert coord._session_rooms["home-a"] == set()
     assert coord._session_rooms["home-b"] == set()
-    assert coord._room_cells["home-a"] == {}
-    assert coord._room_cells["home-b"] == {}
+    assert coord._runs["home-a"].rooms == {}
+    assert coord._runs["home-b"].rooms == {}
 
     # The one deliberately-shared piece of state: last-cleaned-by-name history
     # merges the two homes' same-named room into a single stamp (home-b
@@ -531,6 +442,7 @@ def test_path_stitches_across_job_sorties(monkeypatch: pytest.MonkeyPatch, clock
     _poll(coord, _device(duid, in_cleaning=False))
     assert coord._dry_path[duid] == [[{"x": 100, "y": 100}]]  # untouched by session-end
     assert coord._wet_path[duid] == [[{"x": 100, "y": 100}]]
+    run_sortie1 = coord._runs[duid]
 
     # Sortie 2 starts: the robot's own raw arrays restart near-empty (real
     # firmware behaviour) — here just a single new point each layer. Must
@@ -550,7 +462,7 @@ def test_path_stitches_across_job_sorties(monkeypatch: pytest.MonkeyPatch, clock
     # reset was what made a room's coverage % read a partial number and then drag
     # its learned baseline down to the size of a single batch.
     assert coord._session_start[duid] == clock.now - timedelta(minutes=6)
-    assert coord._room_cells[duid]["Hall"]["dry"] == {(0, 0)}
+    assert coord._runs[duid] is run_sortie1
 
 
 def test_path_resets_across_sorties_without_job_scope(

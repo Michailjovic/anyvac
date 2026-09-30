@@ -666,6 +666,7 @@ async def _load_seats(load_value: Any) -> dict[str, dict[str, Any]]:
     coord._seats_store = _FakeStore(load_value)
     coord._cov_store = _FakeStore()
     coord._cov_pct_store = _FakeStore()
+    coord._cov_legacy_pct_store = _FakeStore()
     coord._est_store = _FakeStore()
     coord._paths_store = _FakeStore()
     coord._home_frame_store = _FakeStore()
