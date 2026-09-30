@@ -91,11 +91,25 @@ class CleanPlanner:
         devices = coordinator.data or {}
         # Per-duid room-name -> segment_id map (what each robot can actually clean).
         self.segments: dict[str, dict[str, int]] = {}
+        # docs/40 §4.3 (Fáze 2.4): cross-robot pairing of the SAME physical room
+        # by the home frame's shared `home_room_id` — robots may name one room
+        # differently in their own apps (docs/30 §4b).
+        #   home_room_owners:     {home_room_id: {duid: that robot's OWN segment_id}}
+        #   home_room_id_by_name: {room name as some robot calls it: home_room_id}
+        # Both stay empty until a home frame has paired rooms, so a fleet
+        # without one behaves exactly as before (exact-name matching only).
+        self.home_room_owners: dict[str, dict[str, int]] = {}
+        self.home_room_id_by_name: dict[str, str] = {}
         for duid, dev in devices.items():
             segs: dict[str, int] = {}
             for r in dev.data.get("rooms", []):
                 if r.get("name") is not None and r.get("segment_id") is not None:
                     segs[str(r["name"])] = int(r["segment_id"])
+                    hrid = r.get("home_room_id")
+                    if hrid:
+                        self.home_room_owners.setdefault(str(hrid), {})[duid] = int(r["segment_id"])
+                        # First robot to publish a name wins that name's entry.
+                        self.home_room_id_by_name.setdefault(str(r["name"]), str(hrid))
             self.segments[duid] = segs
         self.entity_of: dict[str, str | None] = {
             duid: vacuum_entity_for_duid(hass, duid) for duid in devices
@@ -114,8 +128,54 @@ class CleanPlanner:
         sig = (self.devices[duid].data.get("mop_signal")) or {}
         return sig.get("water_box_mode") is not None or bool(sig.get("water_mode_name"))
 
+    # -- room ownership (exact name first, then home_room_id pairing) ----------------
+
+    def _paired_names(self) -> dict[str, str]:
+        # getattr: several unit tests build the planner via object.__new__
+        # without the home-frame maps; absent == no pairing.
+        return getattr(self, "home_room_id_by_name", None) or {}
+
+    def _pair_owners(self) -> dict[str, dict[str, int]]:
+        return getattr(self, "home_room_owners", None) or {}
+
+    def _duid_owns_room(self, duid: str, room: str) -> bool:
+        """Can this robot clean `room`? Its own name for the room, or — when a
+        home frame paired rooms — the same physical room under another robot's
+        name (docs/40 §4.3)."""
+        if room in self.segments.get(duid, {}):
+            return True
+        hrid = self._paired_names().get(room)
+        return hrid is not None and duid in self._pair_owners().get(hrid, {})
+
+    def _segment_for(self, duid: str, room: str) -> int:
+        """This robot's OWN segment id for `room` (never another robot's).
+        Raises KeyError when the robot does not own the room at all."""
+        own = self.segments.get(duid, {})
+        if room in own:
+            return own[room]
+        hrid = self._paired_names().get(room)
+        if hrid is not None and duid in self._pair_owners().get(hrid, {}):
+            return self._pair_owners()[hrid][duid]
+        raise KeyError(room)
+
+    def _own_room_name(self, duid: str, room: str) -> str:
+        """The name THIS robot uses for `room` (learned estimates are keyed by
+        it); `room` itself when it is already that name or unknown."""
+        own = self.segments.get(duid, {})
+        if room in own:
+            return room
+        try:
+            seg = self._segment_for(duid, room)
+        except KeyError:
+            return room
+        return next((n for n, s in own.items() if s == seg), room)
+
     def _estimate(self, duid: str, room: str, kind: str) -> float | None:
-        rec = ((self.coord.rooms_estimate.get(duid)) or {}).get(room) or {}
+        ests = (self.coord.rooms_estimate.get(duid)) or {}
+        rec = ests.get(room)
+        if not rec and self._paired_names():
+            rec = ests.get(self._own_room_name(duid, room))
+        rec = rec or {}
         val = rec.get(kind) or rec.get("dry") or rec.get("wet")
         return float(val) if val else None
 
@@ -183,11 +243,11 @@ class CleanPlanner:
 
         pins = pin or {}
         for room in sorted(rooms, key=est_max, reverse=True):
-            owners = [d for d in cands if room in self.segments.get(d, {})]
+            owners = [d for d in cands if self._duid_owns_room(d, room)]
             pref = pins.get(room)
             if pref:
                 pduid = self._resolve_duid(str(pref))
-                if pduid and pduid in cands and room in self.segments.get(pduid, {}):
+                if pduid and pduid in cands and self._duid_owns_room(pduid, room):
                     owners = [pduid]
                 else:
                     _LOGGER.warning(
@@ -396,7 +456,7 @@ class CleanPlanner:
                 continue
             kind_settings = self._settings_for_duid(settings, "dry", duid)
             selects, fan = self._settings_calls(duid, "dry", kind_settings)
-            segs = [self.segments[duid][r] for r in rms]
+            segs = [self._segment_for(duid, r) for r in rms]
             repeat = max(1, int(kind_settings.get("repeat") or 1))
             tasks.append(
                 {
@@ -453,7 +513,7 @@ class CleanPlanner:
                         r: {
                             "gate": {"duid": room_dry_duid[r], "room": r},
                             "eta_min": room_dry_finish.get(r, 0.0),
-                            "segment": self.segments[duid][r],
+                            "segment": self._segment_for(duid, r),
                         }
                         for r in rms
                         if r in room_dry_duid
@@ -471,7 +531,7 @@ class CleanPlanner:
                         }
                     )
                 else:
-                    segs = [self.segments[duid][r] for r in rms]
+                    segs = [self._segment_for(duid, r) for r in rms]
                     after: list[dict[str, Any]] = []
                     if mode == "both":
                         # Release the wet pass per room done by the DRY robot; a

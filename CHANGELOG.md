@@ -33,13 +33,22 @@ from 1.31.0 to the card's number per the pairing rule.
     survive a restart, and neither should its finish time.
 - `tests/test_job_progress.py` (9 tests).
 
-### Known issue (found while testing this release, NOT introduced by it)
+### Fixed
 
-- `planner.py` in this working copy does not contain the `home_room_id`
-  cross-robot room pairing described under 1.8.0 (`home_room_owners`,
-  `home_room_id_by_name`); `tests/test_planner_home_room_id.py` fails 11/12
-  against it. Looks like an older `planner.py` overwrote the 1.8.0 one at some
-  point. Left untouched here — needs a decision before it is restored.
+- **Restored the `home_room_id` room pairing in `planner.py`** (docs/40 §4.3,
+  first shipped as 1.8.0). The working copy's `planner.py` was an older file
+  (last changed 2026-08-08) without it, while the rest of 1.8.0 — and its
+  tests — were present; `tests/test_planner_home_room_id.py` failed 11/12.
+  Rebuilt against those tests: `CleanPlanner.__init__` indexes
+  `home_room_owners` (`{home_room_id: {duid: own segment_id}}`) and
+  `home_room_id_by_name`; `_duid_owns_room`/`_segment_for` try the robot's own
+  room name first and fall back to the pairing, so `assign()`/`build_tasks()`
+  consider a robot that knows the same physical room under a different name
+  and always dispatch that robot's OWN segment id. Without a home frame
+  (no `home_room_id` anywhere) behaviour is unchanged. Also new: a paired
+  room's time estimate is looked up under the robot's own room name
+  (learned estimates are keyed by it) instead of falling back to the default.
+  1 new test; the full suite is green (387 passed).
 
 ## [1.31.0] - 2026-09-19
 

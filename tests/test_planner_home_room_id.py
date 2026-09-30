@@ -280,3 +280,19 @@ def test_build_tasks_dispatches_each_robots_own_segment_for_a_paired_room(
     wet_task = next(t for t in tasks if t["duid"] == "w1")
     assert dry_task["service_data"]["params"][0]["segments"] == [1]
     assert wet_task["service_data"]["params"][0]["segments"] == [7]
+
+
+def test_estimate_for_a_paired_room_uses_the_robots_own_learned_name() -> None:
+    """Restored 2026-09-30 alongside the pairing itself: learned estimates are
+    keyed by each robot's OWN room name, so a room requested under another
+    robot's name must still find this robot's own estimate instead of silently
+    falling back to DEFAULT_ROOM_MIN."""
+    planner = _planner(
+        devices={"w1": _FakeDevice(mop_signal={"water_box_mode": 200})},
+        segments={"w1": {"Loznice": 7}},
+        entity_of={"w1": "vacuum.w1"},
+        home_room_owners={"R1": {"d1": 1, "w1": 7}},
+        home_room_id_by_name={"Bedroom": "R1", "Loznice": "R1"},
+        rooms_estimate={"w1": {"Loznice": {"wet": 12}}},
+    )
+    assert planner._estimate("w1", "Bedroom", "wet") == 12.0
