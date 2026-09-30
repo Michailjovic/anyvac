@@ -1463,6 +1463,8 @@ class _FakeCoordinatorForSensor:
         self.room_pins: dict[str, Any] = {}
         self.room_sequence: dict[str, int] = {}
         self.floorplan_seats = floorplan_seats
+        # docs/44 F2: the map sensor also publishes the job's progress.
+        self.job_progress = {"active": False}
 
 
 def test_sensor_publishes_floorplan_seats() -> None:

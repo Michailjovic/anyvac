@@ -6,6 +6,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.39.0] - 2026-09-30
+
+Pairs with card **1.39.0** (docs/44 F2 — the card's hero bar). Version jumps
+from 1.31.0 to the card's number per the pairing rule.
+
+### Added
+
+- **`job_progress` attribute** on every AnyVac map sensor (coordinator-wide,
+  recorder-excluded). While an `anyvac.clean` job runs it carries `active`,
+  `started_at`, `finish_at`, `eta_min_left`, `rooms_total`/`rooms_done` (a room
+  is done only when all its passes are), `passes_total`/`passes_done`, one row
+  per planned pass (`room`, `kind`, `vacuum`, `state: queued|active|done`,
+  `pct`) and a per-vacuum summary (`room`, `kind`, `pct`, `next_room`).
+  Without a job it is `{"active": false}`.
+  - `eta_min_left` is the larger of the planner's sequence-aware ETA minus
+    elapsed time (keeps dry→wet gating in the answer) and the slowest robot's
+    own remaining work (its open passes, the active one scaled by live
+    coverage) — so a job running late never shows a finish time in the past.
+  - `anyvac_room_done` carries no clean type; the first event for a robot and
+    room closes its earliest open pass (dry before wet for a both-capable
+    robot, which the planner guarantees).
+  - Set by `_JobRunner.start()`, marked on `anyvac_room_done`, cleared in
+    `finish()` (completion, cancel and timeout alike). Raw `anyvac.run_job`
+    task lists carry no plan and never touch it. Not persisted: a job does not
+    survive a restart, and neither should its finish time.
+- `tests/test_job_progress.py` (9 tests).
+
+### Known issue (found while testing this release, NOT introduced by it)
+
+- `planner.py` in this working copy does not contain the `home_room_id`
+  cross-robot room pairing described under 1.8.0 (`home_room_owners`,
+  `home_room_id_by_name`); `tests/test_planner_home_room_id.py` fails 11/12
+  against it. Looks like an older `planner.py` overwrote the 1.8.0 one at some
+  point. Left untouched here — needs a decision before it is restored.
+
 ## [1.31.0] - 2026-09-19
 
 ### Added

@@ -56,7 +56,7 @@ from homeassistant.helpers.event import async_call_later
 from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
-from .planner import CleanPlanner, duid_for_entity, vacuum_entity_for_duid
+from .planner import DEFAULT_ROOM_MIN, CleanPlanner, duid_for_entity, vacuum_entity_for_duid
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -1167,8 +1167,13 @@ class _JobRunner:
         hass: HomeAssistant,
         tasks: list[dict[str, Any]],
         job_rooms: dict[str, set[str]] | None = None,
+        progress: dict[str, Any] | None = None,
     ) -> None:
         self.hass = hass
+        # docs/44 F2: the plan's room passes + ETA, handed to the coordinator so
+        # the card can show "done around HH:MM" without estimating anything
+        # itself. None for raw `run_job` task lists (no plan to report).
+        self.progress = progress
         # docs/23: a task carrying a "pool" key is a progressive-dispatch pool
         # task (built by planner.py for a wet-capable robot with 2+ rooms in a
         # "both" job) — it goes through `_dispatch_pools()`, not the plain
@@ -1228,6 +1233,13 @@ class _JobRunner:
         for duid, rooms in self.job_rooms.items():
             for coord in _coordinators(self.hass):
                 coord.set_job_rooms(duid, rooms)
+        if self.progress:
+            for coord in _coordinators(self.hass):
+                coord.set_job_plan(
+                    self.progress.get("passes") or [],
+                    self.progress.get("eta_min") or 0.0,
+                    self._start_time,
+                )
         self._unsub.append(
             self.hass.bus.async_listen(f"{DOMAIN}_room_done", self._on_room_done)
         )
@@ -1426,6 +1438,9 @@ class _JobRunner:
 
     async def _on_room_done(self, event) -> None:
         self.done.add((event.data.get("duid"), event.data.get("room")))
+        if self.progress:
+            for coord in _coordinators(self.hass):
+                coord.mark_job_room_done(event.data.get("duid"), event.data.get("room"))
         await self._dispatch_ready()
         await self._dispatch_pools()
         self._maybe_finish()
@@ -1479,6 +1494,9 @@ class _JobRunner:
         for duid in self.job_rooms:
             for coord in _coordinators(self.hass):
                 coord.set_job_rooms(duid, None)
+        if self.progress:
+            for coord in _coordinators(self.hass):
+                coord.clear_job_plan()
         jobs = _active_jobs(self.hass)
         if self in jobs:
             jobs.remove(self)
@@ -1488,10 +1506,11 @@ async def _start_job(
     hass: HomeAssistant,
     tasks: list[dict[str, Any]],
     job_rooms: dict[str, set[str]] | None = None,
+    progress: dict[str, Any] | None = None,
 ) -> None:
     """Cancel any previous job (docs/13 C6: no parallel double-driving) and run."""
     _cancel_jobs(hass)
-    runner = _JobRunner(hass, tasks, job_rooms)
+    runner = _JobRunner(hass, tasks, job_rooms, progress)
     await runner.start()
 
 
@@ -1648,6 +1667,26 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
                 out[duid] = rooms
         return out
 
+    def _job_progress_from_plan(planner: CleanPlanner, plan: dict[str, Any]) -> dict[str, Any]:
+        """docs/44 F2: one row per planned room pass, with the planner's own
+        per-room estimate (``est_min``) and sequence-aware finish time
+        (``finish_min``) — the coordinator orders and tracks them."""
+        timeline = plan.get("timeline") or {}
+        passes: list[dict[str, Any]] = []
+        for kind in ("dry", "wet"):
+            for entity, rooms in (plan.get(kind) or {}).items():
+                duid = planner._resolve_duid(entity)
+                for room in rooms:
+                    passes.append({
+                        "room": room,
+                        "kind": kind,
+                        "vacuum": entity,
+                        "duid": duid,
+                        "est_min": (planner._estimate(duid, room, kind) if duid else None) or DEFAULT_ROOM_MIN,
+                        "finish_min": (timeline.get(kind) or {}).get(room),
+                    })
+        return {"passes": passes, "eta_min": plan.get("eta_min") or 0.0}
+
     def _build(call: ServiceCall) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         coords = _coordinators(hass)
         if not coords:
@@ -1675,7 +1714,9 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
                 f"(plan: {plan})"
             )
         _LOGGER.info("AnyVac clean: %s", plan)
-        await _start_job(hass, tasks, _job_rooms_from_plan(plan))
+        coords = _coordinators(hass)
+        progress = _job_progress_from_plan(CleanPlanner(hass, coords[0]), plan) if coords else None
+        await _start_job(hass, tasks, _job_rooms_from_plan(plan), progress)
 
     async def _handle_plan(call: ServiceCall) -> dict[str, Any]:
         tasks, plan = _build(call)

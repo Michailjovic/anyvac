@@ -1211,6 +1211,11 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # `_sortie_is_new_job`) is what actually distinguishes the two cases.
         self._job_seq = 0
         self._job_id: dict[str, int] = {}
+        # Live progress of the running orchestrated job (docs/44 F2): the plan's
+        # room passes in order, with per-pass done timestamps. Set/cleared by
+        # services.py's _JobRunner; not persisted — a job does not survive a
+        # restart, and neither should a stale "done around HH:MM".
+        self._job_state: dict[str, Any] | None = None
         self._path_job_id: dict[str, int | None] = {}
         # Runs whose harvest is waiting for the job to release this vacuum (docs/36).
         # {duid: utc time the last sortie ended}; absent = nothing pending. Not
@@ -1797,6 +1802,127 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         self._room_sequence = {str(r): i + 1 for i, r in enumerate(rooms) if r}
         self._seq_store.async_delay_save(lambda: dict(self._room_sequence), 2)
         self.async_update_listeners()
+
+    # -- docs/44 F2: job progress (read by the card's hero bar) -----------------
+
+    def set_job_plan(
+        self,
+        passes: list[dict[str, Any]],
+        eta_min: float,
+        started_at: Any = None,
+    ) -> None:
+        """Register the running job's room passes.
+
+        ``passes`` = ``[{room, kind, vacuum, duid, est_min, finish_min}]`` in
+        planned order (``finish_min`` = the planner's sequence-aware finish time
+        for that pass, docs/19). Replaces whatever job was registered before —
+        a new job always cancels the old one first (docs/13 C6)."""
+        rows = sorted(
+            (dict(p, done_at=None) for p in passes),
+            key=lambda p: (p.get("finish_min") or 0.0, 0 if p.get("kind") == "dry" else 1),
+        )
+        self._job_state = {
+            "started_at": started_at or dt_util.utcnow(),
+            "eta_min": float(eta_min or 0.0),
+            "passes": rows,
+        }
+        self.async_update_listeners()
+
+    def mark_job_room_done(self, duid: str, room: str) -> None:
+        """An ``anyvac_room_done`` for this job. The event carries no clean type,
+        so the FIRST open pass of that robot in that room is the one completed
+        (a both-capable robot's dry pass precedes its wet pass of the same room
+        by construction — planner gates wet on the room's dry finish)."""
+        st = self._job_state
+        if not st:
+            return
+        for row in st["passes"]:
+            if row.get("duid") == duid and row.get("room") == room and row.get("done_at") is None:
+                row["done_at"] = dt_util.utcnow()
+                self.async_update_listeners()
+                return
+
+    def clear_job_plan(self) -> None:
+        if self._job_state is not None:
+            self._job_state = None
+            self.async_update_listeners()
+
+    @property
+    def job_progress(self) -> dict[str, Any]:
+        """Card-facing snapshot of the running job (docs/44 F2).
+
+        The card never estimates time itself (docs/14): ``finish_at`` is computed
+        here as ``now + eta_min_left`` where ``eta_min_left`` is the larger of
+        (a) the planner's sequence-aware ETA minus elapsed time and (b) the
+        slowest robot's remaining own work (not-done passes, the active one
+        scaled by its live coverage %). (a) keeps dry→wet gating in the answer,
+        (b) stops the estimate from reaching zero while a robot is visibly still
+        working because the job runs late."""
+        st = self._job_state
+        if not st:
+            return {"active": False}
+        now = dt_util.utcnow()
+        data = self.data or {}
+        rows = st["passes"]
+        # Which pass is each robot working on right now?
+        active_idx: dict[str, int] = {}
+        for i, row in enumerate(rows):
+            duid = row.get("duid")
+            if row.get("done_at") is not None or duid in active_idx:
+                continue
+            dev = data.get(duid)
+            dd = getattr(dev, "data", None) or {}
+            if dd.get("in_cleaning") and dd.get("vacuum_room_name") == row.get("room"):
+                active_idx[duid] = i
+        out_rows: list[dict[str, Any]] = []
+        remaining_by_robot: dict[str, float] = {}
+        for i, row in enumerate(rows):
+            duid = row.get("duid")
+            kind = row.get("kind")
+            est = float(row.get("est_min") or 0.0)
+            if row.get("done_at") is not None:
+                state, pct = "done", 100
+            elif active_idx.get(duid) == i:
+                dev = data.get(duid)
+                prog = ((getattr(dev, "data", None) or {}).get("rooms_progress") or {}).get(row.get("room")) or {}
+                raw = prog.get(f"{kind}_pct")
+                pct = int(raw) if isinstance(raw, (int, float)) else 0
+                state = "active"
+            else:
+                state, pct = "queued", 0
+            if state != "done":
+                remaining_by_robot[duid] = remaining_by_robot.get(duid, 0.0) + est * (1 - min(pct, 100) / 100)
+            out_rows.append({
+                "room": row.get("room"), "kind": kind, "vacuum": row.get("vacuum"),
+                "state": state, "pct": pct,
+            })
+        elapsed = (now - st["started_at"]).total_seconds() / 60
+        static_left = st["eta_min"] - elapsed
+        dynamic_left = max(remaining_by_robot.values(), default=0.0)
+        left = max(static_left, dynamic_left, 0.0)
+        rooms = {r["room"] for r in out_rows}
+        rooms_done = {
+            rm for rm in rooms if all(r["state"] == "done" for r in out_rows if r["room"] == rm)
+        }
+        vacs: dict[str, dict[str, Any]] = {}
+        for r in out_rows:
+            v = vacs.setdefault(r["vacuum"], {"room": None, "kind": None, "pct": None, "next_room": None})
+            if r["state"] == "active":
+                v.update(room=r["room"], kind=r["kind"], pct=r["pct"])
+            elif r["state"] == "queued" and v["next_room"] is None:
+                v["next_room"] = r["room"]
+        return {
+            "active": True,
+            "started_at": st["started_at"].isoformat(timespec="seconds"),
+            "finish_at": (now + timedelta(minutes=left)).isoformat(timespec="seconds"),
+            "eta_min_left": round(left, 1),
+            "rooms_total": len(rooms),
+            "rooms_done": len(rooms_done),
+            "passes_total": len(out_rows),
+            "passes_done": sum(1 for r in out_rows if r["state"] == "done"),
+            "rooms": out_rows,
+            "vacuums": vacs,
+        }
 
     def set_job_rooms(self, duid: str, rooms: set[str] | None) -> None:
         """Plan-scope transit labeling (docs/17 §1.3) — called by services.py's

@@ -83,6 +83,8 @@ class AnyVacMapSensor(CoordinatorEntity[AnyVacCoordinator], SensorEntity):
             "debug_map", "schema_version", "vacuum_position_px", "charger_px",
             "path_dry_px", "path_wet_px", "pipeline_ok", "pipeline_error",
             "room_pins", "room_sequence", "dock_status", "floorplan_seats",
+            # docs/44 F2 — live job progress for the card's hero bar.
+            "job_progress",
             # Kontrakt v3 (docs/40 §4.2 point 6) — additive, same "large/
             # fast-changing map payload" reasoning as the v2 *_px attributes above.
             "home_frame", "registration", "vacuum_position_home_px", "charger_home_px",
@@ -137,6 +139,7 @@ class AnyVacMapSensor(CoordinatorEntity[AnyVacCoordinator], SensorEntity):
             "room_pins": self.coordinator.room_pins,
             "room_sequence": self.coordinator.room_sequence,
             "floorplan_seats": self.coordinator.floorplan_seats,
+            "job_progress": self.coordinator.job_progress,
         }
 
 
