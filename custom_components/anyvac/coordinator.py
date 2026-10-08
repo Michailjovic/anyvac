@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -29,16 +30,23 @@ import numpy as np
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
 from . import coverage as covmod
-from . import homeframe
+from . import homeframe, livediff, localprobe
 from .const import (
     DEFAULT_EXPOSE_LEGACY_MM,
+    DEFAULT_LIVE_DIFF,
     DOMAIN,
+    LIVE_DIFF_BACKOFF_S,
+    LIVE_DIFF_INTERVAL_S,
+    LIVE_DIFF_MAX_FAILS,
+    LIVE_DIFF_TIMEOUT_S,
     OPT_EXPOSE_LEGACY_MM,
+    OPT_LIVE_DIFF,
     PATH_MAX_POINTS,
     ROBOROCK_DOMAIN,
     SCAN_INTERVAL_SECONDS,
@@ -1246,6 +1254,15 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # (the listener's change test and the poll's freshness test both compare
         # against it). `_map_fresh`: per duid, did THIS poll see a new snapshot.
         self._rb_listeners: dict[int, tuple[Any, CALLBACK_TYPE]] = {}
+        # docs/48: live extension of the last full-map snapshot per duid, from
+        # the robot's local get_dynamic_map_diff. Display only — nothing in the
+        # pipeline reads it (docs/48 §1.1).
+        self._live_enabled: bool = entry.options.get(OPT_LIVE_DIFF, DEFAULT_LIVE_DIFF)
+        self._live: dict[str, livediff.LiveTrail] = {}
+        self._live_pub: dict[str, dict[str, Any]] = {}
+        self._live_inflight: set[str] = set()
+        self._live_fails: dict[str, int] = {}
+        self._live_backoff: dict[str, float] = {}
         self._rb_seen_raw: dict[str, bytes] = {}
         self._map_fresh: dict[str, bool] = {}
         # Plan-scope transit labeling (docs/17 §1.3): room-name scope of the currently
@@ -3225,6 +3242,11 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     continue
                 if device is not None:
                     self._note_snapshot(device.duid, _raw_map_bytes(coord))
+                    if self._is_map_fresh(device.duid):
+                        # docs/48 §1.3: the new snapshot already contains every
+                        # point the live trail added — drop it.
+                        getattr(self, "_live", {}).pop(device.duid, None)
+                        getattr(self, "_live_pub", {}).pop(device.duid, None)
                     # docs/40 §4.2/§4.3: cheap cache-key check inline, heavy
                     # FFT registration itself always in the executor — never
                     # blocks this polling coroutine.
@@ -3464,6 +3486,121 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         if prev is raw or prev == raw:
             return
         self.hass.async_create_task(self.async_request_refresh())
+
+    # ------------------------------------------------------------------
+    # Live position from the local diff (docs/48)
+    # ------------------------------------------------------------------
+
+    def live_for(self, duid: str) -> dict[str, Any] | None:
+        """The `live` attribute of one vacuum's sensor (docs/48 §1.5)."""
+        return self._live_pub.get(duid)
+
+    def start_live(self) -> CALLBACK_TYPE:
+        """Start the live poller; returns its unsubscribe callback."""
+        if not self._live_enabled:
+            return lambda: None
+        return async_track_time_interval(
+            self.hass, self._live_tick, timedelta(seconds=LIVE_DIFF_INTERVAL_S)
+        )
+
+    @callback
+    def _live_tick(self, _now: Any = None) -> None:
+        now = time.monotonic()
+        for duid, device in (self.data or {}).items():
+            if not device.data.get("in_cleaning") or duid in self._live_inflight:
+                continue
+            if self._live_backoff.get(duid, 0.0) > now:
+                continue
+            self._live_inflight.add(duid)
+            self.hass.async_create_background_task(
+                self._live_fetch(duid), f"anyvac live diff {duid}"
+            )
+
+    def _live_failed(self, duid: str) -> None:
+        n = self._live_fails.get(duid, 0) + 1
+        self._live_fails[duid] = n
+        if n >= LIVE_DIFF_MAX_FAILS:
+            self._live_fails[duid] = 0
+            self._live_backoff[duid] = time.monotonic() + LIVE_DIFF_BACKOFF_S
+            _LOGGER.debug("AnyVac: live diff for %s paused for %ss", duid, LIVE_DIFF_BACKOFF_S)
+
+    async def _live_fetch(self, duid: str) -> None:
+        try:
+            rb = self.roborock_coordinator_for(duid)
+            if rb is None:
+                return
+            v1ch = localprobe.v1_channel_of(rb)
+            if not getattr(v1ch, "is_local_connected", False):
+                return  # not a failure: no local connection right now
+            res = await localprobe.local_request(
+                v1ch, "get_dynamic_map_diff",
+                timeout_s=LIVE_DIFF_TIMEOUT_S, watch_cloud=False,
+            )
+            parsed = livediff.parse_diff(res.get("ack"))
+            if parsed is None:
+                self._live_failed(duid)
+                return
+            self._live_fails[duid] = 0
+            self._apply_live(duid, parsed)
+        except Exception as err:  # noqa: BLE001 - display-only, never fatal
+            _LOGGER.debug("AnyVac: live diff for %s failed: %s", duid, err)
+            self._live_failed(duid)
+        finally:
+            self._live_inflight.discard(duid)
+
+    def _apply_live(self, duid: str, parsed: dict[str, Any]) -> None:
+        """Merge one parsed diff into the live trail and publish (docs/48 §1.3)."""
+        device = (self.data or {}).get(duid)
+        if device is None:
+            return
+        base = int(device.data.get("path_points") or 0)
+        trail = self._live.get(duid)
+        if trail is None or trail.base != base:
+            trail = self._live[duid] = livediff.LiveTrail(base=base)
+        if trail.apply(parsed):
+            self._live_pub[duid] = self._live_payload(device, trail)
+            self.async_update_listeners()
+
+    def _live_payload(self, device: AnyVacDevice, trail: livediff.LiveTrail) -> dict[str, Any]:
+        """Trail → px-space `live` attribute (docs/48 §1.4–1.5). Same
+        transforms as the snapshot's own `*_px` / `*_home_px` (docs/14)."""
+        duid = device.duid
+        dry_open = self._dry_path_open.get(duid, False)
+        wet_open = self._wet_path_open.get(duid, False)
+        dry = [trail.dry_segment()] if dry_open and trail.points else []
+        wet = trail.wet_segments()
+        aff = _solve_affine(device.data.get("calibration_points"))
+
+        def _px(segs: list[list[dict[str, float]]]) -> list[list[dict[str, float]]]:
+            if aff is None:
+                return []
+            return [s for seg in segs if (s := [q for p in seg if (q := _px_point(p, aff))])]
+
+        frame_id = self._robot_frame.get(duid)
+        frame = self._home_frames.get(frame_id) if frame_id else None
+        rec = (frame.get("robots") or {}).get(duid) if frame is not None else None
+
+        def _hpx(segs: list[list[dict[str, float]]]) -> list[list[dict[str, float]]]:
+            if rec is None:
+                return []
+            return [
+                s for seg in segs if (s := [q for p in seg if (q := _home_px_point(p, rec, frame))])
+            ]
+
+        return {
+            "base_points": trail.base,
+            "seq": trail.seq,
+            "at": dt_util.utcnow().isoformat(timespec="seconds"),
+            "broken": trail.broken,
+            "pos_px": _px_point(trail.pos, aff) if aff is not None else None,
+            "pos_home_px": _home_px_point(trail.pos, rec, frame),
+            "dry_px": _px(dry),
+            "wet_px": _px(wet),
+            "dry_home_px": _hpx(dry),
+            "wet_home_px": _hpx(wet),
+            "dry_continues": bool(dry),
+            "wet_continues": wet_open and trail.wet_starts_on_first_point(),
+        }
 
     def unsubscribe_roborock(self) -> None:
         """Drop every Roborock listener (entry unload)."""

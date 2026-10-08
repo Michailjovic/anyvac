@@ -42,6 +42,7 @@ async def local_request(
     *,
     timeout_s: float = LOCAL_TIMEOUT_S,
     clock: Any = time.monotonic,
+    watch_cloud: bool = True,
 ) -> dict[str, Any]:
     """Send `method` over the LOCAL connection and report how it was answered.
 
@@ -63,7 +64,9 @@ async def local_request(
     if local is None or not getattr(v1ch, "is_local_connected", False):
         raise RuntimeError("robot is not connected locally")
     security = getattr(v1ch, "_security_data", None)
-    mqtt = getattr(v1ch, "_mqtt_channel", None)
+    # docs/48: the live poller sets watch_cloud=False — subscribing to the
+    # cloud topic every few seconds would itself be cloud traffic.
+    mqtt = getattr(v1ch, "_mqtt_channel", None) if watch_cloud else None
 
     request = RequestMessage(method, params=None)
     message = request.encode_message(

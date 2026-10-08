@@ -1467,6 +1467,9 @@ class _FakeCoordinatorForSensor:
         # docs/44 F2: the map sensor also publishes the job's progress.
         self.job_progress = {"active": False}
 
+    def live_for(self, duid: str) -> None:  # docs/48: no live trail here
+        return None
+
 
 def test_sensor_publishes_floorplan_seats() -> None:
     """`AnyVacMapSensor.extra_state_attributes` passes `floorplan_seats`

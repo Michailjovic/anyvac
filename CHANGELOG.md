@@ -6,6 +6,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.51.0] - 2026-10-08
+
+Pairs with card **1.51.0**. docs/48. Includes the unreleased 1.50.1 probe.
+
+### Added
+
+- **Live position from the local connection.** While a vacuum cleans and is
+  connected locally, AnyVac asks it every 3 s for `get_dynamic_map_diff` —
+  measured on the S8 MaxV Ultra to answer locally in 13–142 ms with the
+  robot's position and the path points added since the previous request
+  (standard Roborock map blocks 8/3/18, decoded in the new `livediff.py`).
+  The result is published as the new `live` attribute in px (snapshot and
+  home-frame spaces), extending the last full map until the next one
+  arrives. The full map (cloud, ~30 s) stays the only source for rooms,
+  walls, time attribution, coverage and room confirmation — `live` is
+  display-only. A gap in the diff (someone else, e.g. the app, consumed
+  points) stops the trace extension but keeps the position; three failures
+  in a row pause a robot for 60 s. No cloud traffic: the poller watches only
+  the local channel. Option "Live position from the local connection",
+  default on.
+
 ## [1.50.1] - 2026-10-08
 
 Card unchanged (1.50.0). docs/47 §4.

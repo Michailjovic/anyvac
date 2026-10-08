@@ -31,3 +31,10 @@ PATH_MAX_POINTS = 2000
 # way, so Pin & Go, zone clean and the card itself do not depend on this.
 OPT_EXPOSE_LEGACY_MM = "expose_legacy_mm_attributes"
 DEFAULT_EXPOSE_LEGACY_MM = False
+# docs/48: live position/trace from the robot's local get_dynamic_map_diff.
+OPT_LIVE_DIFF = "live_position_local"
+DEFAULT_LIVE_DIFF = True
+LIVE_DIFF_INTERVAL_S = 3
+LIVE_DIFF_TIMEOUT_S = 4.0
+LIVE_DIFF_MAX_FAILS = 3
+LIVE_DIFF_BACKOFF_S = 60.0

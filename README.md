@@ -33,6 +33,7 @@ or mm math on the card side:
 | --- | --- |
 | `schema_version` | `2` once the integration's own 3-point affine solve succeeds; the card shows a degraded-mode banner and disables smart features below this |
 | `vacuum_position_px` / `charger_px` | `{x, y}` robot / dock position, in **rendered image pixels** |
+| `live` | docs/48: while the vacuum cleans, its newest position and trace from the robot's local `get_dynamic_map_diff`, extending the last full map — `{base_points, seq, at, broken, pos_px, pos_home_px, dry_px, wet_px, dry_home_px, wet_home_px, dry_continues, wet_continues}`; applies only while `base_points` equals `path_points`; `null` otherwise. Option "Live position from the local connection" (default on) |
 | `path_dry_px` | dry-clean trajectory, as **segments** (list of point-lists — one contiguous run per segment, so gaps from transit/mop-wash aren't bridged with a straight line) |
 | `path_wet_px` | mop trajectory, flat list of `{x, y}` pixels |
 | `rooms` | `[{segment_id, name, bbox_px:{x0,y0,x1,y1}, pos_x, pos_y, estimate_dry, estimate_wet, progress_pct}, …]` |

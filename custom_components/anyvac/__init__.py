@@ -66,6 +66,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # docs/47: the coordinator listens on the Roborock coordinators; drop those
     # listeners on unload (a reload creates a fresh coordinator that re-subscribes).
     entry.async_on_unload(coordinator.unsubscribe_roborock)
+    # docs/48: live position from the robot's local diff while it cleans.
+    entry.async_on_unload(coordinator.start_live())
     entry.async_on_unload(entry.add_update_listener(_async_options_updated))
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     async_register_services(hass)

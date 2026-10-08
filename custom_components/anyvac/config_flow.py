@@ -22,7 +22,13 @@ from homeassistant.config_entries import (
 )
 from homeassistant.core import callback
 
-from .const import DEFAULT_EXPOSE_LEGACY_MM, DOMAIN, OPT_EXPOSE_LEGACY_MM
+from .const import (
+    DEFAULT_EXPOSE_LEGACY_MM,
+    DEFAULT_LIVE_DIFF,
+    DOMAIN,
+    OPT_EXPOSE_LEGACY_MM,
+    OPT_LIVE_DIFF,
+)
 
 
 class AnyVacConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -65,6 +71,10 @@ class AnyVacOptionsFlow(OptionsFlow):
                         default=self.config_entry.options.get(
                             OPT_EXPOSE_LEGACY_MM, DEFAULT_EXPOSE_LEGACY_MM
                         ),
+                    ): bool,
+                    vol.Optional(
+                        OPT_LIVE_DIFF,
+                        default=self.config_entry.options.get(OPT_LIVE_DIFF, DEFAULT_LIVE_DIFF),
                     ): bool,
                 }
             ),
