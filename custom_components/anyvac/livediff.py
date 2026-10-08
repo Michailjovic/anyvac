@@ -64,10 +64,14 @@ def parse_diff(answer: Any) -> dict[str, Any] | None:
     """One ``get_dynamic_map_diff`` answer → ``{"start", "pos", "points",
     "flags"}`` or None when it is not a diff answer at all. ``start`` is None
     and the lists are empty when nothing moved since the previous request."""
-    if not isinstance(answer, dict) or not isinstance(answer.get("diff"), dict):
+    if not isinstance(answer, dict):
         return None
-    block = answer["diff"].get("3")
     out: dict[str, Any] = {"start": None, "pos": None, "points": [], "flags": []}
+    if not isinstance(answer.get("diff"), dict):
+        # `{"nonce": 0, "result": 2}` with no `diff` = a valid answer with
+        # nothing in it (S7 MaxV while docked, 2026-10-08) — not a failure.
+        return out if "result" in answer else None
+    block = answer["diff"].get("3")
     if not isinstance(block, dict):
         return out
     data = block.get("data")

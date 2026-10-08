@@ -1267,6 +1267,10 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # field report "still every 30 s" — live updates only right after a
         # full-map refresh; these say what the diff answers in between).
         self._live_stats: dict[str, dict[str, Any]] = {}
+        # Robots whose firmware rejects get_dynamic_map_diff ("method not
+        # recognized" — S6, field-caught 2026-10-08). Never polled again until
+        # HA restarts: retrying every 60 s would only produce the same error.
+        self._live_unsupported: set[str] = set()
         self._rb_seen_raw: dict[str, bytes] = {}
         self._map_fresh: dict[str, bool] = {}
         # Plan-scope transit labeling (docs/17 §1.3): room-name scope of the currently
@@ -3541,6 +3545,8 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 continue
             if self._live_backoff.get(duid, 0.0) > now:
                 continue
+            if duid in getattr(self, "_live_unsupported", ()):
+                continue
             self._live_inflight.add(duid)
             self.hass.async_create_background_task(
                 self._live_fetch(duid), f"anyvac live diff {duid}"
@@ -3568,8 +3574,20 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             )
             parsed = livediff.parse_diff(res.get("ack"))
             if parsed is None:
-                self._live_count(duid, "no_answer", ack=repr(res.get("ack"))[:80],
-                                 ack_error=res.get("ack_error"))
+                err = res.get("ack_error") or ""
+                self._live_count(duid, "no_answer", ack=repr(res.get("ack"))[:80], ack_error=err)
+                if "not recognized" in err.lower() or "unknown method" in err.lower():
+                    self._live_unsupported.add(duid)
+                    st = self._live_stats.get(duid)
+                    if st is not None:
+                        st["unsupported"] = True
+                    _LOGGER.info(
+                        "AnyVac: %s does not support get_dynamic_map_diff — live position "
+                        "off for it, the map updates with the official integration (~30 s)",
+                        duid,
+                    )
+                    self.async_update_listeners()
+                    return
                 self._live_failed(duid)
                 return
             self._live_fails[duid] = 0

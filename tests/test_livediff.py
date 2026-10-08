@@ -53,7 +53,9 @@ def test_mop_flag_changes_inside_one_answer() -> None:
 def test_answer_without_new_points() -> None:
     p = livediff.parse_diff(_answer(None, None))
     assert p == {"start": None, "pos": None, "points": [], "flags": []}
-    assert livediff.parse_diff({"result": 2}) is None
+    # S7 MaxV docked answers `{"nonce": 0, "result": 2}` — valid, empty.
+    assert livediff.parse_diff({"nonce": 0, "result": 2}) == {"start": None, "pos": None, "points": [], "flags": []}
+    assert livediff.parse_diff({"foo": 1}) is None
     assert livediff.parse_diff(["ok"]) is None
 
 
@@ -190,6 +192,34 @@ async def test_good_answer_resets_failures(monkeypatch: pytest.MonkeyPatch) -> N
     c._live_fails["d1"] = 2
     await c._live_fetch("d1")
     assert c._live_fails["d1"] == 0 and c.live_for("d1")["seq"] == 1
+
+
+@pytest.mark.asyncio
+async def test_firmware_without_the_diff_is_never_polled_again(monkeypatch: pytest.MonkeyPatch) -> None:
+    c = _coord()
+    c._live_stats, c._live_unsupported = {}, set()
+    v1 = type("V1", (), {"is_local_connected": True})()
+    c.roborock_coordinator_for = lambda duid: object()  # type: ignore[method-assign]
+    monkeypatch.setattr(localprobe, "v1_channel_of", lambda rb: v1)
+
+    async def rejected(v1ch: Any, method: str, **kw: Any) -> dict[str, Any]:
+        return {"ack": None, "ack_error": "The method called is not recognized by the device."}
+
+    monkeypatch.setattr(localprobe, "local_request", rejected)
+    await c._live_fetch("d1")
+    assert "d1" in c._live_unsupported and c.live_stats_for("d1")["unsupported"] is True
+    assert "d1" not in c._live_backoff  # not a transient failure
+
+    class _Hass:
+        tasks = 0
+
+        def async_create_background_task(self, coro: Any, name: str) -> None:
+            _Hass.tasks += 1
+            coro.close()
+
+    c.hass = _Hass()
+    c._live_tick()
+    assert _Hass.tasks == 0
 
 
 @pytest.mark.asyncio

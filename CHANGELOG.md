@@ -6,6 +6,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.51.3] - 2026-10-08
+
+Card unchanged (1.51.0). docs/48 §4.2 — S6 and S7 MaxV.
+
+### Fixed
+
+- **S6:** its firmware rejects `get_dynamic_map_diff` ("The method called is
+  not recognized by the device"). Such a robot is now marked unsupported and
+  never polled again until HA restarts (`live_stats.unsupported: true`);
+  before, it retried 3× every 60 s for nothing. Its map keeps the official
+  integration's ~30 s.
+- **S7 MaxV:** answers `{"nonce": 0, "result": 2}` without a `diff` (seen
+  while docked). That is now an empty answer, not a failure — before, three
+  of them in a row paused the robot for 60 s.
+
 ## [1.51.2] - 2026-10-08
 
 Card unchanged (1.51.0).
