@@ -23,6 +23,11 @@ Public command interface for the card (and automations):
                           vacuum's raw Roborock map bytes to disk for the
                           offline home-frame registration probe. No card
                           involvement, no behaviour change to anything else.
+- ``anyvac.probe_map_rate`` — DEBUG/DIAGNOSTIC only (docs/47 §4): fetches one
+                          vacuum's map repeatedly for a while and reports
+                          latency, size and whether position/trace changed,
+                          to measure if fetching faster than the official
+                          integration's 30 s is worth it. Nothing is kept.
 - ``anyvac.snap_wall_corner`` — docs/40 §5.B: given a point in home-frame px,
                           returns the nearest wall-corner vertex found in
                           that frame's own wall mask (or the point unchanged
@@ -44,6 +49,8 @@ import logging
 import math
 import os
 import re
+import asyncio
+import statistics
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -56,6 +63,7 @@ from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers.event import async_call_later
 from homeassistant.util import dt as dt_util
 
+from . import localprobe
 from .const import DOMAIN
 from .planner import DEFAULT_ROOM_MIN, CleanPlanner, duid_for_entity, vacuum_entity_for_duid
 
@@ -78,6 +86,7 @@ SERVICE_DOCK_DRY = "dock_dry"
 SERVICE_DOCK_PUMP = "dock_pump"
 SERVICE_DOCK_SELF_CLEAN = "dock_self_clean"
 SERVICE_DOCK_RESOLVE_ERROR = "dock_resolve_error"
+SERVICE_PROBE_MAP_RATE = "probe_map_rate"
 SERVICE_SNAPSHOT_FLOORPLAN = "snapshot_map_as_floorplan"
 SERVICE_EXPORT_MAP_GUIDE = "export_map_guide"
 SERVICE_DUMP_RAW_MAP = "dump_raw_map"
@@ -103,6 +112,7 @@ ALL_SERVICES = (
     SERVICE_DOCK_PUMP,
     SERVICE_DOCK_SELF_CLEAN,
     SERVICE_DOCK_RESOLVE_ERROR,
+    SERVICE_PROBE_MAP_RATE,
     SERVICE_SNAPSHOT_FLOORPLAN,
     SERVICE_EXPORT_MAP_GUIDE,
     SERVICE_DUMP_RAW_MAP,
@@ -397,6 +407,26 @@ DOCK_TOGGLE_SCHEMA = DOCK_ACTION_SCHEMA.extend(
 # Roborock map bytes to disk for the offline home-frame registration probe
 # (`anyvac/tools/homeframe_probe.py`). Same target resolution as goto/zone_clean/
 # the dock actions (entity_id or duid).
+# docs/47 §4. Every map request goes over the Roborock CLOUD (python-roborock's
+# map RPC channel is MQTT-only, even when the robot is connected locally), so
+# the floor of 3 s and the 5 minute cap keep a probe from hammering it.
+PROBE_INTERVAL_MIN_S = 3.0
+PROBE_DURATION_MAX_S = 300.0
+PROBE_MAP_RATE_SCHEMA = vol.Schema(
+    {
+        vol.Optional("entity_id"): str,
+        vol.Optional("duid"): str,
+        vol.Optional("duration_s", default=120): vol.All(
+            vol.Coerce(float), vol.Range(min=10, max=PROBE_DURATION_MAX_S)
+        ),
+        vol.Optional("interval_s", default=10): vol.All(
+            vol.Coerce(float), vol.Range(min=PROBE_INTERVAL_MIN_S, max=60)
+        ),
+        vol.Optional("dynamic_diff", default=False): bool,
+        vol.Optional("transport", default="local"): vol.In(["local", "cloud"]),
+    }
+)
+
 DUMP_RAW_MAP_SCHEMA = vol.Schema(
     {
         vol.Optional("entity_id"): str,
@@ -1165,6 +1195,120 @@ async def _resolve_dock_error(
     return True
 
 
+def _probe_sample(map_trait: Any) -> dict[str, Any]:
+    """What one probe fetch saw: map size, robot position, trace lengths."""
+    raw = getattr(map_trait, "raw_api_response", None)
+    md = getattr(map_trait, "map_data", None)
+
+    def _count(obj: Any) -> int:
+        subs = getattr(obj, "path", None) if obj is not None else None
+        return sum(len(s) for s in subs) if subs else 0
+
+    pos = getattr(md, "vacuum_position", None) if md is not None else None
+    add = getattr(md, "additional_parameters", None) if md is not None else None
+    return {
+        "raw": bytes(raw) if isinstance(raw, (bytes, bytearray)) else None,
+        "x": getattr(pos, "x", None),
+        "y": getattr(pos, "y", None),
+        "path_points": _count(getattr(md, "path", None)) if md is not None else 0,
+        "mop_points": _count(getattr(md, "mop_path", None)) if md is not None else 0,
+        "map_sequence": add.get("map_sequence") if isinstance(add, dict) else None,
+    }
+
+
+def _stats(values: list[float]) -> dict[str, float] | None:
+    if not values:
+        return None
+    return {
+        "min": round(min(values), 1),
+        "median": round(statistics.median(values), 1),
+        "max": round(max(values), 1),
+    }
+
+
+async def _probe_map_rate(
+    map_trait: Any,
+    *,
+    duration_s: float,
+    interval_s: float,
+    dynamic_diff: Callable[[], Awaitable[Any]] | None = None,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    timeout_s: float = 20.0,
+) -> dict[str, Any]:
+    """Fetch the map every `interval_s` for `duration_s` (docs/47 §4).
+
+    `map_trait` is python-roborock's `MapContentTrait` (`refresh()` sends
+    `get_map_v1` and parses it). Reports, per fetch, how long it took and
+    whether the map, the robot position and the trace changed — the facts that
+    decide whether fetching faster than every 30 s buys anything. With
+    `dynamic_diff`, the undocumented `get_dynamic_map_diff` is tried after each
+    fetch and only its shape is reported (type, length, first bytes).
+    """
+    start = clock()
+    samples: list[dict[str, Any]] = []
+    prev: dict[str, Any] | None = None
+    next_at = start
+    while True:
+        now = clock()
+        if now - start > duration_s:
+            break
+        if now < next_at:
+            await sleep(next_at - now)
+        t0 = clock()
+        row: dict[str, Any] = {"t": round(t0 - start, 1)}
+        try:
+            await asyncio.wait_for(map_trait.refresh(), timeout_s)
+        except Exception as err:  # noqa: BLE001 - a failed fetch is a result, not a crash
+            row["error"] = f"{type(err).__name__}: {err}"[:200]
+        row["latency_ms"] = round((clock() - t0) * 1000)
+        if "error" not in row:
+            cur = _probe_sample(map_trait)
+            raw = cur.pop("raw")
+            row["bytes"] = len(raw) if raw is not None else None
+            row.update(cur)
+            if prev is not None:
+                row["changed"] = raw != prev["raw"]
+                row["new_path_points"] = cur["path_points"] - prev["path_points"]
+                row["new_mop_points"] = cur["mop_points"] - prev["mop_points"]
+                if None not in (cur["x"], cur["y"], prev["x"], prev["y"]):
+                    row["moved_mm"] = round(math.hypot(cur["x"] - prev["x"], cur["y"] - prev["y"]))
+            prev = {**cur, "raw": raw}
+        if dynamic_diff is not None:
+            d0 = clock()
+            try:
+                resp = await asyncio.wait_for(dynamic_diff(), timeout_s)
+                info: dict[str, Any] = {"type": type(resp).__name__}
+                if isinstance(resp, (bytes, bytearray)):
+                    info["bytes"] = len(resp)
+                    info["head"] = bytes(resp[:32]).hex()
+                else:
+                    info["value"] = repr(resp)[:400]
+            except Exception as err:  # noqa: BLE001
+                info = {"error": f"{type(err).__name__}: {err}"[:200]}
+            info["latency_ms"] = round((clock() - d0) * 1000)
+            row["dynamic_diff"] = info
+        samples.append(row)
+        next_at = t0 + interval_s
+
+    ok = [s for s in samples if "error" not in s]
+    changed = [s for s in ok if s.get("changed")]
+    change_t = [s["t"] for s in changed]
+    return {
+        "fetches": len(samples),
+        "errors": len(samples) - len(ok),
+        "changed": len(changed),
+        "latency_ms": _stats([s["latency_ms"] for s in ok]),
+        "bytes": _stats([s["bytes"] for s in ok if s.get("bytes") is not None]),
+        "seconds_between_changes": _stats([b - a for a, b in zip(change_t, change_t[1:])]),
+        "new_path_points_per_change": _stats(
+            [s["new_path_points"] + s["new_mop_points"] for s in changed]
+        ),
+        "moved_mm_per_change": _stats([s["moved_mm"] for s in changed if "moved_mm" in s]),
+        "samples": samples,
+    }
+
+
 def _coordinators(hass: HomeAssistant) -> list[Any]:
     """All AnyVac coordinators (in practice one config entry)."""
     out = []
@@ -1876,6 +2020,90 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
             for c in coords:
                 await c.async_request_refresh()
 
+    probing: set[str] = set()
+
+    async def _handle_probe_map_rate(call: ServiceCall) -> dict[str, Any]:
+        # docs/47 §4: DEBUG/DIAGNOSTIC ONLY. Measures; changes nothing the card
+        # or the pipeline reads (the extra fetches only refresh the library's
+        # own map trait, which the official integration reads the same way).
+        duid = _resolve_target_duid(hass, call)
+        rb = next(
+            (c for c in (a.roborock_coordinator_for(duid) for a in _coordinators(hass)) if c is not None),
+            None,
+        )
+        props = getattr(rb, "properties_api", None)
+        trait = getattr(props, "map_content", None)
+        if trait is None:
+            raise HomeAssistantError(f"anyvac.probe_map_rate: no Roborock map for vacuum '{duid}'")
+        if duid in probing:
+            raise HomeAssistantError(f"anyvac.probe_map_rate: already probing '{duid}'")
+        transport = call.data["transport"]
+        diff = None
+        source: Any = trait
+        if transport == "local":
+            # docs/47 §4: python-roborock fetches maps over the cloud only; this
+            # asks the firmware over the local connection and watches both
+            # transports for the answer (localprobe.py).
+            try:
+                v1ch = localprobe.v1_channel_of(rb)
+            except RuntimeError as err:
+                raise HomeAssistantError(f"anyvac.probe_map_rate: {err}") from err
+            if not getattr(v1ch, "is_local_connected", False):
+                raise HomeAssistantError(
+                    f"anyvac.probe_map_rate: '{duid}' is not connected locally right now"
+                )
+            source = localprobe.LocalMapSource(
+                v1ch, getattr(trait, "converter", None), hass.async_add_executor_job
+            )
+            if call.data["dynamic_diff"]:
+
+                async def diff() -> Any:
+                    r = await localprobe.local_request(v1ch, "get_dynamic_map_diff")
+                    return {
+                        "map_bytes": len(r["map"]) if r["map"] is not None else None,
+                        "map_via": r["map_via"],
+                        "ack": repr(r["ack"])[:150],
+                        "ack_error": r["ack_error"],
+                        "protocols": r["protocols"],
+                    }
+
+        elif call.data["dynamic_diff"]:
+            from roborock.roborock_typing import RoborockCommand  # lazy: library of the official integration
+
+            async def diff() -> Any:
+                return await trait.rpc_channel.send_command(RoborockCommand.GET_DYNAMIC_MAP_DIFF)
+
+        device = getattr(rb, "_device", None)
+        probing.add(duid)
+        try:
+            result = await _probe_map_rate(
+                source,
+                duration_s=call.data["duration_s"],
+                interval_s=call.data["interval_s"],
+                dynamic_diff=diff,
+            )
+        finally:
+            probing.discard(duid)
+        status = getattr(props, "status", None)
+        result["vacuum"] = call.data.get("entity_id") or duid
+        result["local_connected"] = getattr(device, "is_local_connected", None)
+        result["state_at_end"] = getattr(status, "state_name", None)
+        result["interval_s"] = call.data["interval_s"]
+        result["transport"] = transport
+        if transport == "local" and getattr(source, "last", None):
+            last = source.last
+            result["last_local_answer"] = {
+                "map_via": last.get("map_via"),
+                "ack": repr(last.get("ack"))[:150],
+                "ack_error": last.get("ack_error"),
+                "protocols": last.get("protocols"),
+            }
+        _LOGGER.info(
+            "AnyVac: probe_map_rate %s — %d fetches, %d changed, latency %s",
+            duid, result["fetches"], result["changed"], result["latency_ms"],
+        )
+        return result
+
     async def _handle_snapshot_floorplan(call: ServiceCall) -> dict[str, Any]:
         if call.data.get("frame") == "home":
             frame_id, frame = _select_home_frame(
@@ -2388,6 +2616,7 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
         (SERVICE_SNAPSHOT_FLOORPLAN, _handle_snapshot_floorplan, SNAPSHOT_FLOORPLAN_SCHEMA, SupportsResponse.ONLY),
         (SERVICE_EXPORT_MAP_GUIDE, _handle_export_map_guide, EXPORT_MAP_GUIDE_SCHEMA, SupportsResponse.ONLY),
         (SERVICE_DUMP_RAW_MAP, _handle_dump_raw_map, DUMP_RAW_MAP_SCHEMA, SupportsResponse.ONLY),
+        (SERVICE_PROBE_MAP_RATE, _handle_probe_map_rate, PROBE_MAP_RATE_SCHEMA, SupportsResponse.ONLY),
         (SERVICE_SNAP_WALL_CORNER, _handle_snap_wall_corner, SNAP_WALL_CORNER_SCHEMA, SupportsResponse.ONLY),
         (SERVICE_DETECT_FIDUCIALS, _handle_detect_fiducials, DETECT_FIDUCIALS_SCHEMA, SupportsResponse.ONLY),
     ]

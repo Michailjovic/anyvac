@@ -1596,15 +1596,21 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 return bytes(raw), meta
         return None
 
-    def roborock_status_for(self, duid: str) -> Any | None:
-        """The Roborock `StatusTrait` of one duid (docs/47 §3, for
-        ``anyvac.dock_resolve_error``) — same piggyback walk as `raw_map_for`."""
+    def roborock_coordinator_for(self, duid: str) -> Any | None:
+        """The Roborock v1 coordinator of one duid (same piggyback walk as
+        `raw_map_for`)."""
         for rb_entry in self.hass.config_entries.async_entries(ROBOROCK_DOMAIN):
             runtime = getattr(rb_entry, "runtime_data", None)
             for coord in getattr(runtime, "v1", None) or []:
                 if getattr(coord, "duid", None) == duid:
-                    return getattr(getattr(coord, "properties_api", None), "status", None)
+                    return coord
         return None
+
+    def roborock_status_for(self, duid: str) -> Any | None:
+        """The Roborock `StatusTrait` of one duid (docs/47 §3, for
+        ``anyvac.dock_resolve_error``)."""
+        coord = self.roborock_coordinator_for(duid)
+        return getattr(getattr(coord, "properties_api", None), "status", None)
 
     @property
     def view_layers(self) -> dict[str, bool]:

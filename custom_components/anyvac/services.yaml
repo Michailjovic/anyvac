@@ -818,6 +818,66 @@ dump_raw_map:
       selector:
         text:
 
+probe_map_rate:
+  name: Probe map refresh rate (debug)
+  description: >-
+    DEBUG/DIAGNOSTIC ONLY (docs/47 §4). Fetches the vacuum's map every
+    interval for a while and returns per-fetch latency, size and whether the
+    map, robot position and trace changed. Run it while the vacuum cleans.
+    The official integration fetches maps over the Roborock cloud only;
+    transport local tests whether the robot answers over the local
+    connection instead. Keep runs short. Nothing is stored.
+  fields:
+    entity_id:
+      name: Vacuum
+      description: Vacuum to probe. Omit if `duid` is given instead.
+      selector:
+        entity:
+          domain: vacuum
+    duid:
+      name: Vacuum (duid)
+      description: Roborock device id, as an alternative to `entity_id`.
+      selector:
+        text:
+    duration_s:
+      name: Duration
+      description: How long to probe, in seconds (10–300).
+      default: 120
+      selector:
+        number:
+          min: 10
+          max: 300
+          unit_of_measurement: s
+    interval_s:
+      name: Interval
+      description: Seconds between fetches (3–60).
+      default: 10
+      selector:
+        number:
+          min: 3
+          max: 60
+          unit_of_measurement: s
+    transport:
+      name: Transport
+      description: >-
+        local (default) asks the robot over the local connection and reports
+        whether the map came back locally or via the cloud; cloud uses the
+        official integration's own (cloud-only) map channel.
+      default: local
+      selector:
+        select:
+          options:
+            - local
+            - cloud
+    dynamic_diff:
+      name: Try get_dynamic_map_diff
+      description: >-
+        Also send the undocumented get_dynamic_map_diff after each fetch and
+        report the shape of its answer.
+      default: false
+      selector:
+        boolean:
+
 snap_wall_corner:
   name: Snap point to nearest wall corner
   description: >-

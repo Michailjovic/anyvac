@@ -6,6 +6,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.50.1] - 2026-10-08
+
+Card unchanged (1.50.0). docs/47 §4.
+
+### Added
+
+- **`anyvac.probe_map_rate`** (debug/diagnostic only). Fetches one vacuum's map
+  every `interval_s` (3–60 s, default 10) for `duration_s` (10–300 s, default
+  120) and returns per-fetch latency, map size, robot position, trace length and
+  whether anything changed, plus a summary (seconds between real changes, new
+  trace points and distance moved per change). With `dynamic_diff: true` it also
+  sends the undocumented `get_dynamic_map_diff` and reports the shape of the
+  answer. Measures whether fetching faster than the official integration's
+  30 s is worth building; stores nothing.
+- **`transport: local` (default).** python-roborock fetches maps over the
+  Roborock cloud only (its map channel is MQTT-only, even with a local
+  connection). The probe instead sends `get_map_v1` over the LOCAL connection
+  (new `localprobe.py`, reaches into python-roborock's `V1Channel` on purpose,
+  guarded) and watches both transports, so each fetch reports whether the
+  robot answered locally, uploaded the map to the cloud instead, or not at
+  all. `transport: cloud` keeps the official integration's channel. 3 s floor
+  and 5 minute cap either way.
+
 ## [1.50.0] - 2026-10-08
 
 Pairs with card **1.50.0**. docs/47. Tested against Home Assistant 2026.10.0
