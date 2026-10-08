@@ -1470,6 +1470,9 @@ class _FakeCoordinatorForSensor:
     def live_for(self, duid: str) -> None:  # docs/48: no live trail here
         return None
 
+    def live_stats_for(self, duid: str) -> None:
+        return None
+
 
 def test_sensor_publishes_floorplan_seats() -> None:
     """`AnyVacMapSensor.extra_state_attributes` passes `floorplan_seats`

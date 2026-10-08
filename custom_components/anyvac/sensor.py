@@ -86,7 +86,7 @@ class AnyVacMapSensor(CoordinatorEntity[AnyVacCoordinator], SensorEntity):
             # docs/44 F2 — live job progress for the card's hero bar.
             "job_progress",
             # docs/48 — live extension of the snapshot from the local diff.
-            "live",
+            "live", "live_stats",
             # Kontrakt v3 (docs/40 §4.2 point 6) — additive, same "large/
             # fast-changing map payload" reasoning as the v2 *_px attributes above.
             "home_frame", "registration", "vacuum_position_home_px", "charger_home_px",
@@ -143,6 +143,7 @@ class AnyVacMapSensor(CoordinatorEntity[AnyVacCoordinator], SensorEntity):
             "floorplan_seats": self.coordinator.floorplan_seats,
             "job_progress": self.coordinator.job_progress,
             "live": self.coordinator.live_for(self._duid),
+            "live_stats": self.coordinator.live_stats_for(self._duid),
         }
 
 

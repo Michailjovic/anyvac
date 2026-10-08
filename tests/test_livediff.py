@@ -190,3 +190,24 @@ async def test_good_answer_resets_failures(monkeypatch: pytest.MonkeyPatch) -> N
     c._live_fails["d1"] = 2
     await c._live_fetch("d1")
     assert c._live_fails["d1"] == 0 and c.live_for("d1")["seq"] == 1
+
+
+@pytest.mark.asyncio
+async def test_live_stats_count_what_the_diff_answers(monkeypatch: pytest.MonkeyPatch) -> None:
+    c = _coord()
+    c._live_stats = {}
+    v1 = type("V1", (), {"is_local_connected": True})()
+    c.roborock_coordinator_for = lambda duid: object()  # type: ignore[method-assign]
+    monkeypatch.setattr(localprobe, "v1_channel_of", lambda rb: v1)
+    answers = iter([_answer(870, T5), _answer(None, None), None])
+
+    async def answer(v1ch: Any, method: str, **kw: Any) -> dict[str, Any]:
+        return {"ack": next(answers), "latency_ms": 20}
+
+    monkeypatch.setattr(localprobe, "local_request", answer)
+    for _ in range(3):
+        await c._live_fetch("d1")
+    st = c.live_stats_for("d1")
+    assert (st["with_points"], st["empty"], st["no_answer"]) == (1, 1, 1)
+    assert st["last"]["what"] == "no_answer"
+    assert c.updates == 2  # every parsed answer republishes (stats changed)

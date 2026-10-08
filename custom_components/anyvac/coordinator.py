@@ -1263,6 +1263,10 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         self._live_inflight: set[str] = set()
         self._live_fails: dict[str, int] = {}
         self._live_backoff: dict[str, float] = {}
+        # Per-robot poller counters, published as `live_stats` (docs/48 follow-up:
+        # field report "still every 30 s" — live updates only right after a
+        # full-map refresh; these say what the diff answers in between).
+        self._live_stats: dict[str, dict[str, Any]] = {}
         self._rb_seen_raw: dict[str, bytes] = {}
         self._map_fresh: dict[str, bool] = {}
         # Plan-scope transit labeling (docs/17 §1.3): room-name scope of the currently
@@ -3247,6 +3251,10 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                         # point the live trail added — drop it.
                         getattr(self, "_live", {}).pop(device.duid, None)
                         getattr(self, "_live_pub", {}).pop(device.duid, None)
+                        st = getattr(self, "_live_stats", {}).get(device.duid)
+                        if st is not None:
+                            st["snapshot_at"] = dt_util.utcnow().isoformat(timespec="seconds")
+                            st["since_snapshot"] = {"with_points": 0, "empty": 0, "no_answer": 0, "failed": 0}
                     # docs/40 §4.2/§4.3: cheap cache-key check inline, heavy
                     # FFT registration itself always in the executor — never
                     # blocks this polling coroutine.
@@ -3495,6 +3503,20 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         """The `live` attribute of one vacuum's sensor (docs/48 §1.5)."""
         return self._live_pub.get(duid)
 
+    def live_stats_for(self, duid: str) -> dict[str, Any] | None:
+        """The `live_stats` attribute (docs/48 follow-up diagnostics)."""
+        return getattr(self, "_live_stats", {}).get(duid)
+
+    def _live_count(self, duid: str, what: str, **extra: Any) -> None:
+        stats = getattr(self, "_live_stats", None)
+        if stats is None:
+            return
+        st = stats.setdefault(duid, {"with_points": 0, "empty": 0, "no_answer": 0, "failed": 0,
+                                     "since_snapshot": {"with_points": 0, "empty": 0, "no_answer": 0, "failed": 0}})
+        st[what] = st.get(what, 0) + 1
+        st["since_snapshot"][what] = st["since_snapshot"].get(what, 0) + 1
+        st["last"] = {"what": what, "at": dt_util.utcnow().isoformat(timespec="seconds"), **extra}
+
     def start_live(self) -> CALLBACK_TYPE:
         """Start the live poller; returns its unsubscribe callback."""
         if not self._live_enabled:
@@ -3538,12 +3560,23 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             )
             parsed = livediff.parse_diff(res.get("ack"))
             if parsed is None:
+                self._live_count(duid, "no_answer", ack=repr(res.get("ack"))[:80],
+                                 ack_error=res.get("ack_error"))
                 self._live_failed(duid)
                 return
             self._live_fails[duid] = 0
+            diff = res["ack"]["diff"]
+            self._live_count(
+                duid, "with_points" if parsed["points"] else "empty",
+                start=parsed["start"], points=len(parsed["points"]),
+                max_len=(diff.get("3") or {}).get("max_len"),
+                c26=(diff.get("26") or {}).get("count"),
+                ms=res.get("latency_ms"),
+            )
             self._apply_live(duid, parsed)
         except Exception as err:  # noqa: BLE001 - display-only, never fatal
             _LOGGER.debug("AnyVac: live diff for %s failed: %s", duid, err)
+            self._live_count(duid, "failed", error=f"{type(err).__name__}: {err}"[:120])
             self._live_failed(duid)
         finally:
             self._live_inflight.discard(duid)
@@ -3559,7 +3592,10 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             trail = self._live[duid] = livediff.LiveTrail(base=base)
         if trail.apply(parsed):
             self._live_pub[duid] = self._live_payload(device, trail)
-            self.async_update_listeners()
+        # Listeners also on an empty answer: `live_stats` changed (docs/48
+        # follow-up diagnostics). Only `live_stats`/`live` differ, so the
+        # browser receives a few bytes.
+        self.async_update_listeners()
 
     def _live_payload(self, device: AnyVacDevice, trail: livediff.LiveTrail) -> dict[str, Any]:
         """Trail → px-space `live` attribute (docs/48 §1.4–1.5). Same

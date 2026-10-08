@@ -869,6 +869,16 @@ probe_map_rate:
           options:
             - local
             - cloud
+    map_every:
+      name: Full map every Nth fetch
+      description: >-
+        Fetch the full map only on every N-th sample (0 = never, diff only) —
+        to see whether the diff keeps answering without full-map requests.
+      default: 1
+      selector:
+        number:
+          min: 0
+          max: 20
     dynamic_diff:
       name: Try get_dynamic_map_diff
       description: >-

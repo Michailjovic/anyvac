@@ -63,7 +63,7 @@ from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers.event import async_call_later
 from homeassistant.util import dt as dt_util
 
-from . import localprobe
+from . import livediff, localprobe
 from .const import DOMAIN
 from .planner import DEFAULT_ROOM_MIN, CleanPlanner, duid_for_entity, vacuum_entity_for_duid
 
@@ -424,6 +424,7 @@ PROBE_MAP_RATE_SCHEMA = vol.Schema(
         ),
         vol.Optional("dynamic_diff", default=False): bool,
         vol.Optional("transport", default="local"): vol.In(["local", "cloud"]),
+        vol.Optional("map_every", default=1): vol.All(vol.Coerce(int), vol.Range(min=0, max=20)),
     }
 )
 
@@ -1236,8 +1237,13 @@ async def _probe_map_rate(
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     timeout_s: float = 20.0,
+    map_every: int = 1,
 ) -> dict[str, Any]:
     """Fetch the map every `interval_s` for `duration_s` (docs/47 §4).
+
+    `map_every` (docs/48 follow-up): fetch the full map only on every N-th
+    sample (0 = never) — to see whether the diff keeps answering without
+    full-map requests in between.
 
     `map_trait` is python-roborock's `MapContentTrait` (`refresh()` sends
     `get_map_v1` and parses it). Reports, per fetch, how long it took and
@@ -1250,6 +1256,7 @@ async def _probe_map_rate(
     samples: list[dict[str, Any]] = []
     prev: dict[str, Any] | None = None
     next_at = start
+    index = 0
     while True:
         now = clock()
         if now - start > duration_s:
@@ -1258,12 +1265,17 @@ async def _probe_map_rate(
             await sleep(next_at - now)
         t0 = clock()
         row: dict[str, Any] = {"t": round(t0 - start, 1)}
-        try:
-            await asyncio.wait_for(map_trait.refresh(), timeout_s)
-        except Exception as err:  # noqa: BLE001 - a failed fetch is a result, not a crash
-            row["error"] = f"{type(err).__name__}: {err}"[:200]
-        row["latency_ms"] = round((clock() - t0) * 1000)
-        if "error" not in row:
+        do_map = map_every > 0 and index % map_every == 0
+        index += 1
+        if do_map:
+            try:
+                await asyncio.wait_for(map_trait.refresh(), timeout_s)
+            except Exception as err:  # noqa: BLE001 - a failed fetch is a result, not a crash
+                row["error"] = f"{type(err).__name__}: {err}"[:200]
+            row["latency_ms"] = round((clock() - t0) * 1000)
+        else:
+            row["map"] = "skipped"
+        if do_map and "error" not in row:
             cur = _probe_sample(map_trait)
             raw = cur.pop("raw")
             row["bytes"] = len(raw) if raw is not None else None
@@ -1294,12 +1306,12 @@ async def _probe_map_rate(
         samples.append(row)
         next_at = t0 + interval_s
 
-    ok = [s for s in samples if "error" not in s]
+    ok = [s for s in samples if "error" not in s and s.get("map") != "skipped"]
     changed = [s for s in ok if s.get("changed")]
     change_t = [s["t"] for s in changed]
     return {
         "fetches": len(samples),
-        "errors": len(samples) - len(ok),
+        "errors": sum(1 for s in samples if "error" in s),
         "changed": len(changed),
         "latency_ms": _stats([s["latency_ms"] for s in ok]),
         "bytes": _stats([s["bytes"] for s in ok if s.get("bytes") is not None]),
@@ -2062,11 +2074,23 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
 
                 async def diff() -> Any:
                     r = await localprobe.local_request(v1ch, "get_dynamic_map_diff")
-                    return {
-                        "map_bytes": len(r["map"]) if r["map"] is not None else None,
-                        "map_via": r["map_via"],
-                        "ack": r["ack"] if isinstance(r["ack"], (dict, list)) else repr(r["ack"])[:150],
-                        "ack_error": r["ack_error"],
+                    ack = r["ack"]
+                    parsed = livediff.parse_diff(ack)
+                    if parsed is None:
+                        return {
+                            "answer": repr(ack)[:150], "ack_error": r["ack_error"],
+                            "protocols": r["protocols"],
+                        }
+                    d = ack["diff"]
+                    return {  # compact (docs/48 follow-up): what the live poller sees
+                        "start": parsed["start"],
+                        "points": len(parsed["points"]),
+                        "pos": parsed["pos"],
+                        "c26": (d.get("26") or {}).get("count"),
+                        "c1": (d.get("1") or {}).get("count"),
+                        "max_len": (d.get("3") or {}).get("max_len"),
+                        "nonzero": sorted(k for k, v in d.items() if isinstance(v, dict) and v.get("count")),
+                        "result": ack.get("result"),
                         "protocols": r["protocols"],
                     }
 
@@ -2084,6 +2108,7 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
                 duration_s=call.data["duration_s"],
                 interval_s=call.data["interval_s"],
                 dynamic_diff=diff,
+                map_every=call.data["map_every"],
             )
         finally:
             probing.discard(duid)

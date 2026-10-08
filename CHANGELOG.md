@@ -6,6 +6,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.51.1] - 2026-10-08
+
+Card unchanged (1.51.0). docs/48 §4 — diagnostics for the field report "the
+robot still moves every 30 s".
+
+### Added
+
+- `live_stats` on the map sensor: what the live poller's diff requests
+  returned (with new points / empty / no local answer / failed), in total and
+  since the last full map, plus the last answer's `start`, point count,
+  `max_len` and latency.
+- `anyvac.probe_map_rate` gets `map_every` (fetch the full map only on every
+  N-th sample, 0 = diff only) and, with `transport: local`, a compact diff
+  summary per sample instead of the whole answer.
+
 ## [1.51.0] - 2026-10-08
 
 Pairs with card **1.51.0**. docs/48. Includes the unreleased 1.50.1 probe.

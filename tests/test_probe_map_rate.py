@@ -111,3 +111,28 @@ async def test_dynamic_diff_json_answer_is_returned_whole_and_via_is_reported() 
     s = r["samples"][0]
     assert s["dynamic_diff"]["value"] == answer
     assert s["via"] == "cloud"
+
+
+@pytest.mark.asyncio
+async def test_map_every_skips_full_map_fetches() -> None:
+    clock = _Clock()
+    trait = _Trait(clock)
+    diffs = 0
+
+    async def diff() -> dict:
+        nonlocal diffs
+        diffs += 1
+        return {"ok": 1}
+
+    r = await _probe_map_rate(
+        trait, duration_s=20, interval_s=5, dynamic_diff=diff, map_every=0,
+        clock=clock, sleep=clock.sleep,
+    )
+    assert trait.calls == 0 and diffs == len(r["samples"]) >= 4
+    assert all(s["map"] == "skipped" for s in r["samples"]) and r["errors"] == 0
+    clock2 = _Clock()
+    trait2 = _Trait(clock2)
+    r2 = await _probe_map_rate(trait2, duration_s=20, interval_s=5, map_every=2, clock=clock2, sleep=clock2.sleep)
+    n = len(r2["samples"])
+    assert trait2.calls == (n + 1) // 2  # samples 0, 2, 4, ...
+    assert [s.get("map") for s in r2["samples"]][:2] == [None, "skipped"]
