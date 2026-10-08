@@ -63,6 +63,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     coordinator = AnyVacCoordinator(hass, entry)
     await coordinator.async_config_entry_first_refresh()
     entry.runtime_data = coordinator
+    # docs/47: the coordinator listens on the Roborock coordinators; drop those
+    # listeners on unload (a reload creates a fresh coordinator that re-subscribes).
+    entry.async_on_unload(coordinator.unsubscribe_roborock)
     entry.async_on_unload(entry.add_update_listener(_async_options_updated))
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     async_register_services(hass)

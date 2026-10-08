@@ -630,6 +630,25 @@ dock_self_clean:
       selector:
         text:
 
+dock_resolve_error:
+  name: Dock — resolve error
+  description: >-
+    Confirm the dock's latched error, like "Resolved" in the Roborock app
+    (e.g. after refilling the clean water tank). Does nothing when the dock
+    reports no error.
+  fields:
+    entity_id:
+      name: Vacuum
+      description: Vacuum whose dock to command. Omit if `duid` is given instead.
+      selector:
+        entity:
+          domain: vacuum
+    duid:
+      name: Vacuum (duid)
+      description: Roborock device id, as an alternative to `entity_id`.
+      selector:
+        text:
+
 snapshot_map_as_floorplan:
   name: Snapshot map as floorplan
   description: >-

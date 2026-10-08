@@ -6,6 +6,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.50.0] - 2026-10-08
+
+Pairs with card **1.50.0**. docs/47. Tested against Home Assistant 2026.10.0
+(python-roborock 7.12.0): full suite green.
+
+### Changed
+
+- **The sensor follows the Roborock map instead of its own clock.** AnyVac now
+  listens on each Roborock v1 coordinator and refreshes as soon as that
+  coordinator's raw map changes. Before, a separate 30 s timer read whatever was
+  there, so position and trace lagged the official integration by 0–30 s
+  (field-observed 10–30 s). A bare status push does not trigger a refresh: it
+  arrives before the new map, and a run end processed against the old map
+  would lose the last room's final points (docs/45 §1.2). The 30 s timer stays
+  as a fallback.
+- **Time attribution and room confirmation count map snapshots, not polls.**
+  A poll that sees no new map while the robot is actively cleaning now leaves
+  the attribution clock alone, so its time goes to the points the next snapshot
+  brings instead of being dropped; in any other state (paused, transit, unknown)
+  it is dropped as before. The "same room on two consecutive polls" debounce
+  now needs two snapshots — two polls on one map can no longer confirm a room.
+
+### Added
+
+- **`anyvac.dock_resolve_error`** — confirms the dock's latched error, like
+  "Resolved" in the Roborock app (a `water_empty` stays latched until then,
+  even after the tank is refilled, so the card's attention dot kept showing).
+  Uses python-roborock 7.12's `StatusTrait.resolve_error` with the dock code,
+  or the raw `resolve_error` command on older libraries; does nothing when the
+  dock reports no error.
+- `dock_status.dock_error` — the enum name of a set dock error
+  (e.g. `water_empty`), `null` otherwise.
+
 ## [1.45.0] - 2026-09-30
 
 Pairs with card **1.45.0** (docs/45 — room completion). Version jumps from

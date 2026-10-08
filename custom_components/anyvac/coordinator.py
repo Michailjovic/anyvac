@@ -28,7 +28,7 @@ from typing import Any
 import numpy as np
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
@@ -79,6 +79,28 @@ def _mode_is_off(name: Any) -> bool:
         return False
     n = str(name).strip().lower()
     return n.startswith("off") or n in ("none", "closed")
+
+
+# Raw Roborock states in which the robot is driving AND cleaning (docs/47 §1.5).
+# A poll that sees no new map snapshot in one of these states defers its time to
+# the points the next snapshot brings; in any other state (paused, idle, transit,
+# unknown) the time is dropped exactly as before docs/47. A positive list on
+# purpose: an unknown/new firmware state falls back to the old behaviour.
+ACTIVE_CLEAN_STATES = {
+    "cleaning",
+    "spot_cleaning",
+    "zoned_cleaning",
+    "segment_cleaning",
+    "robot_status_mopping",
+    "clean_mop_cleaning",
+    "clean_mop_mopping",
+    "segment_mopping",
+    "segment_clean_mop_cleaning",
+    "segment_clean_mop_mopping",
+    "zoned_mopping",
+    "zoned_clean_mop_cleaning",
+    "zoned_clean_mop_mopping",
+}
 
 
 TRANSIT_STATES = {
@@ -834,6 +856,25 @@ def _resolve_map_content(coord: Any) -> Any | None:
     return map_content
 
 
+def _dock_error_name(err: Any) -> str | None:
+    """Name of a set dock error (`RoborockDockErrorCode`), None for none/ok."""
+    try:
+        if err is None or int(err) == 0:
+            return None
+    except (TypeError, ValueError):
+        return None
+    name = getattr(err, "name", None)
+    return str(name) if name else f"code_{int(err)}"
+
+
+def _raw_map_bytes(coord: Any) -> bytes | None:
+    """Raw map bytes of one Roborock v1 coordinator's current map, or None
+    (docs/47 — the change test behind the map-snapshot driven refresh)."""
+    map_content = _resolve_map_content(coord)
+    raw = getattr(map_content, "raw_api_response", None) if map_content else None
+    return raw if isinstance(raw, (bytes, bytearray)) else None
+
+
 def _compute_home_frame_result(
     frames_snapshot: dict[str, dict[str, Any]],
     robot_frame_snapshot: dict[str, str],
@@ -1198,6 +1239,15 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # gauge's time-ratio) + last poll timestamp to measure the per-poll delta.
         self._room_elapsed: dict[str, dict[str, float]] = {}
         self._last_poll: dict[str, datetime] = {}
+        # Map-snapshot driven refresh (docs/47). `_rb_listeners`: one listener per
+        # Roborock v1 coordinator object we are subscribed to, keyed by id() — the
+        # coordinator itself is kept in the tuple so the id cannot be reused while
+        # we hold it. `_rb_seen_raw`: the raw map bytes we last PROCESSED per duid
+        # (the listener's change test and the poll's freshness test both compare
+        # against it). `_map_fresh`: per duid, did THIS poll see a new snapshot.
+        self._rb_listeners: dict[int, tuple[Any, CALLBACK_TYPE]] = {}
+        self._rb_seen_raw: dict[str, bytes] = {}
+        self._map_fresh: dict[str, bool] = {}
         # Plan-scope transit labeling (docs/17 §1.3): room-name scope of the currently
         # running orchestrated job (anyvac.clean), PER VACUUM — set by services.py's
         # _JobRunner when a job starts, cleared when it finishes/cancels. Not persisted
@@ -1544,6 +1594,16 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     "map_sequence": add_params.get("map_sequence") if isinstance(add_params, dict) else None,
                 }
                 return bytes(raw), meta
+        return None
+
+    def roborock_status_for(self, duid: str) -> Any | None:
+        """The Roborock `StatusTrait` of one duid (docs/47 §3, for
+        ``anyvac.dock_resolve_error``) — same piggyback walk as `raw_map_for`."""
+        for rb_entry in self.hass.config_entries.async_entries(ROBOROCK_DOMAIN):
+            runtime = getattr(rb_entry, "runtime_data", None)
+            for coord in getattr(runtime, "v1", None) or []:
+                if getattr(coord, "duid", None) == duid:
+                    return getattr(getattr(coord, "properties_api", None), "status", None)
         return None
 
     @property
@@ -2096,7 +2156,13 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         duid = device.duid
         now = dt_util.utcnow()
         last = self._last_poll.get(duid)
-        self._last_poll[duid] = now
+        # docs/47 §1.3/§1.5: time is measured between map SNAPSHOTS. A poll that
+        # saw no new snapshot while the robot is actively cleaning leaves the
+        # clock where it is — its time belongs to the points the next snapshot
+        # brings. In any other state it advances as before (pauses drop out).
+        fresh = self._is_map_fresh(duid)
+        if fresh or device.data.get("status_state") not in ACTIVE_CLEAN_STATES:
+            self._last_poll[duid] = now
 
         seen = self._path_seen.setdefault(duid, {"dry": 0, "wet": 0})
         layers = (("dry", "_path_dry"), ("wet", "_path_wet"))
@@ -2238,7 +2304,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 run.break_path(layer)
             return
 
-        if last is None:
+        if last is None or not fresh:
             return
         delta = (now - last).total_seconds()
         if delta <= 0 or delta > 600:  # ignore restarts / large gaps
@@ -2291,7 +2357,10 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             return
 
         if raw == self._raw_room.get(duid):
-            self._raw_count[duid] = self._raw_count.get(duid, 0) + 1
+            # docs/47 §1.3: "two consecutive polls" means two map SNAPSHOTS — a
+            # second poll on the same snapshot must not confirm the room.
+            if self._is_map_fresh(duid):
+                self._raw_count[duid] = self._raw_count.get(duid, 0) + 1
         else:
             self._raw_room[duid] = raw
             self._raw_count[duid] = 1
@@ -3137,9 +3206,11 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
     async def _async_update_data(self) -> dict[str, AnyVacDevice]:
         """Read every Roborock v1 coordinator and normalise its map data."""
         result: dict[str, AnyVacDevice] = {}
+        all_coords: list[Any] = []
         for rb_entry in self.hass.config_entries.async_entries(ROBOROCK_DOMAIN):
             runtime = getattr(rb_entry, "runtime_data", None)
             coords = getattr(runtime, "v1", None) or []
+            all_coords.extend(coords)
             for coord in coords:
                 try:
                     device = self._extract_device(coord)
@@ -3147,6 +3218,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     _LOGGER.debug("AnyVac: failed reading a Roborock coordinator: %s", err)
                     continue
                 if device is not None:
+                    self._note_snapshot(device.duid, _raw_map_bytes(coord))
                     # docs/40 §4.2/§4.3: cheap cache-key check inline, heavy
                     # FFT registration itself always in the executor — never
                     # blocks this polling coroutine.
@@ -3316,7 +3388,87 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         for device in result.values():
             device.data["pipeline_ok"] = not missing
             device.data["pipeline_error"] = err_txt
+        self._sync_roborock_listeners(all_coords)
         return result
+
+    # ------------------------------------------------------------------
+    # Map-snapshot driven refresh (docs/47)
+    # ------------------------------------------------------------------
+
+    def _is_map_fresh(self, duid: str) -> bool:
+        """Did this poll see a new map snapshot for `duid` (docs/47 §1.3)?
+
+        True when unknown — no raw bytes available (older library) or a caller
+        that never went through `_note_snapshot` (unit tests driving the
+        pipeline methods directly): that is exactly the pre-docs/47 behaviour.
+        """
+        return getattr(self, "_map_fresh", {}).get(duid, True)
+
+    def _note_snapshot(self, duid: str, raw: bytes | None) -> None:
+        """Record the raw map this poll is about to process and whether it is
+        a new snapshot. Equality, not identity: python-roborock < 7.12 builds a
+        new bytes object on every refresh even when nothing changed."""
+        if raw is None:
+            self._map_fresh[duid] = True
+            return
+        prev = self._rb_seen_raw.get(duid)
+        self._map_fresh[duid] = not (prev is raw or prev == raw)
+        self._rb_seen_raw[duid] = raw
+
+    def _sync_roborock_listeners(self, coords: list[Any]) -> None:
+        """Keep exactly one listener on each live Roborock v1 coordinator.
+
+        A Roborock reload replaces its coordinator objects — new ones get a
+        listener on our next poll, vanished ones are unsubscribed here.
+        """
+        live: set[int] = set()
+        for coord in coords:
+            key = id(coord)
+            live.add(key)
+            if key in self._rb_listeners:
+                continue
+            add = getattr(coord, "async_add_listener", None)
+            if not callable(add):
+                continue
+            try:
+                unsub = add(lambda c=coord: self._on_roborock_update(c))
+            except Exception as err:  # noqa: BLE001 - never break the poll over this
+                _LOGGER.debug("AnyVac: could not subscribe to a Roborock coordinator: %s", err)
+                continue
+            self._rb_listeners[key] = (coord, unsub)
+        for key in [k for k in self._rb_listeners if k not in live]:
+            _coord, unsub = self._rb_listeners.pop(key)
+            unsub()
+
+    @callback
+    def _on_roborock_update(self, coord: Any) -> None:
+        """A Roborock coordinator published new data (docs/47 §1.1).
+
+        Refresh only when its map actually changed — a status push alone is
+        ignored on purpose: it arrives before the new map, and a falling edge
+        processed against the old map loses the last room's final points
+        (docs/45 §1.2). Roborock fetches the map on every state change, so the
+        state change reaches us together with that map.
+        """
+        duid = getattr(coord, "duid", None)
+        raw = _raw_map_bytes(coord)
+        if duid is None or raw is None:
+            return
+        prev = self._rb_seen_raw.get(duid)
+        if prev is raw or prev == raw:
+            return
+        self.hass.async_create_task(self.async_request_refresh())
+
+    def unsubscribe_roborock(self) -> None:
+        """Drop every Roborock listener (entry unload)."""
+        for _coord, unsub in self._rb_listeners.values():
+            unsub()
+        self._rb_listeners.clear()
+
+    async def async_shutdown(self) -> None:
+        """Unsubscribe from Roborock before the base shutdown."""
+        self.unsubscribe_roborock()
+        await super().async_shutdown()
 
     def _extract_device(self, coord: Any) -> AnyVacDevice | None:
         """Extract normalised map data for one Roborock v1 coordinator."""
@@ -3413,6 +3565,9 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             "wash_phase": _s("wash_phase"),
             "wash_ready": _s("wash_ready"),
             "dock_error_status": _s("dock_error_status"),
+            # Enum NAME of a set dock error (e.g. "water_empty", docs/47 §3) so the
+            # card can say what is wrong; None when there is none.
+            "dock_error": _dock_error_name(_s("dock_error_status")),
             "dock_type": _s("dock_type"),
             # Is the dryer running right now? Same field HA 2026.9's own
             # `switch.<vacuum>_mop_drying` reads for its `is_on`.

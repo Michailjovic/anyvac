@@ -45,6 +45,7 @@ import math
 import os
 import re
 import time
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import numpy as np
@@ -76,6 +77,7 @@ SERVICE_DOCK_WASH = "dock_wash"
 SERVICE_DOCK_DRY = "dock_dry"
 SERVICE_DOCK_PUMP = "dock_pump"
 SERVICE_DOCK_SELF_CLEAN = "dock_self_clean"
+SERVICE_DOCK_RESOLVE_ERROR = "dock_resolve_error"
 SERVICE_SNAPSHOT_FLOORPLAN = "snapshot_map_as_floorplan"
 SERVICE_EXPORT_MAP_GUIDE = "export_map_guide"
 SERVICE_DUMP_RAW_MAP = "dump_raw_map"
@@ -100,6 +102,7 @@ ALL_SERVICES = (
     SERVICE_DOCK_DRY,
     SERVICE_DOCK_PUMP,
     SERVICE_DOCK_SELF_CLEAN,
+    SERVICE_DOCK_RESOLVE_ERROR,
     SERVICE_SNAPSHOT_FLOORPLAN,
     SERVICE_EXPORT_MAP_GUIDE,
     SERVICE_DUMP_RAW_MAP,
@@ -1136,6 +1139,32 @@ def _render_guide_layer(
     return buf.getvalue()
 
 
+async def _resolve_dock_error(
+    status: Any | None, send_raw: Callable[[int], Awaitable[None]]
+) -> bool:
+    """Confirm a latched dock error, like "Resolved" in the Roborock app
+    (docs/47 §3). Returns True when there was one to resolve.
+
+    python-roborock 7.12 has `StatusTrait.resolve_error(code)`; it is called
+    with the dock code explicitly (without one it would fall through to the
+    robot error). Older libraries: the raw `resolve_error` command, which the
+    command enum already carried in 7.4.2.
+    """
+    err = getattr(status, "dock_error_status", None) if status is not None else None
+    try:
+        code = int(err) if err is not None else 0
+    except (TypeError, ValueError):
+        code = 0
+    if not code:
+        return False
+    resolve = getattr(status, "resolve_error", None)
+    if callable(resolve):
+        await resolve(code)
+    else:
+        await send_raw(code)
+    return True
+
+
 def _coordinators(hass: HomeAssistant) -> list[Any]:
     """All AnyVac coordinators (in practice one config entry)."""
     out = []
@@ -1824,6 +1853,29 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
         # no documented way to report which dock accessories are installed).
         await _dock_command(call, "app_amethyst_self_check")
 
+    async def _handle_dock_resolve_error(call: ServiceCall) -> None:
+        duid = _resolve_target_duid(hass, call)
+        coords = _coordinators(hass)
+        status = next(
+            (s for s in (c.roborock_status_for(duid) for c in coords) if s is not None),
+            None,
+        )
+
+        async def _send_raw(code: int) -> None:
+            await _dock_command(call, "resolve_error", {"error_code": code})
+
+        try:
+            resolved = await _resolve_dock_error(status, _send_raw)
+        except HomeAssistantError:
+            raise
+        except Exception as err:  # noqa: BLE001 - surface any library error to the caller
+            raise HomeAssistantError(f"anyvac.dock_resolve_error: {err}") from err
+        if resolved:
+            # The status trait refreshes itself; the map does not change, so no
+            # docs/47 map-change refresh follows — publish the cleared flag now.
+            for c in coords:
+                await c.async_request_refresh()
+
     async def _handle_snapshot_floorplan(call: ServiceCall) -> dict[str, Any]:
         if call.data.get("frame") == "home":
             frame_id, frame = _select_home_frame(
@@ -2332,6 +2384,7 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
         (SERVICE_DOCK_DRY, _handle_dock_dry, DOCK_TOGGLE_SCHEMA, SupportsResponse.NONE),
         (SERVICE_DOCK_PUMP, _handle_dock_pump, DOCK_ACTION_SCHEMA, SupportsResponse.NONE),
         (SERVICE_DOCK_SELF_CLEAN, _handle_dock_self_clean, DOCK_ACTION_SCHEMA, SupportsResponse.NONE),
+        (SERVICE_DOCK_RESOLVE_ERROR, _handle_dock_resolve_error, DOCK_ACTION_SCHEMA, SupportsResponse.NONE),
         (SERVICE_SNAPSHOT_FLOORPLAN, _handle_snapshot_floorplan, SNAPSHOT_FLOORPLAN_SCHEMA, SupportsResponse.ONLY),
         (SERVICE_EXPORT_MAP_GUIDE, _handle_export_map_guide, EXPORT_MAP_GUIDE_SCHEMA, SupportsResponse.ONLY),
         (SERVICE_DUMP_RAW_MAP, _handle_dump_raw_map, DUMP_RAW_MAP_SCHEMA, SupportsResponse.ONLY),
