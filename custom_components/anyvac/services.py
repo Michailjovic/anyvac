@@ -1213,6 +1213,7 @@ def _probe_sample(map_trait: Any) -> dict[str, Any]:
         "path_points": _count(getattr(md, "path", None)) if md is not None else 0,
         "mop_points": _count(getattr(md, "mop_path", None)) if md is not None else 0,
         "map_sequence": add.get("map_sequence") if isinstance(add, dict) else None,
+        "via": getattr(map_trait, "via", None),
     }
 
 
@@ -1282,6 +1283,8 @@ async def _probe_map_rate(
                 if isinstance(resp, (bytes, bytearray)):
                     info["bytes"] = len(resp)
                     info["head"] = bytes(resp[:32]).hex()
+                elif isinstance(resp, (dict, list)) and len(repr(resp)) <= 8000:
+                    info["value"] = resp  # whole JSON answer (docs/47 §4 second run)
                 else:
                     info["value"] = repr(resp)[:400]
             except Exception as err:  # noqa: BLE001
@@ -2062,7 +2065,7 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
                     return {
                         "map_bytes": len(r["map"]) if r["map"] is not None else None,
                         "map_via": r["map_via"],
-                        "ack": repr(r["ack"])[:150],
+                        "ack": r["ack"] if isinstance(r["ack"], (dict, list)) else repr(r["ack"])[:150],
                         "ack_error": r["ack_error"],
                         "protocols": r["protocols"],
                     }

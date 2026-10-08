@@ -143,6 +143,7 @@ class LocalMapSource:
         self.raw_api_response: bytes | None = None
         self.map_data: Any = None
         self.last: dict[str, Any] | None = None
+        self.via: str | None = None  # "local" | "cloud": where the last map frame came from
 
     async def refresh(self) -> None:
         res = await local_request(self._v1ch, "get_map_v1")
@@ -152,8 +153,10 @@ class LocalMapSource:
                 "no map frame (local ack=%r, error=%r, protocols local=%s cloud=%s)"
                 % (res["ack"], res["ack_error"], res["protocols"]["local"], res["protocols"]["cloud"])
             )
-        if res["map_via"] != "local":
-            raise RuntimeError("map frame arrived via the CLOUD, not locally")
+        # The firmware answers a LOCAL map request by uploading the map to the
+        # cloud (measured 2026-10-08, 11/11 fetches). The map is still parsed
+        # and measured; each sample says which way it came (`via`).
+        self.via = res["map_via"]
         parse = getattr(self._converter, "async_parse_map_content", None)
         if parse is not None:
             content = await parse(res["map"])

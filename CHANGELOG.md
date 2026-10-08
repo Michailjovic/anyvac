@@ -28,6 +28,9 @@ Card unchanged (1.50.0). docs/47 §4.
   robot answered locally, uploaded the map to the cloud instead, or not at
   all. `transport: cloud` keeps the official integration's channel. 3 s floor
   and 5 minute cap either way.
+  A map that comes back via the cloud is still parsed and measured; every
+  sample carries `via`. A JSON answer of `get_dynamic_map_diff` is returned
+  whole.
 
 ## [1.50.0] - 2026-10-08
 

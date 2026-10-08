@@ -93,3 +93,21 @@ async def test_dynamic_diff_shape_is_reported() -> None:
     )
     d = r["samples"][0]["dynamic_diff"]
     assert d["type"] == "bytes" and d["bytes"] == 40 and d["head"] == ("0102" * 16)
+
+
+@pytest.mark.asyncio
+async def test_dynamic_diff_json_answer_is_returned_whole_and_via_is_reported() -> None:
+    clock = _Clock()
+    trait = _Trait(clock)
+    trait.via = "cloud"
+    answer = {"diff": {"1": {"count": 738}, "43": {"max_len": 0, "x": list(range(50))}}}
+
+    async def diff() -> Any:
+        return answer
+
+    r = await _probe_map_rate(
+        trait, duration_s=5, interval_s=5, dynamic_diff=diff, clock=clock, sleep=clock.sleep
+    )
+    s = r["samples"][0]
+    assert s["dynamic_diff"]["value"] == answer
+    assert s["via"] == "cloud"

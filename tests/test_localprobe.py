@@ -90,9 +90,14 @@ async def test_map_answered_via_cloud_is_flagged() -> None:
     v = _V1(script)
     r = await localprobe.local_request(v, "get_map_v1", timeout_s=1)
     assert r["map_via"] == "cloud"
-    src = localprobe.LocalMapSource(v, converter=None, executor=None)
-    with pytest.raises(RuntimeError, match="CLOUD"):
-        await src.refresh()
+
+    class _Conv:
+        async def async_parse_map_content(self, data: bytes) -> Any:
+            return SimpleNamespace(raw_api_response=data, map_data="parsed")
+
+    src = localprobe.LocalMapSource(v, _Conv(), executor=None)
+    await src.refresh()  # measured anyway, flagged
+    assert src.via == "cloud" and src.map_data == "parsed"
 
 
 @pytest.mark.asyncio
@@ -131,6 +136,7 @@ async def test_parsed_map_exposed_like_the_library_trait() -> None:
     src = localprobe.LocalMapSource(_V1(script), _Conv(), executor=None)
     await src.refresh()
     assert src.raw_api_response == b"MAPBYTES" and src.map_data == "parsed"
+    assert src.via == "local"
 
 
 @pytest.mark.asyncio
