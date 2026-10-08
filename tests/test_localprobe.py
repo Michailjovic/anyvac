@@ -125,6 +125,26 @@ async def test_a_real_rpc_result_ends_the_wait_early() -> None:
 
 
 @pytest.mark.asyncio
+async def test_params_are_sent_with_the_request() -> None:
+    """docs/48 §4.2: the probe's `diff_params` experiment."""
+    seen: list[Any] = []
+
+    def script(v: _V1, rid: int) -> None:
+        v._local_channel.emit(_msg(RPC, rid, {"nonce": 0, "result": 2}))
+
+    v = _V1(script)
+    orig = v._local_channel.publish
+
+    async def publish(msg: Any) -> None:
+        seen.append(json.loads(json.loads(msg.payload)["dps"]["101"])["params"])
+        await orig(msg)
+
+    v._local_channel.publish = publish
+    r = await localprobe.local_request(v, "get_dynamic_map_diff", timeout_s=5, params=[0])
+    assert seen == [[0]] and r["ack"] == {"nonce": 0, "result": 2}
+
+
+@pytest.mark.asyncio
 async def test_parsed_map_exposed_like_the_library_trait() -> None:
     def script(v: _V1, rid: int) -> None:
         v._local_channel.emit(_msg(MAP, rid, b"MAPBYTES"))

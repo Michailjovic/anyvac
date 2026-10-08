@@ -43,6 +43,7 @@ async def local_request(
     timeout_s: float = LOCAL_TIMEOUT_S,
     clock: Any = time.monotonic,
     watch_cloud: bool = True,
+    params: Any = None,
 ) -> dict[str, Any]:
     """Send `method` over the LOCAL connection and report how it was answered.
 
@@ -68,7 +69,7 @@ async def local_request(
     # cloud topic every few seconds would itself be cloud traffic.
     mqtt = getattr(v1ch, "_mqtt_channel", None) if watch_cloud else None
 
-    request = RequestMessage(method, params=None)
+    request = RequestMessage(method, params=params)
     message = request.encode_message(
         RoborockMessageProtocol.GENERAL_REQUEST,
         security_data=security,

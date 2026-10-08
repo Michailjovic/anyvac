@@ -425,6 +425,9 @@ PROBE_MAP_RATE_SCHEMA = vol.Schema(
         vol.Optional("dynamic_diff", default=False): bool,
         vol.Optional("transport", default="local"): vol.In(["local", "cloud"]),
         vol.Optional("map_every", default=1): vol.All(vol.Coerce(int), vol.Range(min=0, max=20)),
+        # docs/48 §4.2 experiment: params sent with get_dynamic_map_diff
+        # (local transport only), e.g. [0] or {"nonce": 0}.
+        vol.Optional("diff_params"): vol.Any(list, dict, int, str),
     }
 )
 
@@ -2072,16 +2075,22 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
             )
             if call.data["dynamic_diff"]:
 
+                diff_params = call.data.get("diff_params")
+
                 async def diff() -> Any:
-                    r = await localprobe.local_request(v1ch, "get_dynamic_map_diff")
+                    r = await localprobe.local_request(
+                        v1ch, "get_dynamic_map_diff", params=diff_params
+                    )
                     ack = r["ack"]
                     parsed = livediff.parse_diff(ack)
-                    if parsed is None:
+                    d = ack.get("diff") if isinstance(ack, dict) else None
+                    if parsed is None or not isinstance(d, dict):
+                        # no diff at all (S6 rejects the method, S7 MaxV
+                        # answers `{"nonce": 0, "result": 2}`): show it raw
                         return {
                             "answer": repr(ack)[:150], "ack_error": r["ack_error"],
                             "protocols": r["protocols"],
                         }
-                    d = ack["diff"]
                     return {  # compact (docs/48 follow-up): what the live poller sees
                         "start": parsed["start"],
                         "points": len(parsed["points"]),

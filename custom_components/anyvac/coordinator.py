@@ -44,6 +44,7 @@ from .const import (
     LIVE_DIFF_BACKOFF_S,
     LIVE_DIFF_INTERVAL_S,
     LIVE_DIFF_MAX_FAILS,
+    LIVE_DIFF_NODIFF_LIMIT,
     LIVE_DIFF_TIMEOUT_S,
     OPT_EXPOSE_LEGACY_MM,
     OPT_LIVE_DIFF,
@@ -1271,6 +1272,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # recognized" — S6, field-caught 2026-10-08). Never polled again until
         # HA restarts: retrying every 60 s would only produce the same error.
         self._live_unsupported: set[str] = set()
+        self._live_nodiff: dict[str, int] = {}  # consecutive diff-less answers
         self._rb_seen_raw: dict[str, bytes] = {}
         self._map_fresh: dict[str, bool] = {}
         # Plan-scope transit labeling (docs/17 §1.3): room-name scope of the currently
@@ -3258,7 +3260,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                         st = getattr(self, "_live_stats", {}).get(device.duid)
                         if st is not None:
                             st["snapshot_at"] = dt_util.utcnow().isoformat(timespec="seconds")
-                            st["since_snapshot"] = {"with_points": 0, "empty": 0, "no_answer": 0, "failed": 0}
+                            st["since_snapshot"] = {"with_points": 0, "empty": 0, "no_diff": 0, "no_answer": 0, "failed": 0}
                     # docs/40 §4.2/§4.3: cheap cache-key check inline, heavy
                     # FFT registration itself always in the executor — never
                     # blocks this polling coroutine.
@@ -3523,8 +3525,8 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         stats = getattr(self, "_live_stats", None)
         if stats is None:
             return
-        st = stats.setdefault(duid, {"with_points": 0, "empty": 0, "no_answer": 0, "failed": 0,
-                                     "since_snapshot": {"with_points": 0, "empty": 0, "no_answer": 0, "failed": 0}})
+        zero = {"with_points": 0, "empty": 0, "no_diff": 0, "no_answer": 0, "failed": 0}
+        st = stats.setdefault(duid, {**zero, "since_snapshot": dict(zero)})
         st[what] = st.get(what, 0) + 1
         st["since_snapshot"][what] = st["since_snapshot"].get(what, 0) + 1
         st["last"] = {"what": what, "at": dt_util.utcnow().isoformat(timespec="seconds"), **extra}
@@ -3560,6 +3562,22 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             self._live_backoff[duid] = time.monotonic() + LIVE_DIFF_BACKOFF_S
             _LOGGER.debug("AnyVac: live diff for %s paused for %ss", duid, LIVE_DIFF_BACKOFF_S)
 
+    def _mark_live_unsupported(self, duid: str, reason: str) -> None:
+        """Stop the live poller for one robot until HA restarts (docs/48 §4.2).
+
+        `reason`: "method" = the firmware rejects get_dynamic_map_diff (S6),
+        "no_diff" = it answers but never with a diff (S7 MaxV)."""
+        self._live_unsupported.add(duid)
+        st = getattr(self, "_live_stats", {}).get(duid)
+        if st is not None:
+            st["unsupported"] = reason
+        _LOGGER.info(
+            "AnyVac: %s gives no get_dynamic_map_diff data (%s) — live position "
+            "off for it, the map updates with the official integration (~30 s)",
+            duid, reason,
+        )
+        self.async_update_listeners()
+
     async def _live_fetch(self, duid: str) -> None:
         try:
             rb = self.roborock_coordinator_for(duid)
@@ -3577,21 +3595,26 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 err = res.get("ack_error") or ""
                 self._live_count(duid, "no_answer", ack=repr(res.get("ack"))[:80], ack_error=err)
                 if "not recognized" in err.lower() or "unknown method" in err.lower():
-                    self._live_unsupported.add(duid)
-                    st = self._live_stats.get(duid)
-                    if st is not None:
-                        st["unsupported"] = True
-                    _LOGGER.info(
-                        "AnyVac: %s does not support get_dynamic_map_diff — live position "
-                        "off for it, the map updates with the official integration (~30 s)",
-                        duid,
-                    )
-                    self.async_update_listeners()
+                    self._mark_live_unsupported(duid, "method")
                     return
                 self._live_failed(duid)
                 return
             self._live_fails[duid] = 0
-            diff = res["ack"]["diff"]
+            diff = (res.get("ack") or {}).get("diff")
+            if not isinstance(diff, dict):
+                # `{"nonce": 0, "result": 2}` — a valid answer that never
+                # carries a diff. S7 MaxV answers only this, even while
+                # cleaning (field 2026-10-08): its firmware keeps no diff.
+                # After LIVE_DIFF_NODIFF_LIMIT such answers in a row the
+                # poller stops for that robot (same as an unsupported method).
+                n = self._live_nodiff.get(duid, 0) + 1  # reset by any real diff
+                self._live_nodiff[duid] = n
+                self._live_count(duid, "no_diff", ack=repr(res.get("ack"))[:80],
+                                 ms=res.get("latency_ms"))
+                if n >= LIVE_DIFF_NODIFF_LIMIT:
+                    self._mark_live_unsupported(duid, "no_diff")
+                return
+            self._live_nodiff[duid] = 0
             self._live_count(
                 duid, "with_points" if parsed["points"] else "empty",
                 start=parsed["start"], points=len(parsed["points"]),

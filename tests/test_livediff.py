@@ -104,6 +104,7 @@ def _coord(path_points: int = 870, dry_open: bool = True, wet_open: bool = True)
     c._robot_frame, c._home_frames = {}, {}
     c._live, c._live_pub = {}, {}
     c._live_inflight, c._live_fails, c._live_backoff = set(), {}, {}
+    c._live_nodiff = {}
     c.updates = 0
 
     def _upd() -> None:
@@ -207,7 +208,7 @@ async def test_firmware_without_the_diff_is_never_polled_again(monkeypatch: pyte
 
     monkeypatch.setattr(localprobe, "local_request", rejected)
     await c._live_fetch("d1")
-    assert "d1" in c._live_unsupported and c.live_stats_for("d1")["unsupported"] is True
+    assert "d1" in c._live_unsupported and c.live_stats_for("d1")["unsupported"] == "method"
     assert "d1" not in c._live_backoff  # not a transient failure
 
     class _Hass:
@@ -245,3 +246,36 @@ async def test_live_stats_count_what_the_diff_answers(monkeypatch: pytest.Monkey
     snap = c.live_stats_for("d1")
     snap["since_snapshot"]["empty"] = 99
     assert c.live_stats_for("d1")["since_snapshot"]["empty"] == 1
+
+
+@pytest.mark.asyncio
+async def test_answer_without_diff_while_cleaning_turns_live_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """S7 MaxV answers `{"nonce": 0, "result": 2}` even while cleaning
+    (field 2026-10-08) — 1.51.3 crashed on it with KeyError 'diff'."""
+    from custom_components.anyvac.const import LIVE_DIFF_NODIFF_LIMIT
+
+    c = _coord()
+    c._live_stats, c._live_unsupported = {}, set()
+    v1 = type("V1", (), {"is_local_connected": True})()
+    c.roborock_coordinator_for = lambda duid: object()  # type: ignore[method-assign]
+    monkeypatch.setattr(localprobe, "v1_channel_of", lambda rb: v1)
+    answers = [{"nonce": 0, "result": 2}] * 3 + [_answer(870, T5)]
+    answers += [{"nonce": 0, "result": 2}] * LIVE_DIFF_NODIFF_LIMIT
+    it = iter(answers)
+
+    async def answer(v1ch: Any, method: str, **kw: Any) -> dict[str, Any]:
+        return {"ack": next(it), "latency_ms": 7}
+
+    monkeypatch.setattr(localprobe, "local_request", answer)
+    for _ in range(4):
+        await c._live_fetch("d1")
+    st = c.live_stats_for("d1")
+    assert (st["no_diff"], st["with_points"], st["failed"]) == (3, 1, 0)
+    assert c._live_nodiff["d1"] == 0 and "d1" not in c._live_unsupported  # a real diff resets
+    for _ in range(LIVE_DIFF_NODIFF_LIMIT - 1):
+        await c._live_fetch("d1")
+    assert "d1" not in c._live_unsupported
+    await c._live_fetch("d1")
+    assert "d1" in c._live_unsupported
+    assert c.live_stats_for("d1")["unsupported"] == "no_diff"
+    assert not c._live_backoff.get("d1")  # not a transient failure

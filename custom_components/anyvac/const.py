@@ -38,3 +38,6 @@ LIVE_DIFF_INTERVAL_S = 3
 LIVE_DIFF_TIMEOUT_S = 4.0
 LIVE_DIFF_MAX_FAILS = 3
 LIVE_DIFF_BACKOFF_S = 60.0
+# docs/48 §4.2: diff-less answers in a row (while cleaning) before the live
+# poller gives up on a robot — 20 × 3 s = one minute of cleaning.
+LIVE_DIFF_NODIFF_LIMIT = 20

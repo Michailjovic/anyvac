@@ -887,6 +887,13 @@ probe_map_rate:
       default: false
       selector:
         boolean:
+    diff_params:
+      name: Params for get_dynamic_map_diff
+      description: >-
+        Experimental (local transport only): params sent with
+        get_dynamic_map_diff, e.g. [0] or {"nonce": 0}. Empty = none.
+      selector:
+        object:
 
 snap_wall_corner:
   name: Snap point to nearest wall corner

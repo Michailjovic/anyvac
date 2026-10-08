@@ -6,6 +6,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.51.4] - 2026-10-08
+
+Card unchanged (1.51.0). docs/48 §4.2 — S7 MaxV while cleaning.
+
+### Fixed
+
+- **1.51.3 regression:** the live poller and the probe crashed with
+  `KeyError: 'diff'` on the S7 MaxV answer `{"nonce": 0, "result": 2}`.
+- **S7 MaxV:** it answers only this, without a `diff`, **also while
+  cleaning** — its firmware keeps no diff. Such answers are now counted as
+  `live_stats.no_diff`; after 20 in a row (≈ one minute of cleaning) the
+  poller stops for that robot until HA restarts
+  (`live_stats.unsupported: "no_diff"`). Any real diff resets the count.
+  `live_stats.unsupported` is now a reason string (`"method"` for S6) instead
+  of `true`.
+
+### Added
+
+- `probe_map_rate`: optional `diff_params` (local transport) — params sent
+  with `get_dynamic_map_diff`, to test whether the S7 firmware needs some.
+  Diff-less answers are shown raw.
+
 ## [1.51.3] - 2026-10-08
 
 Card unchanged (1.51.0). docs/48 §4.2 — S6 and S7 MaxV.
