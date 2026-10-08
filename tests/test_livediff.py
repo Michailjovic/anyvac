@@ -211,3 +211,7 @@ async def test_live_stats_count_what_the_diff_answers(monkeypatch: pytest.Monkey
     assert (st["with_points"], st["empty"], st["no_answer"]) == (1, 1, 1)
     assert st["last"]["what"] == "no_answer"
     assert c.updates == 2  # every parsed answer republishes (stats changed)
+    # Published as a copy: HA must see a different value next time.
+    snap = c.live_stats_for("d1")
+    snap["since_snapshot"]["empty"] = 99
+    assert c.live_stats_for("d1")["since_snapshot"]["empty"] == 1

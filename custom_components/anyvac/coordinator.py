@@ -3504,8 +3504,16 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         return self._live_pub.get(duid)
 
     def live_stats_for(self, duid: str) -> dict[str, Any] | None:
-        """The `live_stats` attribute (docs/48 follow-up diagnostics)."""
-        return getattr(self, "_live_stats", {}).get(duid)
+        """The `live_stats` attribute (docs/48 follow-up diagnostics).
+
+        A COPY: the counters are mutated in place, and HA keeps the previous
+        state's attributes by reference — handing out the live dict made the
+        new state compare equal to the old one, so the frontend never saw the
+        counters move (field-caught 2026-10-08, 1.51.1)."""
+        st = getattr(self, "_live_stats", {}).get(duid)
+        if st is None:
+            return None
+        return {k: (dict(v) if isinstance(v, dict) else v) for k, v in st.items()}
 
     def _live_count(self, duid: str, what: str, **extra: Any) -> None:
         stats = getattr(self, "_live_stats", None)

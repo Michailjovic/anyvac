@@ -6,6 +6,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.51.2] - 2026-10-08
+
+Card unchanged (1.51.0).
+
+### Fixed
+
+- `live_stats` never changed in the browser: the counters were handed to HA by
+  reference and mutated in place, so each new state compared equal to the
+  previous one. Published as a copy now.
+
 ## [1.51.1] - 2026-10-08
 
 Card unchanged (1.51.0). docs/48 §4 — diagnostics for the field report "the
