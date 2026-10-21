@@ -6,6 +6,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.51.5] - 2026-10-21
+
+Card unchanged (1.51.5).
+
+### Fixed
+
+- **`outline_home_px` of a split room traced only a small island.** Roborock
+  marks furniture/obstacle cells inside a segment with an obstacle pixel
+  type, so a segment's room cells come back cut into several parts by
+  1-cell lines. Measured on a real S8 MaxV Ultra map, every room is split:
+  the living room into 23 parts, the kitchen into 16, with the largest part
+  holding only 78 % of its cells. The outline tracer walks only the ring its
+  seed (topmost, then leftmost cell) lies on; for the kitchen that was a
+  15 × 5-cell strip along the top wall, so the outline was a 0.75 × 0.25 m
+  rectangle on the top edge of its 3.2 × 4.4 m bbox. The mask is now first
+  closed with a 3 × 3 square (bridges gaps up to 2 cells / 10 cm and fills
+  the obstacle lines) and then reduced to its largest 4-connected part. On
+  that map every room becomes one part whose extent equals its bbox. Pure
+  numpy, ~1 ms per room. Fixes the room shape in the card's merged mode, in
+  `export_map_guide` (`frame: "home"`) and for every other consumer of
+  `outline_home_px`. `bbox_home_px`, `home_room_id` (IoU over the whole
+  mask) and room coverage never used the outline and are unchanged.
+
+### Added
+
+- A warning is logged (once per map) when a room's largest connected part
+  still holds less than 50 % of its cells after closing, i.e. when one
+  outline cannot represent the room.
+
 ## [1.51.4] - 2026-10-08
 
 Card unchanged (1.51.0). docs/48 §4.2 — S7 MaxV while cleaning.

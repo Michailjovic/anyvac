@@ -45,6 +45,7 @@ Coordinate systems, to keep straight while reading this file:
 from __future__ import annotations
 
 import base64
+import logging
 import math
 import struct
 import time
@@ -52,6 +53,8 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+
+_LOGGER = logging.getLogger(__name__)
 
 # 1 raw grid cell = 50 mm (docs/40 §2) — fixed by the Roborock map format.
 CELL_MM = 50
@@ -569,11 +572,134 @@ def home_px_to_mm(
 
 # ── Room outline (docs/40 §4.1 — best-effort, may be deferred) ───────────────
 
+# A traced outline keeping less than this share of the segment's cells is
+# logged (once per distinct mask): the segment is split into comparably large
+# parts, so its single outline genuinely misrepresents the room.
+OUTLINE_MIN_KEPT_FRACTION = 0.5
+# Masks already warned about — `outline_from_mask` runs on every publish, the
+# masks only change at registration events. Bounded so it can never grow.
+_OUTLINE_WARNED: set[tuple[Any, ...]] = set()
+_OUTLINE_WARNED_MAX = 256
+
+
+# 3 x 3 square structuring element for `close_small_gaps` — (dy, dx) offsets
+# in the form `coverage._shift_any` takes.
+_CLOSE_OFFSETS = np.array([(dy, dx) for dy in (-1, 0, 1) for dx in (-1, 0, 1)], dtype=np.int64)
+
+
+def close_small_gaps(mask: np.ndarray) -> np.ndarray:
+    """Morphological closing of `mask` with a 3 x 3 square (bool, same shape).
+
+    Roborock marks furniture/obstacle cells inside a segment with an
+    obstacle pixel type, so the segment's room cells (`(b & 7) == 7`) come
+    back cut by 1-cell lines — measured on a real S8 map: every room split,
+    the kitchen into 16 parts with the largest holding only 78 % of the
+    cells. Closing bridges gaps up to 2 cells (10 cm) and fills the lines
+    themselves, which is what a floor-plan outline wants; on that map it
+    turned every room into one part whose extent equals the room's own bbox
+    exactly. Wider gaps stay separate. Two regions touching only at a
+    diagonal corner are not joined either (the classic closing property),
+    consistent with the 4-connected tracer.
+
+    Works on the mask's bounding box only (closing with a square never
+    leaves it), padded by one cell so the image edge is plain background.
+    Uses `coverage._shift_any` (docs/14 rule 1: one morphology helper),
+    imported lazily so `tools/homeframe_probe.py`, which loads this file by
+    path outside the package, keeps working."""
+    ys, xs = np.nonzero(mask)
+    if ys.size == 0:
+        return mask
+    r0, r1 = int(ys.min()), int(ys.max()) + 1
+    c0, c1 = int(xs.min()), int(xs.max()) + 1
+    from .coverage import _shift_any  # lazy: see docstring
+
+    sub = np.pad(mask[r0:r1, c0:c1].astype(bool), 1)
+    closed = _shift_any(_shift_any(sub, _CLOSE_OFFSETS, False), _CLOSE_OFFSETS, True)
+    out = np.zeros(mask.shape, dtype=bool)
+    out[r0:r1, c0:c1] = closed[1:-1, 1:-1]
+    return out
+
+
+def largest_component(mask: np.ndarray) -> np.ndarray:
+    """The largest 4-connected component of `mask` (bool array, same shape).
+
+    4-connectivity on purpose: it is exactly the connectivity
+    `outline_from_mask`'s tracer follows (two regions touching only at a
+    diagonal corner are traced as separate rings), so the component chosen
+    here is always one ring the tracer can walk completely. Ties go to the
+    component that starts first in row-major order (topmost, then leftmost)
+    — deterministic. A mask with zero or one component is returned unchanged
+    (no copy).
+
+    Pure numpy/Python, no scipy (docs/40 §6), and cheap enough for the
+    per-publish path: horizontal runs are found vectorised, and only the
+    runs (a few per row) go through a union-find, never single cells.
+    """
+    ys, xs = np.nonzero(mask)
+    if ys.size == 0:
+        return mask
+    r0, r1 = int(ys.min()), int(ys.max()) + 1
+    c0, c1 = int(xs.min()), int(xs.max()) + 1
+    crop = mask[r0:r1, c0:c1].astype(np.int8)
+    edges = np.diff(np.pad(crop, ((0, 0), (1, 1))), axis=1)
+    # Both come back in row-major order, so the k-th start pairs with the
+    # k-th end: run k covers columns [start, end) of row `run_row[k]`.
+    run_row, run_start = np.nonzero(edges == 1)
+    _, run_end = np.nonzero(edges == -1)
+    rows, starts, ends = run_row.tolist(), run_start.tolist(), run_end.tolist()
+    n = len(rows)
+
+    parent = list(range(n))
+
+    def find(k: int) -> int:
+        while parent[k] != k:
+            parent[k] = parent[parent[k]]
+            k = parent[k]
+        return k
+
+    # Union every run with the runs of the row above it that it overlaps
+    # (shares at least one column = 4-connected). Two-pointer sweep; the
+    # smaller index stays root, so a root is its component's first run in
+    # row-major order — that is what makes the tie-break deterministic.
+    prev_lo = prev_hi = 0  # run index range of the previous row
+    i = 0
+    while i < n:
+        row = rows[i]
+        j = i
+        while j < n and rows[j] == row:
+            j += 1
+        if i > 0 and rows[i - 1] == row - 1:
+            p = prev_lo
+            for k in range(i, j):
+                while p < prev_hi and ends[p] <= starts[k]:
+                    p += 1
+                q = p
+                while q < prev_hi and starts[q] < ends[k]:
+                    a, b = find(q), find(k)
+                    if a != b:
+                        parent[max(a, b)] = min(a, b)
+                    q += 1
+        prev_lo, prev_hi = i, j
+        i = j
+
+    sizes: dict[int, int] = {}
+    for k in range(n):
+        root = find(k)
+        sizes[root] = sizes.get(root, 0) + ends[k] - starts[k]
+    if len(sizes) == 1:
+        return mask
+    best = min(sizes, key=lambda root: (-sizes[root], root))
+    out = np.zeros_like(mask, dtype=bool)
+    for k in range(n):
+        if find(k) == best:
+            out[r0 + rows[k], c0 + starts[k] : c0 + ends[k]] = True
+    return out
+
 
 def outline_from_mask(
-    mask: np.ndarray, cell_mm: float, max_points: int = 60
+    mask: np.ndarray, cell_mm: float, max_points: int = 60, label: str | None = None
 ) -> list[tuple[float, float]]:
-    """Trace one connected room mask's outer boundary and simplify it with
+    """Trace a room mask's outer boundary and simplify it with
     the SAME Douglas-Peucker implementation `coordinator.py` already uses
     for path decimation (`_rdp_simplify` — imported lazily, inside this
     function, to avoid a circular import: `coordinator.py` imports THIS
@@ -593,10 +719,35 @@ def outline_from_mask(
     oriented so a clockwise walk keeps the foreground on its right, and the
     resulting polygon's area always equals `cell_count * cell_mm ** 2`
     exactly for any rectilinear region.
+
+    A segment mask is NOT one connected region: Roborock's obstacle lines
+    cut it into parts (a real S8 kitchen: 16 parts, the topmost a 15 x 5-cell
+    strip). The tracer walks only the ring its seed lies on, and the seed
+    (topmost-then-leftmost pixel) can fall into a small part, so the mask is
+    first closed (`close_small_gaps`) and then reduced to its
+    `largest_component` — the outline is that component's boundary and the
+    exact-area property above holds for it. If that component keeps less
+    than `OUTLINE_MIN_KEPT_FRACTION` of the closed mask's cells, a warning is
+    logged once per distinct mask (`label` names the room in that message).
     """
-    ys, xs = np.nonzero(mask)
-    if ys.size == 0:
+    if not mask.any():
         return []
+    mask = close_small_gaps(mask)
+    total = int(np.count_nonzero(mask))
+    mask = largest_component(mask)
+    ys, xs = np.nonzero(mask)
+    kept = int(ys.size)
+    if kept < OUTLINE_MIN_KEPT_FRACTION * total:
+        key = (label, mask.shape, total, kept)
+        if key not in _OUTLINE_WARNED:
+            if len(_OUTLINE_WARNED) >= _OUTLINE_WARNED_MAX:
+                _OUTLINE_WARNED.clear()
+            _OUTLINE_WARNED.add(key)
+            _LOGGER.warning(
+                "Room outline %s: the largest connected part holds only %d of %d "
+                "segment cells (%.0f %%) — the outline covers that part only",
+                label or "(unnamed)", kept, total, 100.0 * kept / total,
+            )
     if ys.size == 1:
         x0, y0 = float(xs[0] * cell_mm), float(ys[0] * cell_mm)
         return [(x0, y0), (x0 + cell_mm, y0), (x0 + cell_mm, y0 + cell_mm), (x0, y0 + cell_mm)]

@@ -702,7 +702,9 @@ def _apply_home_frame_contract(
         seg_id = room.get("segment_id")
         mask = seg_masks.get(seg_id) if seg_id is not None else None
         if mask is not None and mask.any():
-            outline_local = homeframe.outline_from_mask(mask, cell_mm)
+            outline_local = homeframe.outline_from_mask(
+                mask, cell_mm, label=f"{device.name} / {room.get('name')} (segment {seg_id})"
+            )
             room["outline_home_px"] = [
                 _frame_mm_to_home_px(frame["origin_mm"][0] + ox, frame["origin_mm"][1] + oy, frame)
                 for ox, oy in outline_local
