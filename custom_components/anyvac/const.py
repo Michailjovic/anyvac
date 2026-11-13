@@ -41,3 +41,23 @@ LIVE_DIFF_BACKOFF_S = 60.0
 # docs/48 §4.2: diff-less answers in a row (while cleaning) before the live
 # poller gives up on a robot — 20 × 3 s = one minute of cleaning.
 LIVE_DIFF_NODIFF_LIMIT = 20
+
+
+# 1.51.8 (plan po auditu, B2): every `.storage` file the integration writes, as
+# the suffix after `anyvac_`. `async_remove_entry` deletes them when the last
+# AnyVac entry is removed; `tests/test_unload_and_remove.py` keeps this list in
+# step with the Stores the coordinator creates.
+STORE_KEYS: tuple[str, ...] = (
+    "room_history",
+    "room_estimates",
+    "selection",
+    "room_pins",
+    "room_sequence",
+    "coverage_baseline",
+    "room_completion",
+    "room_coverage_pct",
+    "paths",
+    "view_layers",
+    "floorplan_seats",
+    "home_frame",
+)

@@ -24,6 +24,8 @@ precisely because these jobs DO carry `job_rooms`.
 
 from __future__ import annotations
 
+import asyncio
+
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -51,17 +53,29 @@ class _FakeBus:
         return _unsub
 
     async def fire(self, event_type: str, data: dict[str, Any]) -> None:
-        for handler in list(self._listeners.get(event_type, [])):
-            await handler(SimpleNamespace(data=data))
+        # Every listener as its own task, like HA's `async_fire` (1.51.7).
+        loop = asyncio.get_running_loop()
+        event = SimpleNamespace(data=data)
+        await asyncio.gather(*(
+            asyncio.Task(handler(event), loop=loop, eager_start=True)
+            for handler in list(self._listeners.get(event_type, []))
+        ))
 
 
 class _FakeServices:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, dict[str, Any]]] = []
+        self.contexts: list[Any] = []
 
     async def async_call(
-        self, domain: str, service: str, data: dict[str, Any], blocking: bool = True
+        self,
+        domain: str,
+        service: str,
+        data: dict[str, Any],
+        blocking: bool = True,
+        context: Any = None,
     ) -> None:
+        self.contexts.append(context)
         self.calls.append((domain, service, dict(data)))
 
     def send_command_calls(self) -> list[dict[str, Any]]:

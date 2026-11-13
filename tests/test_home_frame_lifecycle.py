@@ -191,6 +191,7 @@ class _FakeHass:
 
 def _bare_coordinator() -> AnyVacCoordinator:
     coord = object.__new__(AnyVacCoordinator)
+    coord._pending_saves = {}
     coord.hass = _FakeHass()
     coord._home_frame_disabled = set()
     coord._home_frame_inflight = set()
@@ -270,6 +271,8 @@ def _coordinator_with_aligned_robot() -> AnyVacCoordinator:
     robot_frame["s6"] = res2["robot_frame"]
 
     coord = object.__new__(AnyVacCoordinator)
+
+    coord._pending_saves = {}
     coord._home_frames = frames
     coord._robot_frame = robot_frame
     return coord
@@ -313,6 +316,7 @@ class _FakeStore:
 
 def _async_bare_coordinator() -> AnyVacCoordinator:
     coord = object.__new__(AnyVacCoordinator)
+    coord._pending_saves = {}
     coord.hass = _FakeAsyncHass()
     coord._home_frames = {}
     coord._robot_frame = {}

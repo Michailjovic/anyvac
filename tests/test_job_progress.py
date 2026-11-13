@@ -42,6 +42,7 @@ class _Clock:
 def _coord(monkeypatch: pytest.MonkeyPatch, clock: _Clock) -> AnyVacCoordinator:
     monkeypatch.setattr(coord_mod.dt_util, "utcnow", clock)
     c = object.__new__(AnyVacCoordinator)
+    c._pending_saves = {}
     c._job_state = None
     c.data = {}
     c.async_update_listeners = lambda: None  # type: ignore[method-assign]

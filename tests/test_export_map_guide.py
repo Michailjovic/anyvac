@@ -110,6 +110,7 @@ def test_guide_room_rects_skips_rooms_without_a_usable_bbox() -> None:
 
 def _coord_with_calibration_points(duid: str, calibration_points: object) -> AnyVacCoordinator:
     coord = object.__new__(AnyVacCoordinator)
+    coord._pending_saves = {}
     coord.data = {
         duid: AnyVacDevice(
             duid=duid, slug=duid, name=duid,

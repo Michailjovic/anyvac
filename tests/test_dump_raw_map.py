@@ -1,7 +1,7 @@
 """Tests for `anyvac.dump_raw_map` (docs/40 Fáze 0, 2026-09-13).
 
 DEBUG/DIAGNOSTIC ONLY service: writes a vacuum's raw Roborock map bytes to
-config/www/anyvac/debug/ so they can be pulled into `anyvac/tools/samples/`
+config/anyvac/debug/ so they can be pulled into `anyvac/tools/samples/`
 for the offline home-frame registration probe (docs/40 §3.2). No behaviour
 change to anything else, no card involvement.
 

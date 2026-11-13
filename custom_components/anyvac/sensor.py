@@ -87,6 +87,8 @@ class AnyVacMapSensor(CoordinatorEntity[AnyVacCoordinator], SensorEntity):
             "job_progress",
             # docs/48 — live extension of the snapshot from the local diff.
             "live", "live_stats",
+            # 1.51.6 (plan po auditu, A0) — polls around a clean's end.
+            "clean_type_trace",
             # Kontrakt v3 (docs/40 §4.2 point 6) — additive, same "large/
             # fast-changing map payload" reasoning as the v2 *_px attributes above.
             "home_frame", "registration", "vacuum_position_home_px", "charger_home_px",

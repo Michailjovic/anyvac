@@ -20,10 +20,11 @@ import shutil
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.storage import Store
 
-from .const import DOMAIN
+from .const import DOMAIN, STORE_KEYS
 from .coordinator import AnyVacCoordinator
-from .services import ALL_SERVICES, async_register_services
+from .services import ALL_SERVICES, _cancel_jobs, async_register_services
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -78,7 +79,34 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload an AnyVac config entry."""
     unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unloaded:
+        # 1.51.8 (plan po auditu, B2): an unloaded integration must not keep
+        # dispatching robots. A running job's listeners used to outlive the
+        # entry — after a disable or removal they still sent `app_segment_clean`
+        # on the next `anyvac_room_done`. The robots finish what they were
+        # already doing; only the orchestration stops.
+        started = _cancel_jobs(hass)
+        if started:
+            _LOGGER.warning(
+                "AnyVac unloaded during a clean job; the remaining queued rooms "
+                "were not sent (%s)",
+                ", ".join(sorted(started)),
+            )
         for svc in ALL_SERVICES:
             if hass.services.has_service(DOMAIN, svc):
                 hass.services.async_remove(DOMAIN, svc)
     return unloaded
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Delete AnyVac's `.storage` files when its last entry is removed (B2).
+
+    Room history, estimates, pins, coverage and the home frame are per
+    installation, not per entry, so they stay while another AnyVac entry
+    exists. Blueprints are left alone: automations may still use them."""
+    if any(
+        other.entry_id != entry.entry_id
+        for other in hass.config_entries.async_entries(DOMAIN)
+    ):
+        return
+    for key in STORE_KEYS:
+        await Store(hass, 1, f"{DOMAIN}_{key}").async_remove()

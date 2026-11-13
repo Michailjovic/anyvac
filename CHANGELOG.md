@@ -6,6 +6,116 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.51.9] - 2026-11-13
+
+Card unchanged (1.51.5). Audit plan 1.51.5, steps C1–C3.
+
+### Security
+
+- **`detect_floorplan_fiducials` can no longer read files outside
+  `config/www/`.** Its `/local/...` path was joined without resolving `..`, so
+  `/local/../.storage/<file>` reached into `config/.storage/`. The path is now
+  resolved (including symlinks) and must stay inside `config/www/`.
+- **`dump_raw_map` writes to `config/anyvac/debug/` instead of
+  `config/www/anyvac/debug/`.** Everything under `www/` is served at `/local/`
+  without authentication, and a raw map is the floor plan of your home. The
+  service's response now returns the config-relative path. Delete any old
+  dumps from `config/www/anyvac/debug/` by hand.
+- **File and diagnostic services are admin-only:**
+  `snapshot_map_as_floorplan`, `export_map_guide`, `dump_raw_map`,
+  `probe_map_rate` and `detect_floorplan_fiducials`. They read or write files
+  in the config directory or are diagnostics, and are only used from setup
+  flows (calibration, map guide) or by hand. Calls from automations and
+  scripts are unaffected. Everything the card uses in normal operation —
+  cleaning, planning, Pin & Go, zones, dock actions, room selection, layers —
+  stays open to every user.
+
+## [1.51.8] - 2026-11-13
+
+Card unchanged (1.51.5). Audit plan 1.51.5, steps B2 and B4.
+
+### Fixed
+
+- **Unloading AnyVac now stops a running clean job.** Its event listeners used
+  to outlive the config entry, so after disabling or removing the integration
+  the next `anyvac_room_done` still sent a robot an `app_segment_clean`. The
+  robots finish what they are already doing; rooms still queued are not sent,
+  and a warning in the log names the robots involved.
+- **Pending data is written on unload instead of after it.** Room history,
+  estimates, traces and the other stores are saved with a short delay. On an
+  entry reload (any options change) the old coordinator's timers used to fire
+  after the new coordinator had loaded the files — overwriting newer data with
+  the old snapshot — or the pending write was lost. The coordinator now writes
+  every pending store when it shuts down, exactly once.
+- **Service calls run under the caller's context.** Everything AnyVac calls on
+  your behalf — the job runner's settings and room dispatches (including the
+  pool batches sent later from events), `goto`, `zone_clean`, the dock
+  actions and `cancel`'s return-to-base — now carries the context of the
+  service call that started it. The logbook attributes those actions to the
+  user who pressed START, and Home Assistant checks that user's permissions;
+  before, each call ran as a new system context.
+
+### Added
+
+- **Removing the last AnyVac entry deletes its `.storage` files**
+  (`anyvac_room_history`, `anyvac_paths`, `anyvac_home_frame` and the rest).
+  They stay while another AnyVac entry exists. Blueprints are left in place
+  because automations may still use them.
+
+### Changed
+
+- The coordinator passes its config entry to Home Assistant explicitly
+  instead of relying on the setup context.
+
+## [1.51.7] - 2026-11-13
+
+Card unchanged (1.51.5). Audit plan 1.51.5, step B1.
+
+### Fixed
+
+- **A room could be skipped in a "both" job when two dry robots finished in
+  the same poll.** Home Assistant runs every coroutine event listener as its
+  own task, so two `anyvac_room_done` events fired back to back ran the job
+  runner's handler twice at the same time. Both saw the wet robot free —
+  it is only marked busy after `send_command` returns — and both sent it an
+  `app_segment_clean`. The robot runs only the last command it receives, so
+  the first room was marked dispatched and never mopped. A job's event
+  handlers and wait-rechecks now run one at a time, which makes "robot is
+  free → dispatch → mark busy" a single step: the second room waits for the
+  robot to finish its batch, as it does when the events arrive in separate
+  polls. A handler that was queued while the job ended (completed, cancelled
+  or timed out) no longer dispatches anything.
+
+### Tests
+
+- The fake event bus in the job runner tests now runs each listener as its
+  own task, like Home Assistant. The old fake awaited listeners one after
+  another, which is why the race never showed up in the suite.
+
+## [1.51.6] - 2026-11-13
+
+Card unchanged (1.51.5). Audit plan 1.51.5, step A0.
+
+### Added
+
+- **`clean_type_trace` attribute on the AnyVac map sensor (diagnostics).**
+  Field report: a dry S7 MaxV run is announced as wet by `anyvac_run_finished`
+  and everything built on it. A coordinator simulation found two paths that
+  produce this — no room name during the run (so no session clean type is
+  captured), or `in_cleaning` still set on the poll where the firmware has
+  already reset the water mode for the trip home — and the sensor's attributes
+  are not recorded, so which one happens on real hardware cannot be read back
+  from history. The attribute keeps the last 8 full polls of a clean, the
+  poll where it ends and the 3 after it, then freezes until the next clean
+  ends. Each poll lists `in_cleaning`, `status_state`, `transit`,
+  `vacuuming`, `room`, `water_mode_name`, `water_box_carriage_status`,
+  `fan_speed_name`, the derived `signal`, the session clean type before and
+  after the poll, `run_pending` and the dry/wet trace point counts; the edge
+  poll also carries `event_clean_type`, the value the finish events were
+  built from. `events` lists the `clean_type` of the last 6
+  `clean_started` / `clean_finished` / `run_finished` events. Observation
+  only — nothing feeds back into tracking, events or learning. Not recorded.
+
 ## [1.51.5] - 2026-10-21
 
 Card unchanged (1.51.5).

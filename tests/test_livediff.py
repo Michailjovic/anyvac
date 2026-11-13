@@ -97,6 +97,7 @@ CALIB = [  # 1 px per 100 mm, no flip — enough to check the transform is appli
 
 def _coord(path_points: int = 870, dry_open: bool = True, wet_open: bool = True) -> AnyVacCoordinator:
     c = object.__new__(AnyVacCoordinator)
+    c._pending_saves = {}
     c.data = {"d1": AnyVacDevice(duid="d1", slug="d1", name="S8", data={
         "path_points": path_points, "calibration_points": CALIB, "in_cleaning": True})}
     c._dry_path_open = {"d1": dry_open}

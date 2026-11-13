@@ -60,6 +60,7 @@ def _bare_coordinator() -> AnyVacCoordinator:
     that). `_listeners` is DataUpdateCoordinator's own state, needed because
     `set_room_pin` calls `async_update_listeners()`."""
     coord = object.__new__(AnyVacCoordinator)
+    coord._pending_saves = {}
     coord._room_pins = {}
     coord._pins_store = _FakeStore()
     coord._listeners = {}
@@ -130,6 +131,7 @@ def test_room_pins_property_returns_a_copy() -> None:
 
 async def _load_pins(load_value: Any) -> dict[str, dict[str, str]]:
     coord = object.__new__(AnyVacCoordinator)
+    coord._pending_saves = {}
     coord._store = _FakeStore()
     coord._sel_store = _FakeStore()
     coord._pins_store = _FakeStore(load_value)
@@ -188,6 +190,7 @@ def _pin_lifecycle_coordinator(clock_now: datetime) -> AnyVacCoordinator:
     the pin auto-clear code — mirrors `test_coordinator_pipeline.py`'s
     `_new_coordinator`/`_poll` pattern, trimmed to what this path touches."""
     coord = object.__new__(AnyVacCoordinator)
+    coord._pending_saves = {}
     coord.hass = _FakeHass()
     for attr in ("_store", "_est_store", "_cov_store", "_cov_pct_store", "_cov_legacy_pct_store", "_sel_store", "_seq_store", "_layers_store", "_paths_store"):
         setattr(coord, attr, _FakeStore())

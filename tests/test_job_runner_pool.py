@@ -2,8 +2,10 @@
 
 Exercises `_dispatch_pools()`'s adaptive threshold batching purely through
 the same public surface real events drive: `anyvac_room_done` /
-`anyvac_clean_finished` bus events (a fake bus fires them synchronously,
-matching HA's `async_fire`) and `hass.services.async_call` (recorded instead
+`anyvac_clean_finished` bus events (the fake bus runs every listener as its
+own task, matching how HA's `async_fire` schedules coroutine listeners — two
+events fired back to back run CONCURRENTLY, see
+`test_two_gates_in_one_poll_dispatch_one_batch`) and `hass.services.async_call` (recorded instead
 of touching a real vacuum). `homeassistant.helpers.event.async_call_later`
 is monkeypatched to a fake scheduler that records `(delay, action)` instead
 of using a real asyncio timer — tests fire the action themselves to
@@ -20,6 +22,7 @@ empty dict).
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -81,19 +84,39 @@ class _FakeBus:
 
         return _unsub
 
-    async def fire(self, event_type: str, data: dict[str, Any]) -> None:
+    def fire_nowait(self, event_type: str, data: dict[str, Any]) -> list[asyncio.Task]:
+        """Like HA's `async_fire`: schedule every listener as a task, return at once."""
         event = SimpleNamespace(data=data)
-        for handler in list(self._listeners.get(event_type, [])):
-            await handler(event)
+        loop = asyncio.get_running_loop()
+        return [
+            asyncio.Task(handler(event), loop=loop, eager_start=True)
+            for handler in list(self._listeners.get(event_type, []))
+        ]
+
+    async def fire(self, event_type: str, data: dict[str, Any]) -> None:
+        """Fire and wait until this event's listeners are done."""
+        await asyncio.gather(*self.fire_nowait(event_type, data))
 
 
 class _FakeServices:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, dict[str, Any]]] = []
+        self.contexts: list[Any] = []
+        # A real service call yields to the event loop (network round trip to
+        # the robot); 0 keeps the old no-yield behaviour for the other tests.
+        self.latency_s = 0.0
 
     async def async_call(
-        self, domain: str, service: str, data: dict[str, Any], blocking: bool = True
+        self,
+        domain: str,
+        service: str,
+        data: dict[str, Any],
+        blocking: bool = True,
+        context: Any = None,
     ) -> None:
+        self.contexts.append(context)
+        if self.latency_s:
+            await asyncio.sleep(self.latency_s)
         self.calls.append((domain, service, dict(data)))
 
     def send_command_calls(self) -> list[dict[str, Any]]:
@@ -263,3 +286,64 @@ async def test_static_task_bypasses_pool_machinery(monkeypatch: pytest.MonkeyPat
     assert len(calls) == 1
     assert calls[0]["params"][0]["segments"] == [1]
     assert runner.started_vacuums == {"vacuum.wet1"}
+
+
+async def test_two_gates_in_one_poll_dispatch_one_batch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """1.51.7 (plan po auditu B1). Two dry robots finish their rooms in the same
+    poll, so two `anyvac_room_done` land back to back while the wet robot is
+    free. Before the runner serialised its handlers, both saw the robot free
+    and each sent its own `app_segment_clean` — the robot runs only the second,
+    the first room was marked dispatched and never mopped."""
+    hass, _clock, _sched = _rig(monkeypatch)
+    hass.services.latency_s = 0.01
+    task = _pool_task(
+        "wet1", "vacuum.wet1",
+        {"Kitchen": ("dry1", 0.0, 16), "Bedroom": ("dry2", 0.0, 17)},
+    )
+    runner = _JobRunner(hass, [task])
+    await runner.start()
+    assert hass.services.send_command_calls() == []
+
+    tasks = hass.bus.fire_nowait(f"{services_mod.DOMAIN}_room_done", {"duid": "dry1", "room": "Kitchen"})
+    tasks += hass.bus.fire_nowait(f"{services_mod.DOMAIN}_room_done", {"duid": "dry2", "room": "Bedroom"})
+    await asyncio.gather(*tasks)
+
+    sent = hass.services.send_command_calls()
+    assert len(sent) == 1, sent
+    # The second room waits for the robot to be free, then goes out on its own.
+    assert sent[0]["params"][0]["segments"] == [16]
+    await hass.bus.fire(f"{services_mod.DOMAIN}_clean_finished", {"duid": "wet1"})
+    sent = hass.services.send_command_calls()
+    assert [c["params"][0]["segments"] for c in sent] == [[16], [17]]
+
+
+async def test_handler_queued_behind_a_finished_job_does_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A handler that waited for the lock while the job ended must not dispatch."""
+    hass, _clock, _sched = _rig(monkeypatch)
+    hass.services.latency_s = 0.01
+    task = _pool_task("wet1", "vacuum.wet1", {"Kitchen": ("dry1", 0.0, 16)})
+    runner = _JobRunner(hass, [task])
+    await runner.start()
+    async with runner._lock:
+        tasks = hass.bus.fire_nowait(f"{services_mod.DOMAIN}_room_done", {"duid": "dry1", "room": "Kitchen"})
+        runner.finish()
+    await asyncio.gather(*tasks)
+    assert hass.services.send_command_calls() == []
+
+
+async def test_pool_dispatch_carries_the_starting_calls_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """1.51.8 (plan po auditu B4): a pool batch is sent from an event handler
+    long after the service call returned; it still runs under the caller's
+    context, so HA attributes it to that user and checks their permissions."""
+    hass, _clock, _sched = _rig(monkeypatch)
+    ctx = SimpleNamespace(user_id="user-1")
+    task = _pool_task("wet1", "vacuum.wet1", {"Kitchen": ("dry1", 0.0, 16)})
+    runner = _JobRunner(hass, [task], context=ctx)
+    await runner.start()
+    await hass.bus.fire(f"{services_mod.DOMAIN}_room_done", {"duid": "dry1", "room": "Kitchen"})
+    assert hass.services.send_command_calls()
+    assert hass.services.contexts and all(c is ctx for c in hass.services.contexts)

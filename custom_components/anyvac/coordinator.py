@@ -22,8 +22,10 @@ import logging
 import math
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
@@ -95,6 +97,13 @@ def _mode_is_off(name: Any) -> bool:
 # the points the next snapshot brings; in any other state (paused, idle, transit,
 # unknown) the time is dropped exactly as before docs/47. A positive list on
 # purpose: an unknown/new firmware state falls back to the old behaviour.
+# 1.51.6 (plan po auditu, A0): how many full polls `clean_type_trace` keeps
+# before and after a clean's falling edge, and how many of AnyVac's own clean
+# events it remembers.
+_CT_TRACE_BEFORE = 8
+_CT_TRACE_AFTER = 3
+_CT_TRACE_EVENTS = 6
+
 ACTIVE_CLEAN_STATES = {
     "cleaning",
     "spot_cleaning",
@@ -1182,10 +1191,18 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         super().__init__(
             hass,
             _LOGGER,
+            config_entry=entry,
             name=DOMAIN,
             update_interval=timedelta(seconds=SCAN_INTERVAL_SECONDS),
         )
         self.entry = entry
+        # 1.51.8 (plan po auditu, B2): every Store's latest delayed-save data
+        # function, so `async_shutdown` can write what is still pending. HA's own
+        # final write only runs when HA stops; on an entry reload the old
+        # coordinator's timers used to fire AFTER the new one had loaded the
+        # files, overwriting newer data with the old snapshot — or the pending
+        # write was simply lost.
+        self._pending_saves: dict[Store, Callable[[], Any]] = {}
         self._store: Store = Store(hass, 1, f"{DOMAIN}_room_history")
         # Read once at construction: `__init__.py` reloads the entry on an
         # options change (`async_update_listener`), so a new coordinator picks
@@ -1270,6 +1287,22 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # field report "still every 30 s" — live updates only right after a
         # full-map refresh; these say what the diff answers in between).
         self._live_stats: dict[str, dict[str, Any]] = {}
+        # 1.51.6 (plan po auditu, A0): `clean_type_trace` — the full polls around
+        # a clean's falling edge plus the clean_type AnyVac's own clean events
+        # carried. Field report 2026-11-12: a dry S7 MaxV run is announced as wet.
+        # The fix depends on WHICH path produces it (no room name during the run,
+        # or in_cleaning still set while the water mode is already reset), and the
+        # sensor's attributes are not recorded, so only a live capture can tell.
+        # Observation only: nothing here feeds back into the pipeline.
+        self._ct_trace_buf: dict[str, deque[dict[str, Any]]] = {}
+        self._ct_trace_prev: dict[str, bool] = {}
+        self._ct_trace_tail: dict[str, int] = {}
+        self._ct_trace_last: dict[str, dict[str, Any]] = {}
+        self._ct_trace_events: dict[str, deque[dict[str, Any]]] = {}
+        self._ct_trace_unsub: list[CALLBACK_TYPE] = [
+            hass.bus.async_listen(f"{DOMAIN}_{name}", self._ct_trace_on_event)
+            for name in ("clean_started", "clean_finished", "run_finished")
+        ]
         # Robots whose firmware rejects get_dynamic_map_diff ("method not
         # recognized" — S6, field-caught 2026-10-08). Never polled again until
         # HA restarts: retrying every 60 s would only produce the same error.
@@ -1533,7 +1566,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
 
         if estimates:
             _prune(self._estimates)
-            self._est_store.async_delay_save(lambda: self._estimates, 2)
+            self._delay_save(self._est_store, lambda: self._estimates, 2)
         if baselines:
             # `_room_coverage` has no duid dimension (mirrors `_history`'s cross-fleet
             # room-name keying), so a duid-scoped reset still clears by room/kind only.
@@ -1545,7 +1578,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     self._room_coverage[rnm].pop(f"{k}_floor", None)
                 if not self._room_coverage[rnm]:
                     self._room_coverage.pop(rnm)
-            self._cov_pct_store.async_delay_save(lambda: self._room_coverage, 2)
+            self._delay_save(self._cov_pct_store, lambda: self._room_coverage, 2)
         self.async_update_listeners()
 
     def pct_to_mm(self, duid: str, x_pct: float, y_pct: float) -> tuple[int, int] | None:
@@ -1652,7 +1685,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             self._view_layers["dry"] = bool(dry)
         if wet is not None:
             self._view_layers["wet"] = bool(wet)
-        self._layers_store.async_delay_save(lambda: dict(self._view_layers), 2)
+        self._delay_save(self._layers_store, lambda: dict(self._view_layers), 2)
         self.async_update_listeners()
 
     @property
@@ -1851,7 +1884,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 self._floorplan_seats.pop(floorplan, None)
             else:
                 entry["updated"] = dt_util.utcnow().isoformat(timespec="seconds")
-        self._seats_store.async_delay_save(lambda: self._floorplan_seats, 2)
+        self._delay_save(self._seats_store, lambda: self._floorplan_seats, 2)
         self.async_update_listeners()
 
     @property
@@ -1881,7 +1914,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 kinds.pop(kind, None)
                 if not kinds:
                     self._room_pins.pop(room, None)
-        self._pins_store.async_delay_save(lambda: dict(self._room_pins), 2)
+        self._delay_save(self._pins_store, lambda: dict(self._room_pins), 2)
         self.async_update_listeners()
 
     @property
@@ -1896,7 +1929,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         it's still present in the new list; rooms not in ``rooms`` at all are dropped
         from the map entirely (the editor always sends its full known room list)."""
         self._room_sequence = {str(r): i + 1 for i, r in enumerate(rooms) if r}
-        self._seq_store.async_delay_save(lambda: dict(self._room_sequence), 2)
+        self._delay_save(self._seq_store, lambda: dict(self._room_sequence), 2)
         self.async_update_listeners()
 
     # -- docs/44 F2: job progress (read by the card's hero bar) -----------------
@@ -2072,7 +2105,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             self._selected_rooms -= names
         elif mode == "toggle":
             self._selected_rooms ^= names
-        self._sel_store.async_delay_save(lambda: sorted(self._selected_rooms), 2)
+        self._delay_save(self._sel_store, lambda: sorted(self._selected_rooms), 2)
         self.async_update_listeners()
 
     def _learn_estimate(
@@ -2088,7 +2121,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         before = rec.get(kind)
         after = round(minutes) if before is None else round(0.6 * before + 0.4 * minutes)
         rec[kind] = after
-        self._est_store.async_delay_save(lambda: self._estimates, 5)
+        self._delay_save(self._est_store, lambda: self._estimates, 5)
         return before, after
 
     def _update_geometry(self, device: AnyVacDevice) -> covmod.Geometry | None:
@@ -2291,7 +2324,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # writing to disk every SCAN_INTERVAL forever regardless of whether the
         # vacuum is doing anything.
         if dry_changed or wet_changed or dry_open_changed or sortie_wipe is not None:
-            self._paths_store.async_delay_save(
+            self._delay_save(self._paths_store,
                 self._paths_for_save,
                 _PATHS_WIPE_SAVE_DELAY_S if sortie_wipe else _PATHS_SAVE_DELAY_S,
             )
@@ -2470,7 +2503,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     # save once the new session's first points land, but a poll where the
                     # robot hasn't produced any points yet must not leave the stale
                     # pre-wipe trace sitting on disk in the meantime.
-                    self._paths_store.async_delay_save(
+                    self._delay_save(self._paths_store,
                         self._paths_for_save, _PATHS_WIPE_SAVE_DELAY_S
                     )
                     self._session_start[duid] = dt_util.utcnow()
@@ -2639,7 +2672,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 room_rec[kind] = krec
             calib_rooms[nm] = room_rec
         if coverage_changed:
-            self._cov_pct_store.async_delay_save(lambda: self._room_coverage, 5)
+            self._delay_save(self._cov_pct_store, lambda: self._room_coverage, 5)
         self._last_calib[duid] = {
             "at": dt_util.utcnow().isoformat(timespec="seconds"),
             "clean_type": ct,
@@ -2656,7 +2689,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # room keys == integration room names by convention).
         if rooms and self._selected_rooms & set(rooms):
             self._selected_rooms -= set(rooms)
-            self._sel_store.async_delay_save(lambda: sorted(self._selected_rooms), 2)
+            self._delay_save(self._sel_store, lambda: sorted(self._selected_rooms), 2)
         # Pins are one-shot user overrides — clear them with the finished rooms
         # (docs/18 §7e), same lifecycle as the selection auto-clear above.
         # Per-kind since 2026-07-25: this session's evidence-based `ct` is a
@@ -2681,7 +2714,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     self._room_pins.pop(r, None)
                     pins_changed = True
             if pins_changed:
-                self._pins_store.async_delay_save(lambda: dict(self._room_pins), 2)
+                self._delay_save(self._pins_store, lambda: dict(self._room_pins), 2)
         self._session_rooms[duid] = set()
         # Clear the live per-room session accumulators NOW (calibration + baseline
         # learning above already consumed them). Without this, rooms_progress kept
@@ -3027,7 +3060,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 new_frame_id, duid,
             )
         self._home_frame_cache_key[duid] = result["cache_key"]
-        self._home_frame_store.async_delay_save(self._home_frame_for_save, 5)
+        self._delay_save(self._home_frame_store, self._home_frame_for_save, 5)
         self.async_update_listeners()
 
     def home_px_to_mm(self, duid: str, x: float, y: float) -> tuple[float, float] | None:
@@ -3150,7 +3183,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         rec["any"] = now
         for kind in kinds:
             rec[kind] = now
-        self._store.async_delay_save(self._history_for_save, 5)
+        self._delay_save(self._store, self._history_for_save, 5)
 
     def _update_history(self, device: AnyVacDevice) -> None:
         """Stamp rooms the firmware explicitly reports as cleaned (cleaned_rooms).
@@ -3222,6 +3255,91 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             }
         return out
 
+    @callback
+    def _ct_trace_on_event(self, event: Any) -> None:
+        """Remember which clean_type AnyVac's own clean events carried (A0)."""
+        duid = event.data.get("duid")
+        if not duid:
+            return
+        events = self._ct_trace_events.setdefault(duid, deque(maxlen=_CT_TRACE_EVENTS))
+        events.append(
+            {
+                "event": event.event_type.removeprefix(f"{DOMAIN}_"),
+                "at": dt_util.utcnow().isoformat(timespec="seconds"),
+                "clean_type": event.data.get("clean_type"),
+            }
+        )
+
+    def _record_clean_type_trace(
+        self, device: AnyVacDevice, session_before: str | None
+    ) -> None:
+        """Keep the last full polls of a clean and freeze them a few polls after
+        its falling edge into `clean_type_trace` (A0).
+
+        Called once per full poll AFTER the pipeline, so ``signal`` is the
+        clean_type `_extract_device` derived for this poll and ``session_after`` is
+        what `_track_and_emit` kept. ``event_clean_type`` on the edge poll is the
+        value `_run_event` built the finish events from (session first, then this
+        poll's signal) — the field report's symptom in one number."""
+        duid = device.duid
+        cleaning = bool(device.data.get("in_cleaning"))
+        prev = self._ct_trace_prev.get(duid, False)
+        self._ct_trace_prev[duid] = cleaning
+        tail = self._ct_trace_tail.get(duid)
+        if not cleaning and not prev and tail is None:
+            return
+        buf = self._ct_trace_buf.setdefault(
+            duid, deque(maxlen=_CT_TRACE_BEFORE + 1 + _CT_TRACE_AFTER)
+        )
+        edge = prev and not cleaning
+        sig = device.data.get("mop_signal") or {}
+        signal = device.data.get("clean_type")
+        buf.append(
+            {
+                "at": dt_util.utcnow().isoformat(timespec="seconds"),
+                "edge": edge,
+                "in_cleaning": cleaning,
+                "status_state": device.data.get("status_state"),
+                "transit": bool(device.data.get("transit")),
+                "vacuuming": bool(device.data.get("vacuuming")),
+                "room": device.data.get("vacuum_room_name"),
+                "water_mode_name": sig.get("water_mode_name"),
+                "water_box_carriage_status": sig.get("water_box_carriage_status"),
+                "fan_speed_name": sig.get("fan_speed_name"),
+                "signal": signal,
+                "session_before": session_before,
+                "session_after": self._session_clean_type.get(duid),
+                "event_clean_type": (session_before or signal) if edge else None,
+                "run_pending": duid in self._run_pending,
+                "dry_points": sum(len(seg) for seg in self._dry_path.get(duid, [])),
+                "wet_points": sum(len(seg) for seg in self._wet_path.get(duid, [])),
+            }
+        )
+        if edge:
+            tail = _CT_TRACE_AFTER
+        elif tail is not None:
+            tail -= 1
+        if tail is not None and tail <= 0:
+            edges = [p["at"] for p in buf if p["edge"]]
+            self._ct_trace_last[duid] = {
+                "edge_at": edges[-1] if edges else None,
+                "polls": list(buf),
+            }
+            buf.clear()
+            tail = None
+        if tail is None:
+            self._ct_trace_tail.pop(duid, None)
+        else:
+            self._ct_trace_tail[duid] = tail
+
+    def _clean_type_trace(self, duid: str) -> dict[str, Any] | None:
+        """The published `clean_type_trace` attribute (A0)."""
+        last = self._ct_trace_last.get(duid)
+        events = self._ct_trace_events.get(duid)
+        if last is None and not events:
+            return None
+        return {**(last or {}), "events": list(events or [])}
+
     def _coverage_debug(self, device: AnyVacDevice) -> dict[str, Any] | None:
         """What the room-completion tracker currently believes (docs/45) — for the
         card's debug view and field reports."""
@@ -3281,10 +3399,12 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                                     "sample": val[:20] if isinstance(val, list) else val,
                                 }
                         dbg["watermarks"] = seen or None
+                    ct_session_before = self._session_clean_type.get(device.duid)
                     self._update_history(device)
                     self._detect_room_done(device)
                     self._track_and_emit(device)
                     self._attribute_points(device)
+                    self._record_clean_type_trace(device, ct_session_before)
                     progress = self._build_progress(device)
                     for room in device.data.get("rooms", []):
                         rec = self._history.get(room.get("name")) or {}
@@ -3333,6 +3453,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     # finished rooms, passes, path driven through rooms that were NOT
                     # counted. Replaces the docs/17 `transit_cells` debug counter.
                     device.data["coverage_debug"] = self._coverage_debug(device)
+                    device.data["clean_type_trace"] = self._clean_type_trace(device.duid)
                     # Kontrakt v2 (docs/14 §3.6 + §5): geometry in rendered image
                     # PIXELS so the card never has to do mm math again.
                     aff = _solve_affine(device.data.get("calibration_points"))
@@ -3698,7 +3819,30 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
     async def async_shutdown(self) -> None:
         """Unsubscribe from Roborock before the base shutdown."""
         self.unsubscribe_roborock()
+        for unsub in self._ct_trace_unsub:
+            unsub()
+        self._ct_trace_unsub = []
         await super().async_shutdown()
+        await self._flush_stores()
+
+    def _delay_save(self, store: Store, data_func: Callable[[], Any], delay: float) -> None:
+        """`store.async_delay_save` that `_flush_stores` can complete on unload."""
+        self._pending_saves[store] = data_func
+        store.async_delay_save(data_func, delay)
+
+    async def _flush_stores(self) -> None:
+        """Write every Store with a delayed save now (B2).
+
+        `Store.async_save` cancels the store's pending delayed write, so the
+        file ends up with this coordinator's final data exactly once and no
+        timer is left to fire after a reload. A store whose delayed write
+        already ran is simply written again with the same data."""
+        pending, self._pending_saves = self._pending_saves, {}
+        for store, data_func in pending.items():
+            try:
+                await store.async_save(data_func())
+            except Exception:  # noqa: BLE001 — one store must not block the rest
+                _LOGGER.exception("AnyVac: could not write %s on unload", store.key)
 
     def _extract_device(self, coord: Any) -> AnyVacDevice | None:
         """Extract normalised map data for one Roborock v1 coordinator."""

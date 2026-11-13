@@ -230,3 +230,34 @@ def test_detect_fiducials_none_found_returns_empty_not_an_error() -> None:
     assert result["found"] == 0
     assert sorted(result["missing"]) == ["bl", "br", "tl", "tr"]
     assert result["home_anchors"] == []
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "/local/../.storage/core.config_entries",
+        "/local/anyvac/../../secrets.yaml",
+        "/local/..",
+        "/local/",
+    ],
+)
+def test_resolve_local_www_path_refuses_to_leave_www(url: str) -> None:
+    """1.51.9 (plan po auditu C1): `..` must not climb out of config/www/."""
+    with pytest.raises(ValueError, match="under config/www/"):
+        _resolve_local_www_path(_FakeHass(), url)
+
+
+def test_resolve_local_www_path_refuses_a_symlink_out_of_www(tmp_path) -> None:
+    www = tmp_path / "www"
+    www.mkdir()
+    (tmp_path / "secret.png").write_bytes(b"x")
+    (www / "link.png").symlink_to(tmp_path / "secret.png")
+
+    class _Hass:
+        class config:
+            @staticmethod
+            def path(*parts: str) -> str:
+                return str(tmp_path.joinpath(*parts))
+
+    with pytest.raises(ValueError, match="under config/www/"):
+        _resolve_local_www_path(_Hass(), "/local/link.png")

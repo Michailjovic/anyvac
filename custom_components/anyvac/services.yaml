@@ -795,8 +795,8 @@ dump_raw_map:
   name: Dump raw map (debug)
   description: >-
     DEBUG/DIAGNOSTIC ONLY (docs/40 Fáze 0). Writes the vacuum's raw Roborock
-    map bytes to config/www/anyvac/debug/ for the offline home-frame
-    registration probe. Not used by the card; no behaviour change to anything
+    map bytes to config/anyvac/debug/ for the offline home-frame
+    registration probe. Administrators only. Not used by the card; no behaviour change to anything
     else. Fails if raw map data is not available yet for this vacuum.
   fields:
     entity_id:

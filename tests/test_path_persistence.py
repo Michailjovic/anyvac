@@ -107,6 +107,7 @@ def _new_coordinator(
     monkeypatch: pytest.MonkeyPatch, clock: _Clock, paths_store: _FakeStore | None = None
 ) -> AnyVacCoordinator:
     coord = object.__new__(AnyVacCoordinator)
+    coord._pending_saves = {}
     coord.hass = _FakeHass()
     for attr in (
         "_store", "_est_store", "_cov_store", "_cov_pct_store", "_cov_legacy_pct_store", "_sel_store",

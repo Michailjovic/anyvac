@@ -58,8 +58,13 @@ from typing import Any
 import numpy as np
 import voluptuous as vol
 
-from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
-from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
+from homeassistant.core import Context, HomeAssistant, ServiceCall, SupportsResponse
+from homeassistant.exceptions import (
+    HomeAssistantError,
+    ServiceValidationError,
+    Unauthorized,
+    UnknownUser,
+)
 from homeassistant.helpers.event import async_call_later
 from homeassistant.util import dt as dt_util
 
@@ -93,6 +98,23 @@ SERVICE_DUMP_RAW_MAP = "dump_raw_map"
 SERVICE_SNAP_WALL_CORNER = "snap_wall_corner"
 SERVICE_DETECT_FIDUCIALS = "detect_floorplan_fiducials"
 SERVICE_SET_FLOORPLAN_SEAT = "set_floorplan_seat"
+
+# 1.51.9 (plan po auditu, C2): config-relative folder for `dump_raw_map`.
+DEBUG_DUMP_DIR = "anyvac/debug"
+
+# 1.51.9 (plan po auditu, C3): services that read or write files in the config
+# directory or are diagnostics. Only an administrator may call them — the same
+# rule Home Assistant applies to its own file and debug services. Every one is
+# used only from setup flows (calibration, map guide) or by hand.
+ADMIN_SERVICES: frozenset[str] = frozenset(
+    {
+        SERVICE_SNAPSHOT_FLOORPLAN,
+        SERVICE_EXPORT_MAP_GUIDE,
+        SERVICE_DUMP_RAW_MAP,
+        SERVICE_PROBE_MAP_RATE,
+        SERVICE_DETECT_FIDUCIALS,
+    }
+)
 
 ALL_SERVICES = (
     SERVICE_RUN_JOB,
@@ -898,7 +920,14 @@ def _resolve_local_www_path(hass: HomeAssistant, path: str) -> str:
             f"config/www/), got: {path!r}"
         )
     rel = raw[len("/local/") :]
-    return hass.config.path("www", *rel.split("/"))
+    # 1.51.9 (plan po auditu, C1): `/local/../.storage/x` used to resolve to
+    # `config/.storage/x`. Resolve symlinks and `..` first and accept only a
+    # path that is still inside `config/www/`.
+    www = os.path.realpath(hass.config.path("www"))
+    target = os.path.realpath(os.path.join(www, *rel.split("/")))
+    if os.path.commonpath([www, target]) != www or target == www:
+        raise ValueError(f"path must point to a file under config/www/, got: {path!r}")
+    return target
 
 
 def _detect_fiducials(image_bytes: bytes, known: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1359,8 +1388,15 @@ class _JobRunner:
         tasks: list[dict[str, Any]],
         job_rooms: dict[str, set[str]] | None = None,
         progress: dict[str, Any] | None = None,
+        context: Context | None = None,
     ) -> None:
         self.hass = hass
+        # 1.51.8 (plan po auditu, B4): the context of the service call that
+        # started the job, handed to every call the runner makes — including the
+        # later, event-driven pool dispatches — so the logbook attributes them to
+        # the user who pressed START and HA checks that user's permissions.
+        # Without it every call ran as a fresh system context.
+        self.context = context
         # docs/44 F2: the plan's room passes + ETA, handed to the coordinator so
         # the card can show "done around HH:MM" without estimating anything
         # itself. None for raw `run_job` task lists (no plan to report).
@@ -1417,8 +1453,24 @@ class _JobRunner:
         self._pool_first_ready: dict[str, Any] = {}
         self._pool_wait_cancel: dict[str, Any] = {}
         self._start_time: Any = None
+        # 1.51.7 (plan po auditu, B1): one job's event handlers run one at a time.
+        # HA runs every coroutine listener as its own task, so two
+        # `anyvac_room_done` from the same poll (two dry robots finishing) used to
+        # interleave at the first `await` of `_dispatch_pool_batch`: both saw the
+        # wet robot free (`pool_busy` is only set after `send_command` returns)
+        # and both sent it an `app_segment_clean` — the second overrode the first,
+        # whose room was marked dispatched and never mopped. Holding the lock
+        # across the whole handler is what makes "check free → dispatch → mark
+        # busy" one step; `_closed` stops a handler that queued behind the lock
+        # from dispatching for a job that ended meanwhile.
+        self._lock = asyncio.Lock()
+        self._closed = False
 
     async def start(self) -> None:
+        async with self._lock:
+            await self._start()
+
+    async def _start(self) -> None:
         _active_jobs(self.hass).append(self)
         self._start_time = dt_util.utcnow()
         for duid, rooms in self.job_rooms.items():
@@ -1461,6 +1513,8 @@ class _JobRunner:
 
     async def _dispatch_ready(self) -> None:
         for tid in list(self.pending):
+            if self._closed:
+                return
             if self._met(self.tasks[tid]):
                 self.pending.discard(tid)  # discard before await: no double dispatch
                 try:
@@ -1477,6 +1531,8 @@ class _JobRunner:
         each call re-evaluates from scratch (any previously scheduled recheck
         for a task is cancelled and replaced or resolved into a dispatch)."""
         for tid, pt in list(self.pool_tasks.items()):
+            if self._closed:
+                return
             dispatched: set[str] = pt["dispatched"]
             remaining = {r: m for r, m in pt["pool"].items() if r not in dispatched}
             if not remaining:
@@ -1530,9 +1586,12 @@ class _JobRunner:
 
     def _make_pool_recheck(self, tid: str):
         async def _cb(_now: Any) -> None:
-            self._pool_wait_cancel.pop(tid, None)
-            await self._dispatch_pools()
-            self._maybe_finish()
+            async with self._lock:
+                if self._closed:
+                    return
+                self._pool_wait_cancel.pop(tid, None)
+                await self._dispatch_pools()
+                self._maybe_finish()
         return _cb
 
     async def _dispatch_pool_batch(self, tid: str, pt: dict[str, Any], rooms: list[str]) -> None:
@@ -1546,6 +1605,7 @@ class _JobRunner:
                     "select_option",
                     {"entity_id": sel["entity_id"], "option": sel["option"]},
                     blocking=True,
+                    context=self.context,
                 )
             except Exception as err:  # noqa: BLE001
                 _LOGGER.warning(
@@ -1559,6 +1619,7 @@ class _JobRunner:
                     "set_fan_speed",
                     {"entity_id": entity, "fan_speed": pt["fan_speed"]},
                     blocking=True,
+                    context=self.context,
                 )
             except Exception as err:  # noqa: BLE001
                 _LOGGER.warning("AnyVac run_job: set_fan_speed failed: %s", err)
@@ -1573,6 +1634,7 @@ class _JobRunner:
                     "params": [{"segments": segs, "repeat": pt.get("repeat", 1)}],
                 },
                 blocking=True,
+                    context=self.context,
             )
             _LOGGER.info("AnyVac pool %s (%s): dispatched %s", tid, entity, sorted(rooms))
         except Exception as err:  # noqa: BLE001 - one bad batch must not wedge the job
@@ -1594,6 +1656,7 @@ class _JobRunner:
                     "select_option",
                     {"entity_id": sel["entity_id"], "option": sel["option"]},
                     blocking=True,
+                    context=self.context,
                 )
             except Exception as err:  # noqa: BLE001
                 _LOGGER.warning(
@@ -1609,6 +1672,7 @@ class _JobRunner:
                     "set_fan_speed",
                     {"entity_id": task["vacuum"], "fan_speed": task["fan_speed"]},
                     blocking=True,
+                    context=self.context,
                 )
             except Exception as err:  # noqa: BLE001
                 _LOGGER.warning("AnyVac run_job: set_fan_speed failed: %s", err)
@@ -1616,7 +1680,11 @@ class _JobRunner:
         if service and "." in service:
             domain, name = service.split(".", 1)
             await self.hass.services.async_call(
-                domain, name, dict(task.get("service_data") or {}), blocking=True
+                domain,
+                name,
+                dict(task.get("service_data") or {}),
+                blocking=True,
+                context=self.context,
             )
             if task.get("vacuum"):
                 self.started_vacuums.add(task["vacuum"])
@@ -1628,6 +1696,11 @@ class _JobRunner:
                 self.awaiting_finish.add(task["duid"])
 
     async def _on_room_done(self, event) -> None:
+        async with self._lock:
+            if not self._closed:
+                await self._handle_room_done(event)
+
+    async def _handle_room_done(self, event) -> None:
         self.done.add((event.data.get("duid"), event.data.get("room")))
         if self.progress:
             for coord in _coordinators(self.hass):
@@ -1637,6 +1710,11 @@ class _JobRunner:
         self._maybe_finish()
 
     async def _on_finished(self, event) -> None:
+        async with self._lock:
+            if not self._closed:
+                await self._handle_finished(event)
+
+    async def _handle_finished(self, event) -> None:
         # Whole-session completion satisfies a condition with the room omitted.
         duid = event.data.get("duid")
         self.done.add((duid, None))
@@ -1667,6 +1745,7 @@ class _JobRunner:
 
     def finish(self) -> None:
         """Stop listening and deregister (idempotent)."""
+        self._closed = True
         for unsub in self._unsub:
             unsub()
         self._unsub = []
@@ -1698,10 +1777,11 @@ async def _start_job(
     tasks: list[dict[str, Any]],
     job_rooms: dict[str, set[str]] | None = None,
     progress: dict[str, Any] | None = None,
+    context: Context | None = None,
 ) -> None:
     """Cancel any previous job (docs/13 C6: no parallel double-driving) and run."""
     _cancel_jobs(hass)
-    runner = _JobRunner(hass, tasks, job_rooms, progress)
+    runner = _JobRunner(hass, tasks, job_rooms, progress, context)
     await runner.start()
 
 
@@ -1791,11 +1871,30 @@ def _target_zone_mm_for(
     return a, b
 
 
+def _require_admin(hass: HomeAssistant, handler: Any) -> Any:
+    """Wrap a service handler so only an administrator may call it (C3).
+
+    Same check as Home Assistant's `async_register_admin_service`, done here
+    because that helper only gained response support in recent versions. A call
+    without a user (automations, scripts, the system) is allowed, as in core."""
+
+    async def _admin_handler(call: ServiceCall) -> Any:
+        if call.context.user_id:
+            user = await hass.auth.async_get_user(call.context.user_id)
+            if user is None:
+                raise UnknownUser(context=call.context)
+            if not user.is_admin:
+                raise Unauthorized(context=call.context)
+        return await handler(call)
+
+    return _admin_handler
+
+
 def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one registrar
     """Register the AnyVac services (idempotent)."""
 
     async def _handle_run_job(call: ServiceCall) -> None:
-        await _start_job(hass, list(call.data["tasks"]))
+        await _start_job(hass, list(call.data["tasks"]), context=call.context)
 
     async def _handle_select_rooms(call: ServiceCall) -> None:
         rooms = list(call.data.get("rooms", []))
@@ -1907,7 +2006,7 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
         _LOGGER.info("AnyVac clean: %s", plan)
         coords = _coordinators(hass)
         progress = _job_progress_from_plan(CleanPlanner(hass, coords[0]), plan) if coords else None
-        await _start_job(hass, tasks, _job_rooms_from_plan(plan), progress)
+        await _start_job(hass, tasks, _job_rooms_from_plan(plan), progress, call.context)
 
     async def _handle_plan(call: ServiceCall) -> dict[str, Any]:
         tasks, plan = _build(call)
@@ -1924,6 +2023,7 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
             "send_command",
             {"entity_id": entity, "command": "app_goto_target", "params": [x, y]},
             blocking=True,
+            context=call.context,
         )
 
     async def _handle_zone_clean(call: ServiceCall) -> None:
@@ -1940,6 +2040,7 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
             "send_command",
             {"entity_id": entity, "command": "app_zoned_clean", "params": [zone]},
             blocking=True,
+            context=call.context,
         )
 
     async def _dock_command(call: ServiceCall, command: str, params: Any = None) -> None:
@@ -1953,7 +2054,9 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
         data: dict[str, Any] = {"entity_id": entity, "command": command}
         if params is not None:
             data["params"] = params
-        await hass.services.async_call("vacuum", "send_command", data, blocking=True)
+        await hass.services.async_call(
+            "vacuum", "send_command", data, blocking=True, context=call.context
+        )
 
     async def _handle_dock_empty(call: ServiceCall) -> None:
         # app_start_collect_dust — documented, confirmed command (docs/26 §3).
@@ -2539,7 +2642,10 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
         entity = call.data.get("entity_id") or vacuum_entity_for_duid(hass, duid)
         name = call.data.get("name") or (entity.split(".", 1)[-1] if entity else duid)
         filename = _raw_map_filename(name, meta.get("map_flag"))
-        target_dir = hass.config.path("www", "anyvac", "debug")
+        # 1.51.9 (plan po auditu, C2): outside `www/`. Everything under `www/`
+        # is served at `/local/` without authentication, and a raw map is the
+        # floor plan of the user's home.
+        target_dir = hass.config.path(DEBUG_DUMP_DIR)
         target_path = os.path.join(target_dir, filename)
 
         def _write() -> None:
@@ -2560,7 +2666,7 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
             duid, target_path, len(raw), sha1,
         )
         return {
-            "path": f"/local/anyvac/debug/{filename}",
+            "path": f"{DEBUG_DUMP_DIR}/{filename}",
             "bytes": len(raw),
             "map_index": meta.get("map_index"),
             "map_sequence": meta.get("map_sequence"),
@@ -2629,6 +2735,7 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
                 "return_to_base",
                 {"entity_id": sorted(started)},
                 blocking=False,
+                context=call.context,
             )
 
     registrations: list[tuple[str, Any, vol.Schema, SupportsResponse]] = [
@@ -2658,6 +2765,8 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
         (SERVICE_DETECT_FIDUCIALS, _handle_detect_fiducials, DETECT_FIDUCIALS_SCHEMA, SupportsResponse.ONLY),
     ]
     for name, handler, schema, supports in registrations:
+        if name in ADMIN_SERVICES:
+            handler = _require_admin(hass, handler)
         if not hass.services.has_service(DOMAIN, name):
             hass.services.async_register(
                 DOMAIN, name, handler, schema=schema, supports_response=supports

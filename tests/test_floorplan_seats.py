@@ -44,6 +44,7 @@ def _bare_coordinator() -> AnyVacCoordinator:
     state set up. `_listeners` is DataUpdateCoordinator's own state, needed
     because `set_floorplan_seat` calls `async_update_listeners()`."""
     coord = object.__new__(AnyVacCoordinator)
+    coord._pending_saves = {}
     coord._floorplan_seats = {}
     coord._seats_store = _FakeStore()
     coord._listeners = {}
@@ -658,6 +659,7 @@ def test_two_floorplans_are_independent() -> None:
 
 async def _load_seats(load_value: Any) -> dict[str, dict[str, Any]]:
     coord = object.__new__(AnyVacCoordinator)
+    coord._pending_saves = {}
     coord._store = _FakeStore()
     coord._sel_store = _FakeStore()
     coord._pins_store = _FakeStore()

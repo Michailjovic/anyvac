@@ -2,7 +2,7 @@
 
 Pure Python + numpy, NO Home Assistant, NO opencv/scipy/scikit-image
 (docs/40 §6 "co NEDĚLAT"). Takes raw Roborock map dumps produced by
-``anyvac.dump_raw_map`` (config/www/anyvac/debug/*.bin, or the copies a user
+``anyvac.dump_raw_map`` (config/anyvac/debug/*.bin, or the copies a user
 placed under ``anyvac/tools/samples/``) and:
 
 1. Decodes each one's IMAGE block directly from bytes into numpy masks

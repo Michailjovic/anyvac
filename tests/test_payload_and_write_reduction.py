@@ -109,6 +109,7 @@ def test_saved_paths_are_simplified_but_endpoints_and_cursor_are_not() -> None:
     """`_paths_for_save` must shrink the on-disk copy without moving endpoints,
     and must leave `path_seen` (a RAW-point diff cursor) alone."""
     coord = object.__new__(coordinator_mod.AnyVacCoordinator)
+    coord._pending_saves = {}
     # A long straight run: nearly every interior point is redundant.
     straight = [{"x": float(i), "y": 0.0} for i in range(0, 3000, 3)]
     coord._dry_path = {"d1": [straight]}
@@ -133,6 +134,7 @@ def test_saved_paths_keep_real_corners() -> None:
     """The flip side: simplification must not flatten a path that has genuine
     shape — a zigzag has no redundant points to drop."""
     coord = object.__new__(coordinator_mod.AnyVacCoordinator)
+    coord._pending_saves = {}
     zig = _zigzag(500)
     coord._dry_path = {"d1": [zig]}
     coord._wet_path = {"d1": []}

@@ -69,6 +69,7 @@ class _TaskHass:
 
 def _listener_coordinator() -> AnyVacCoordinator:
     coord = object.__new__(AnyVacCoordinator)
+    coord._pending_saves = {}
     coord.hass = _TaskHass()
     coord._rb_listeners = {}
     coord._rb_seen_raw = {}
