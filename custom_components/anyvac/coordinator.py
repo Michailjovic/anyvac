@@ -38,7 +38,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
 from . import coverage as covmod
-from . import homeframe, livediff, localprobe
+from . import homeframe, livediff, localchannel
 from .const import (
     DEFAULT_EXPOSE_LEGACY_MM,
     DEFAULT_LIVE_DIFF,
@@ -1077,7 +1077,7 @@ def _compute_home_frame_result(
     return result
 
 
-def _extract_map(map_data: Any) -> dict[str, Any]:
+def _extract_map(map_data: Any, decimate: bool = True) -> dict[str, Any]:
     """Pull the fields the card needs out of a parser MapData object."""
     out: dict[str, Any] = {}
 
@@ -1102,7 +1102,11 @@ def _extract_map(map_data: Any) -> dict[str, Any]:
                 py = getattr(pt, "y", None)
                 if px is not None and py is not None:
                     flat.append({"x": px, "y": py})
-    out["path"] = _decimate(flat, PATH_MAX_POINTS)
+    # `decimate=False` (D4, 1.52.3): the decimated `path` / `mop_path` only feed the
+    # opt-in legacy mm attributes; with those off they were computed (20-40 ms per
+    # vacuum and poll, on the event loop) and then dropped. The raw list is handed
+    # over untouched — `_async_update_data` pops it, nothing else reads it.
+    out["path"] = _decimate(flat, PATH_MAX_POINTS) if decimate else flat
     out["path_points"] = len(flat)  # raw (undecimated) count — grows through the clean
 
     # Mop (wet) path as a separate layer.
@@ -1116,7 +1120,7 @@ def _extract_map(map_data: Any) -> dict[str, Any]:
                 my = getattr(pt, "y", None)
                 if mx is not None and my is not None:
                     mflat.append({"x": mx, "y": my})
-    out["mop_path"] = _decimate(mflat, PATH_MAX_POINTS)
+    out["mop_path"] = _decimate(mflat, PATH_MAX_POINTS) if decimate else mflat
     out["mop_path_points"] = len(mflat)
 
     # Rooms: {segment_number: Room} -> list of plain dicts.
@@ -3856,10 +3860,10 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             rb = self.roborock_coordinator_for(duid)
             if rb is None:
                 return
-            v1ch = localprobe.v1_channel_of(rb)
+            v1ch = localchannel.v1_channel_of(rb)
             if not getattr(v1ch, "is_local_connected", False):
                 return  # not a failure: no local connection right now
-            res = await localprobe.local_request(
+            res = await localchannel.local_request(
                 v1ch, "get_dynamic_map_diff",
                 timeout_s=LIVE_DIFF_TIMEOUT_S, watch_cloud=False,
             )
@@ -3912,11 +3916,14 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         trail = self._live.get(duid)
         if trail is None or trail.base != base:
             trail = self._live[duid] = livediff.LiveTrail(base=base)
-        if trail.apply(parsed):
-            self._live_pub[duid] = self._live_payload(device, trail)
-        # Listeners also on an empty answer: `live_stats` changed (docs/48
-        # follow-up diagnostics). Only `live_stats`/`live` differ, so the
-        # browser receives a few bytes.
+        if not trail.apply(parsed):
+            # An answer that moved nothing changes only the `live_stats` counters.
+            # Pushing those every 3 s is a `state_changed` per answer and with it a
+            # recorder row (47 rows in 3.5 min measured 2026-11-10, all with the
+            # same stored attributes — docs/49 D1). They ride along with the next
+            # real update or the regular poll instead.
+            return
+        self._live_pub[duid] = self._live_payload(device, trail)
         self.async_update_listeners()
 
     def _live_payload(self, device: AnyVacDevice, trail: livediff.LiveTrail) -> dict[str, Any]:
@@ -4006,7 +4013,8 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         if map_data is None:
             return None
 
-        data = _extract_map(map_data)
+        # `self` is None in unit tests that call this unbound — keep decimating there.
+        data = _extract_map(map_data, decimate=getattr(self, "_expose_legacy_mm", True))
         try:
             data["debug_map"] = _extract_debug(map_data)
         except Exception as err:  # noqa: BLE001 - debug data must never break the update

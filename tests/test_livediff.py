@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from custom_components.anyvac import livediff, localprobe
+from custom_components.anyvac import livediff, localchannel
 from custom_components.anyvac import coordinator as coordinator_mod
 from custom_components.anyvac.coordinator import AnyVacCoordinator, AnyVacDevice
 
@@ -147,14 +147,14 @@ async def test_fetch_failures_back_off(monkeypatch: pytest.MonkeyPatch) -> None:
     c = _coord()
     v1 = type("V1", (), {"is_local_connected": True})()
     c.roborock_coordinator_for = lambda duid: object()  # type: ignore[method-assign]
-    monkeypatch.setattr(localprobe, "v1_channel_of", lambda rb: v1)
+    monkeypatch.setattr(localchannel, "v1_channel_of", lambda rb: v1)
     calls: list[dict[str, Any]] = []
 
     async def no_answer(v1ch: Any, method: str, **kw: Any) -> dict[str, Any]:
         calls.append(kw)
         return {"ack": None}
 
-    monkeypatch.setattr(localprobe, "local_request", no_answer)
+    monkeypatch.setattr(localchannel, "local_request", no_answer)
     for _ in range(3):
         c._live_inflight.add("d1")
         await c._live_fetch("d1")
@@ -184,13 +184,13 @@ async def test_good_answer_resets_failures(monkeypatch: pytest.MonkeyPatch) -> N
     c = _coord()
     v1 = type("V1", (), {"is_local_connected": True})()
     c.roborock_coordinator_for = lambda duid: object()  # type: ignore[method-assign]
-    monkeypatch.setattr(localprobe, "v1_channel_of", lambda rb: v1)
+    monkeypatch.setattr(localchannel, "v1_channel_of", lambda rb: v1)
 
     async def answer(v1ch: Any, method: str, **kw: Any) -> dict[str, Any]:
         assert method == "get_dynamic_map_diff"
         return {"ack": _answer(870, T5)}
 
-    monkeypatch.setattr(localprobe, "local_request", answer)
+    monkeypatch.setattr(localchannel, "local_request", answer)
     c._live_fails["d1"] = 2
     await c._live_fetch("d1")
     assert c._live_fails["d1"] == 0 and c.live_for("d1")["seq"] == 1
@@ -202,12 +202,12 @@ async def test_firmware_without_the_diff_is_never_polled_again(monkeypatch: pyte
     c._live_stats, c._live_unsupported = {}, set()
     v1 = type("V1", (), {"is_local_connected": True})()
     c.roborock_coordinator_for = lambda duid: object()  # type: ignore[method-assign]
-    monkeypatch.setattr(localprobe, "v1_channel_of", lambda rb: v1)
+    monkeypatch.setattr(localchannel, "v1_channel_of", lambda rb: v1)
 
     async def rejected(v1ch: Any, method: str, **kw: Any) -> dict[str, Any]:
         return {"ack": None, "ack_error": "The method called is not recognized by the device."}
 
-    monkeypatch.setattr(localprobe, "local_request", rejected)
+    monkeypatch.setattr(localchannel, "local_request", rejected)
     await c._live_fetch("d1")
     assert "d1" in c._live_unsupported and c.live_stats_for("d1")["unsupported"] == "method"
     assert "d1" not in c._live_backoff  # not a transient failure
@@ -230,19 +230,21 @@ async def test_live_stats_count_what_the_diff_answers(monkeypatch: pytest.Monkey
     c._live_stats = {}
     v1 = type("V1", (), {"is_local_connected": True})()
     c.roborock_coordinator_for = lambda duid: object()  # type: ignore[method-assign]
-    monkeypatch.setattr(localprobe, "v1_channel_of", lambda rb: v1)
+    monkeypatch.setattr(localchannel, "v1_channel_of", lambda rb: v1)
     answers = iter([_answer(870, T5), _answer(None, None), None])
 
     async def answer(v1ch: Any, method: str, **kw: Any) -> dict[str, Any]:
         return {"ack": next(answers), "latency_ms": 20}
 
-    monkeypatch.setattr(localprobe, "local_request", answer)
+    monkeypatch.setattr(localchannel, "local_request", answer)
     for _ in range(3):
         await c._live_fetch("d1")
     st = c.live_stats_for("d1")
     assert (st["with_points"], st["empty"], st["no_answer"]) == (1, 1, 1)
     assert st["last"]["what"] == "no_answer"
-    assert c.updates == 2  # every parsed answer republishes (stats changed)
+    # Only the answer that moved the trail republishes (docs/49 D1): an empty answer
+    # changes just the counters, and pushing those every 3 s is a recorder row each.
+    assert c.updates == 1
     # Published as a copy: HA must see a different value next time.
     snap = c.live_stats_for("d1")
     snap["since_snapshot"]["empty"] = 99
@@ -259,7 +261,7 @@ async def test_answer_without_diff_while_cleaning_turns_live_off(monkeypatch: py
     c._live_stats, c._live_unsupported = {}, set()
     v1 = type("V1", (), {"is_local_connected": True})()
     c.roborock_coordinator_for = lambda duid: object()  # type: ignore[method-assign]
-    monkeypatch.setattr(localprobe, "v1_channel_of", lambda rb: v1)
+    monkeypatch.setattr(localchannel, "v1_channel_of", lambda rb: v1)
     answers = [{"nonce": 0, "result": 2}] * 3 + [_answer(870, T5)]
     answers += [{"nonce": 0, "result": 2}] * LIVE_DIFF_NODIFF_LIMIT
     it = iter(answers)
@@ -267,7 +269,7 @@ async def test_answer_without_diff_while_cleaning_turns_live_off(monkeypatch: py
     async def answer(v1ch: Any, method: str, **kw: Any) -> dict[str, Any]:
         return {"ack": next(it), "latency_ms": 7}
 
-    monkeypatch.setattr(localprobe, "local_request", answer)
+    monkeypatch.setattr(localchannel, "local_request", answer)
     for _ in range(4):
         await c._live_fetch("d1")
     st = c.live_stats_for("d1")

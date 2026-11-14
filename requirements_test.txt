@@ -1,3 +1,6 @@
-pytest>=7.0
-homeassistant>=2024.1
+pytest>=9.0
+pytest-asyncio>=1.0
+homeassistant>=2026.11
 voluptuous>=0.13
+numpy
+python-roborock>=7.22

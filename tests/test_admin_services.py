@@ -63,3 +63,13 @@ def test_admin_set_is_exactly_the_file_and_debug_services() -> None:
     for name in ("clean", "plan", "goto", "zone_clean", "cancel", "select_rooms", "set_layers"):
         assert name not in ADMIN_SERVICES
     assert services_mod.DEBUG_DUMP_DIR == "anyvac/debug"
+
+
+def test_run_job_service_is_gone() -> None:
+    """B3 (1.52.1): `anyvac.run_job` called any service with any data and ignored
+    the caller's context. Jobs start through `anyvac.clean` only."""
+    from custom_components.anyvac import services
+
+    assert not hasattr(services, "SERVICE_RUN_JOB")
+    assert "run_job" not in services.ALL_SERVICES
+    assert "run_job" not in services.ADMIN_SERVICES

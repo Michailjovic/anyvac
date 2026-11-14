@@ -204,3 +204,24 @@ async def test_select_that_did_not_take_is_reported_not_silent(monkeypatch):
     hass.states = SimpleNamespace(get=lambda eid: SimpleNamespace(state="off"))
     await runner._apply_selects([{"entity_id": "select.s7_mop", "option": "off"}])
     assert warned == []
+
+
+def test_legacy_path_is_only_decimated_when_it_is_exposed():
+    """D4 (1.52.3): `path` / `mop_path` feed only the opt-in legacy mm attributes —
+    with those off the RDP pass over them was wasted work on the event loop."""
+    from types import SimpleNamespace
+
+    # A wiggly line far longer than PATH_MAX_POINTS so decimation really shortens it.
+    n = coordinator_mod.PATH_MAX_POINTS * 3
+    pts = [SimpleNamespace(x=float(i * 40), y=float((i % 7) * 15 + (i % 3) * 9)) for i in range(n)]
+    md = SimpleNamespace(
+        vacuum_position=None, charger=None, rooms={}, cleaned_rooms=[], vacuum_room=None,
+        vacuum_room_name=None, image=None,
+        path=SimpleNamespace(path=[pts]), mop_path=SimpleNamespace(path=[pts]),
+    )
+    full = coordinator_mod._extract_map(md, decimate=True)
+    lazy = coordinator_mod._extract_map(md, decimate=False)
+    assert len(full["path"]) <= coordinator_mod.PATH_MAX_POINTS < n
+    assert len(lazy["path"]) == len(lazy["mop_path"]) == n
+    assert full["path_points"] == lazy["path_points"] == n
+    assert lazy["_path_dry"] == full["_path_dry"]  # the live trace is unaffected

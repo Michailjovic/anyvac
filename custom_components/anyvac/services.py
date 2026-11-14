@@ -11,9 +11,9 @@ Public command interface for the card (and automations):
 - ``anyvac.cancel``     — tear down running jobs and send the started robots home.
 - ``anyvac.select_rooms`` / ``anyvac.pin_room`` / ``anyvac.set_layers`` /
   ``anyvac.set_room_sequence`` / ``anyvac.reset_learning`` — state.
-- ``anyvac.run_job``    — INTERNAL executor (docs/14 §5: undocumented); kept
-                          registered for the transition period while the card still
-                          builds v1 plans, removed from docs in Fáze 3.
+  (``anyvac.run_job``, the old raw-task-list executor, was removed in 1.52.1: it
+  called any service with any data and never carried the caller's context. Jobs
+  start through ``anyvac.clean`` and the planner only.)
 - ``anyvac.snapshot_map_as_floorplan`` / ``anyvac.export_map_guide`` — custom
                           floorplan helpers (docs/30 §8, docs/37): save a
                           vacuum's own map as a static photo, and export its
@@ -74,7 +74,6 @@ from .planner import DEFAULT_ROOM_MIN, CleanPlanner, duid_for_entity, vacuum_ent
 
 _LOGGER = logging.getLogger(__name__)
 
-SERVICE_RUN_JOB = "run_job"
 SERVICE_SELECT_ROOMS = "select_rooms"
 SERVICE_PIN_ROOM = "pin_room"
 SERVICE_SET_LAYERS = "set_layers"
@@ -117,7 +116,6 @@ ADMIN_SERVICES: frozenset[str] = frozenset(
 )
 
 ALL_SERVICES = (
-    SERVICE_RUN_JOB,
     SERVICE_SELECT_ROOMS,
     SERVICE_PIN_ROOM,
     SERVICE_SET_LAYERS,
@@ -157,7 +155,6 @@ BATCH_WAIT_THRESHOLD_MIN = 3.0
 # estimate must never stall a batch indefinitely.
 BATCH_WAIT_CAP_MIN = 6.0
 
-RUN_JOB_SCHEMA = vol.Schema({vol.Required("tasks"): [dict]})
 SELECT_ROOMS_SCHEMA = vol.Schema(
     {
         vol.Optional("rooms", default=list): [str],
@@ -1900,9 +1897,6 @@ def _require_admin(hass: HomeAssistant, handler: Any) -> Any:
 def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one registrar
     """Register the AnyVac services (idempotent)."""
 
-    async def _handle_run_job(call: ServiceCall) -> None:
-        await _start_job(hass, list(call.data["tasks"]), context=call.context)
-
     async def _handle_select_rooms(call: ServiceCall) -> None:
         rooms = list(call.data.get("rooms", []))
         mode = call.data.get("mode", "set")
@@ -2746,7 +2740,6 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
             )
 
     registrations: list[tuple[str, Any, vol.Schema, SupportsResponse]] = [
-        (SERVICE_RUN_JOB, _handle_run_job, RUN_JOB_SCHEMA, SupportsResponse.NONE),
         (SERVICE_SELECT_ROOMS, _handle_select_rooms, SELECT_ROOMS_SCHEMA, SupportsResponse.NONE),
         (SERVICE_PIN_ROOM, _handle_pin_room, PIN_ROOM_SCHEMA, SupportsResponse.NONE),
         (SERVICE_SET_LAYERS, _handle_set_layers, SET_LAYERS_SCHEMA, SupportsResponse.NONE),

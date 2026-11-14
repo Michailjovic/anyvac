@@ -13,7 +13,7 @@ floorplan and run zone / pin-and-go cleaning with **no manual calibration**.
 
 - The official **Roborock** integration set up and working (AnyVac reads from it;
   it does not open its own Roborock connection).
-- Home Assistant 2024.1.0 or newer.
+- Home Assistant 2026.11.0 or newer (the version the integration is tested on; it also needs the official `roborock` integration).
 
 ## Install
 
@@ -199,8 +199,8 @@ closing) — the AnyVac card sends an *intent*, not a pre-built plan:
 A task started by `anyvac.clean` runs once its gating conditions (`anyvac_room_done` per
 room, or `anyvac_clean_finished` per vacuum) are met, so a wet robot follows a dry robot per
 room without colliding — and a robot never receives a new command while mid-clean (that would
-discard the one in progress). `anyvac.run_job` (raw task lists) also exists but is an internal
-implementation detail the card no longer builds plans for directly — use `anyvac.clean`.
+discard the one in progress). Jobs start through `anyvac.clean` only (the old raw-task-list
+service `anyvac.run_job` was removed in 1.52.1).
 
 ## Status
 

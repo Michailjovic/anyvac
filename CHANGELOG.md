@@ -6,6 +6,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.52.3] - 2026-11-14
+
+Card unchanged (1.52.0). Audit plan 1.51.5, steps D1, D2 and D4.
+
+### Fixed
+
+- **The live position poller no longer writes a database row every 3 seconds.**
+  An answer that moved nothing changed only the `live_stats` counters, and
+  pushing those was a `state_changed` per answer — 47 recorder rows in 3.5
+  minutes on 10 November, every one with the same stored attributes. Such
+  answers now ride along with the next real update or the regular poll. The
+  counters in the card's debug view therefore refresh a little less often while
+  the robot stands still.
+
+### Changed
+
+- **The local-RPC code behind the live poller has its own module,
+  `localchannel.py`.** It lived in `localprobe.py`, whose header said "DEBUG ONLY,
+  nothing here is used by the pipeline". The module now lists the python-roborock
+  internals it touches, and `tests/test_localchannel_contract.py` checks each one
+  against the installed library, so an upgrade that moves them fails a test
+  instead of silently switching the live poller off. `localprobe.py` keeps the
+  measuring tool (`probe_map_rate`).
+
+### Performance
+
+- **The legacy `path` / `mop_path` are only decimated when they are exposed.**
+  With the legacy mm attributes off (the default) the RDP pass over them cost
+  20–40 ms per vacuum and poll on the event loop, and the result was dropped.
+
+### Not done
+
+- D3 (does polling `get_dynamic_map_diff` every 3 s disturb the live map in the
+  Roborock app?) needs a hardware check; nothing changes until it is measured.
+
+## [1.52.2] - 2026-11-14
+
+Card unchanged (1.52.0). Audit plan 1.51.5, step C4.
+
+### Changed
+
+- **Minimum Home Assistant is now 2026.11.0** (`hacs.json`, README). The old
+  `2024.1.0` was never true: `sensor.py` imports `AddConfigEntryEntitiesCallback`,
+  which Home Assistant 2025.1 does not have, and the roborock integration's
+  `properties_api` that AnyVac reads is far newer. 2026.11 is what the test suite
+  runs on.
+- `requirements_test.txt` lists what the suite really needs: `pytest>=9`,
+  `pytest-asyncio`, `homeassistant>=2026.11`, `numpy`, `python-roborock>=7.22`.
+
+## [1.52.1] - 2026-11-14
+
+Card unchanged (1.52.0). Audit plan 1.51.5, step B3.
+
+### Removed
+
+- **`anyvac.run_job` is gone.** It took a raw list of tasks and called any service
+  with any data, and without the caller's context, so it sidestepped the permissions
+  of whoever called it. The card never used it (it was never in `services.yaml`);
+  jobs start through `anyvac.clean`, whose planner builds the tasks. Automations that
+  called `anyvac.run_job` directly must switch to `anyvac.clean`.
+
 ## [1.52.0] - 2026-11-14
 
 Card 1.52.0. Audit plan 1.51.5, block A (docs/49).
