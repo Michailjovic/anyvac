@@ -1598,20 +1598,7 @@ class _JobRunner:
         pt["dispatched"].update(rooms)
         self._pool_first_ready.pop(tid, None)  # reset for this pool's NEXT batch, if any
         entity = pt["vacuum"]
-        for sel in pt.get("selects") or []:
-            try:
-                await self.hass.services.async_call(
-                    "select",
-                    "select_option",
-                    {"entity_id": sel["entity_id"], "option": sel["option"]},
-                    blocking=True,
-                    context=self.context,
-                )
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.warning(
-                    "AnyVac run_job: select %s -> %s failed: %s",
-                    sel.get("entity_id"), sel.get("option"), err,
-                )
+        await self._apply_selects(pt.get("selects"))
         if pt.get("fan_speed"):
             try:
                 await self.hass.services.async_call(
@@ -1646,25 +1633,45 @@ class _JobRunner:
         self.awaiting_finish.add(pt["duid"])
         self.pool_busy[pt["duid"]] = tid
 
-    async def _run_task(self, task: dict[str, Any]) -> None:
-        # Pre-clean settings are best-effort: an unknown select option must not
-        # abort the clean command itself.
-        for sel in task.get("selects") or []:
+    async def _apply_selects(self, selects: list[dict[str, Any]] | None) -> None:
+        """Apply the pre-clean selects and CHECK that they took (docs/49 A5).
+
+        Best-effort on purpose — an unknown option must not abort the clean command
+        itself — but never silent: if `mop_intensity: off` is not in place the "dry"
+        robot mops. A failure or a state that did not follow is logged as a warning
+        and recorded in `job_progress.warnings`; the clean is not blocked."""
+        for sel in selects or []:
+            entity, option = sel.get("entity_id"), sel.get("option")
+            problem: str | None = None
             try:
                 await self.hass.services.async_call(
                     "select",
                     "select_option",
-                    {"entity_id": sel["entity_id"], "option": sel["option"]},
+                    {"entity_id": entity, "option": option},
                     blocking=True,
                     context=self.context,
                 )
             except Exception as err:  # noqa: BLE001
-                _LOGGER.warning(
-                    "AnyVac run_job: select %s -> %s failed: %s",
-                    sel.get("entity_id"),
-                    sel.get("option"),
-                    err,
-                )
+                problem = f"{entity} -> {option} failed: {err}"
+            else:
+                states = getattr(self.hass, "states", None)
+                if states is not None:
+                    # The integration may publish the new value a moment later.
+                    for attempt in range(6):
+                        state = states.get(entity)
+                        if state is None or state.state == option:
+                            break
+                        if attempt < 5:
+                            await asyncio.sleep(0.5)
+                    else:
+                        problem = f"{entity} is '{state.state}', expected '{option}'"
+            if problem:
+                _LOGGER.warning("AnyVac run_job: pre-clean setting did not take: %s", problem)
+                for coord in _coordinators(self.hass):
+                    coord.add_job_warning(problem)
+
+    async def _run_task(self, task: dict[str, Any]) -> None:
+        await self._apply_selects(task.get("selects"))
         if task.get("fan_speed") and task.get("vacuum"):
             try:
                 await self.hass.services.async_call(

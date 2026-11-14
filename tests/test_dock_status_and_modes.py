@@ -135,7 +135,7 @@ def test_mop_only_pass_with_legacy_fan_name_is_not_vacuuming() -> None:
             "state_name": "cleaning",
             "fan_speed_name": "off_raise_main_brush",
             "water_mode_name": "medium",
-            "is_water_box_carriage_attached": True,
+            "water_box_carriage_status": 1,
         }
     )
     data = _extract(coord)
@@ -151,7 +151,7 @@ def test_mop_only_pass_with_current_fan_name_is_not_vacuuming() -> None:
             "state_name": "cleaning",
             "fan_speed_name": "off",
             "water_mode_name": "medium",
-            "is_water_box_carriage_attached": True,
+            "water_box_carriage_status": 1,
         }
     )
     data = _extract(coord)

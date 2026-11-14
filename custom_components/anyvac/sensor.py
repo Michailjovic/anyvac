@@ -89,6 +89,8 @@ class AnyVacMapSensor(CoordinatorEntity[AnyVacCoordinator], SensorEntity):
             "live", "live_stats",
             # 1.51.6 (plan po auditu, A0) — polls around a clean's end.
             "clean_type_trace",
+            # docs/49 — the knob, the verdict's source and the last run's verdict.
+            "mode_signal", "clean_type_source", "last_run",
             # Kontrakt v3 (docs/40 §4.2 point 6) — additive, same "large/
             # fast-changing map payload" reasoning as the v2 *_px attributes above.
             "home_frame", "registration", "vacuum_position_home_px", "charger_home_px",

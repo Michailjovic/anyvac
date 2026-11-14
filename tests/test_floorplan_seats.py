@@ -671,6 +671,7 @@ async def _load_seats(load_value: Any) -> dict[str, dict[str, Any]]:
     coord._cov_legacy_pct_store = _FakeStore()
     coord._est_store = _FakeStore()
     coord._paths_store = _FakeStore()
+    coord._last_run_store = _FakeStore()
     coord._home_frame_store = _FakeStore()
     coord._floorplan_seats = {}  # __init__'s default, in case load_value isn't a dict
     await coord._async_setup()

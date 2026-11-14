@@ -142,16 +142,23 @@ for "overdue" logic (`now() - states(sensor) > N days`).
 
 | Event | Data |
 | --- | --- |
-| `anyvac_clean_started` | `{ vacuum, duid, clean_type }` — once per RUN |
-| `anyvac_clean_finished` | `{ vacuum, duid, clean_type, rooms, duration_min }` — once per OUTING |
+| `anyvac_clean_started` | `{ vacuum, duid, clean_type, clean_type_source }` — once per RUN |
+| `anyvac_clean_finished` | `{ vacuum, duid, clean_type, clean_type_source, kinds, rooms_kinds, rooms, duration_min }` — once per OUTING |
 | `anyvac_run_finished` | the same payload, plus `calibrated` (per room and kind: `before`/`after` estimate) — once per RUN, when the whole job is done and its calibration/coverage has been written |
-| `anyvac_room_done` | `{ vacuum, duid, room, reason }` — fired when a vacuum has truly left a room it was cleaning (`reason: "left"`, debounced over 2 polls) or on return-to-dock (`reason: "docked"`). The orchestrator's per-room "wet follows dry" signal. |
+| `anyvac_room_done` | `{ vacuum, duid, room, reason, kind, kinds }` — fired when a vacuum has truly left a room it was cleaning (`reason: "left"`, debounced over 2 polls) or on return-to-dock (`reason: "docked"`). The orchestrator's per-room "wet follows dry" signal. |
 
 **Run vs outing** (docs/36): a job dispatched progressively sends the robot out several times, with a
 dock trip between batches. `anyvac_clean_finished` fires on every one of those outings — the
 orchestrator listens on it to dispatch the next batch — while `anyvac_clean_started` /
 `anyvac_run_finished` bracket the whole job. **For a "cleaning done" notification, use
 `anyvac_run_finished`**: `clean_finished` would fire once per batch.
+
+**Kind of a run** (docs/49): `clean_type` is `dry`, `wet` or `both` (a combined pass leaves both
+footprints), or `null` when nothing is known. The run's real footprint decides; before it exists the job's
+plan; the water-mode knob only as a last resort and only the value held during active cleaning
+(`clean_type_source`: `evidence` / `plan` / `signal`). The map sensor publishes the running run's kind as
+`clean_type` (`null` when idle), the knob as `mode_signal`, and the last finished run as
+`last_run: { kind, source, finished_at, rooms }`.
 
 All events are fired **server-side** on the vacuum's cleaning transitions, so notifications built on
 them fire reliably whether or not the AnyVac card (or any dashboard) is open. `rooms` is the set of
@@ -164,7 +171,7 @@ rooms actually visited during the run; `duration_min` is the measured run length
 
 - *AnyVac — Room overdue* — pick a room timestamp sensor + threshold days + notify service + message.
 - *AnyVac — Clean finished* — fires on `anyvac_clean_finished`; message can use `{{ vacuum }}`,
-  `{{ clean_type }}`, `{{ rooms }}`.
+  `{{ clean_type }}`, `{{ clean_label }}` (`dry and wet` for `both`), `{{ rooms }}`.
 - *AnyVac — Vacuum error* — pick the error sensor + notify service + message (`{{ error }}`).
 
 Create an automation from one (Settings → Automations → Blueprints), choose your notify service and

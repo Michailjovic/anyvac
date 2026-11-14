@@ -85,17 +85,21 @@ def test_window_freezes_after_the_edge(monkeypatch: pytest.MonkeyPatch) -> None:
     assert coord._clean_type_trace("s7")["polls"] == polls
 
 
+ACTIVE = dict(status_state="segment_cleaning")
+
+
 @pytest.mark.parametrize(
     "run_polls, expected",
     [
-        # S1: the room is known during the run -> the session keeps "dry".
-        ([dict(clean_type="dry", vacuum_room_name="Hall", _path_dry=HALL)], "dry"),
-        # S2: no room name during the run -> no session value -> the edge poll's
-        # reset water mode wins.
-        ([dict(clean_type="dry", _path_dry=HALL)], "wet"),
+        # S1: the room is known during the run.
+        ([dict(clean_type="dry", vacuum_room_name="Hall", _path_dry=HALL, **ACTIVE)] * 2, "dry"),
+        # S2 (docs/49): no room name during the run. Used to announce "wet" (the
+        # edge poll's reset water mode won); the knob is now captured in active
+        # cleaning regardless of the room name.
+        ([dict(clean_type="dry", _path_dry=HALL, **ACTIVE)] * 2, "dry"),
     ],
 )
-def test_edge_event_clean_type_matches_the_fired_event(
+def test_finish_event_keeps_the_dry_verdict_after_the_knob_reset(
     monkeypatch: pytest.MonkeyPatch, run_polls, expected
 ) -> None:
     coord, clock = _rig(monkeypatch)
@@ -105,10 +109,8 @@ def test_edge_event_clean_type_matches_the_fired_event(
     for _ in range(1 + coordinator_mod._CT_TRACE_AFTER):
         _step(coord, clock, in_cleaning=False, vacuuming=False, clean_type="wet", _path_dry=HALL)
     trace = coord._clean_type_trace("s7")
-    edge = next(p for p in trace["polls"] if p["edge"])
     finished = [e for e in trace["events"] if e["event"] == "run_finished"]
     assert finished and finished[-1]["clean_type"] == expected
-    assert edge["event_clean_type"] == expected
 
 
 def test_events_are_bounded(monkeypatch: pytest.MonkeyPatch) -> None:

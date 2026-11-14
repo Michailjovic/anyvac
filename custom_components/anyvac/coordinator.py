@@ -1231,6 +1231,13 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # resets its settings to default at the end of a clean, so the clean_type read
         # at the finish poll is unreliable — capture it mid-clean instead.
         self._session_clean_type: dict[str, str] = {}
+        # First candidate of the two-poll stability check of that capture (docs/49).
+        self._signal_candidate: dict[str, str] = {}
+        # Verdict of the LAST finished run per vacuum: {kind, source, finished_at,
+        # rooms}. Persisted (`_last_run_store`) — the idle `clean_type` is null, so
+        # this is what a card/automation reads after the run (docs/49).
+        self._last_run_store: Store = Store(hass, 1, f"{DOMAIN}_last_run")
+        self._last_run: dict[str, dict[str, Any]] = {}
         # Diagnostics: the last single-room calibration decision per vacuum (for the
         # card's Debug tab) — so you can see exactly why an estimate did / didn't write.
         self._last_calib: dict[str, dict[str, Any]] = {}
@@ -2051,7 +2058,20 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             "passes_done": sum(1 for r in out_rows if r["state"] == "done"),
             "rooms": out_rows,
             "vacuums": vacs,
+            # docs/49 A5: pre-clean settings that did not take (e.g. the dry run's
+            # `mop_intensity: off`) — the run was NOT blocked, the card may say so.
+            "warnings": list(st.get("warnings") or []),
         }
+
+    def add_job_warning(self, text: str) -> None:
+        """Note a problem of the running job (shown in `job_progress.warnings`)."""
+        st = self._job_state
+        if st is None:
+            return
+        warnings = st.setdefault("warnings", [])
+        if text not in warnings:
+            warnings.append(text)
+            self.async_update_listeners()
 
     def set_job_rooms(self, duid: str, rooms: set[str] | None) -> None:
         """Plan-scope transit labeling (docs/17 §1.3) — called by services.py's
@@ -2296,7 +2316,9 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         dry_changed = gate_open and bool(new_by_layer["dry"])
         if dry_changed:
             segs = self._dry_path.setdefault(duid, [])
-            if not was_dry_open:
+            # `not segs`: the gate can open on a poll that brought no points yet
+            # (no segment was started then) — the first points must still get one.
+            if not was_dry_open or not segs:
                 segs.append([])
             segs[-1].extend(new_by_layer["dry"])
         self._dry_path_open[duid] = gate_open
@@ -2411,11 +2433,15 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 # Fire done/stamp only with real cleaning evidence — a confirmed room
                 # the robot merely drove through (dock in room) must not release the
                 # orchestrator's wet pass nor stamp history.
-                if self._evidence_kinds(device, prev):
+                kinds = self._evidence_kinds(device, prev)
+                if kinds:
                     self._stamp_room(device, prev)
                     self.hass.bus.async_fire(
                         f"{DOMAIN}_room_done",
-                        {"vacuum": device.name, "duid": duid, "room": prev, "reason": "docked"},
+                        {
+                            "vacuum": device.name, "duid": duid, "room": prev, "reason": "docked",
+                            "kind": self._kind_of(kinds), "kinds": list(kinds),
+                        },
                     )
                 else:
                     _LOGGER.debug("AnyVac: %s left %s without evidence — no room_done", device.name, prev)
@@ -2438,11 +2464,15 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             self._confirmed_room[duid] = raw
             self._session_confirmed.setdefault(duid, set()).add(raw)
             if prev:
-                if self._evidence_kinds(device, prev):
+                kinds = self._evidence_kinds(device, prev)
+                if kinds:
                     self._stamp_room(device, prev)
                     self.hass.bus.async_fire(
                         f"{DOMAIN}_room_done",
-                        {"vacuum": device.name, "duid": duid, "room": prev, "reason": "left"},
+                        {
+                            "vacuum": device.name, "duid": duid, "room": prev, "reason": "left",
+                            "kind": self._kind_of(kinds), "kinds": list(kinds),
+                        },
                     )
                 else:
                     _LOGGER.debug("AnyVac: %s left %s without evidence — no room_done", device.name, prev)
@@ -2490,6 +2520,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     if self._run_pending.pop(duid, None) is not None:
                         self._harvest_run(device)
                     self._session_clean_type.pop(duid, None)
+                    self._signal_candidate.pop(duid, None)
                     self._session_rooms[duid] = set()
                     self._session_confirmed[duid] = set()
                     self._room_elapsed[duid] = {}
@@ -2509,20 +2540,25 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     self._session_start[duid] = dt_util.utcnow()
                     # ``clean_started`` is a RUN-level signal (docs/36): a notification
                     # automation must not fire again for every batch of the same job.
+                    # The plan knows what the job ordered; with no job the knob is the
+                    # only hint (docs/49) — flagged as such in `clean_type_source`.
+                    ct_start, ct_src = self.resolve_run_kind(duid)
+                    if ct_start is None:
+                        ct_start = device.data.get("clean_type")
+                        ct_src = "signal" if ct_start else None
                     self.hass.bus.async_fire(
                         f"{DOMAIN}_clean_started",
-                        {"vacuum": device.name, "duid": duid, "clean_type": device.data.get("clean_type")},
+                        {
+                            "vacuum": device.name, "duid": duid,
+                            "clean_type": ct_start, "clean_type_source": ct_src,
+                        },
                     )
                 self._dry_path_open[duid] = False
                 self._wet_path_open[duid] = False
             room = device.data.get("vacuum_room_name")
             if room:
                 self._session_rooms.setdefault(duid, set()).add(room)
-                # Capture clean type only while genuinely cleaning a room (settings
-                # applied, before the end-of-clean reset to default).
-                ct_now = device.data.get("clean_type")
-                if ct_now in ("dry", "wet"):
-                    self._session_clean_type[duid] = ct_now
+            self._capture_signal(device)
         elif was:
             # The last seconds of cleaning arrive with this very poll (the firmware
             # refreshes the map on the state change) — attribute them BEFORE any
@@ -2580,17 +2616,105 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             return False
         return True
 
+    # -- docs/49: what KIND of run was it? ----------------------------------------
+    # One rule: EVIDENCE decides (the run's real dry/wet footprint); until evidence
+    # exists the job's PLAN says what it ordered; the mode KNOB comes last, and only
+    # the value captured during active cleaning (`_capture_signal`). The knob read at
+    # the finish poll is never used — the S7 MaxV firmware resets the water mode in
+    # the very state update that starts `returning_home`.
+
+    @staticmethod
+    def _kind_of(kinds: Any) -> str | None:
+        """{"dry"} → "dry", {"wet"} → "wet", both → "both", nothing → None."""
+        ks = {k for k in kinds if k in covmod.KINDS}
+        if len(ks) == len(covmod.KINDS):
+            return "both"
+        return next(iter(ks)) if ks else None
+
+    @staticmethod
+    def _kinds_list(kind: str | None) -> list[str]:
+        if kind == "both":
+            return list(covmod.KINDS)
+        return [kind] if kind in covmod.KINDS else []
+
+    def _run_evidence(self, duid: str) -> dict[str, list[str]]:
+        """{room: [kinds]} the running run has real footprint evidence for (lenient
+        5 % floor, rooms the run actually cleaned — `RunTracker.activated`)."""
+        run = self._runs.get(duid)
+        if run is None:
+            return {}
+        geo = (self._geo.get(duid) or (None, None, None))[2]
+        out: dict[str, list[str]] = {}
+        for nm in run.activated:
+            ks = [k for k in covmod.KINDS if run.floor_fraction(geo, nm, k) >= 0.05]
+            if ks:
+                out[nm] = ks
+        return out
+
+    def _plan_kinds(self, duid: str) -> set[str]:
+        """Kinds the registered job ordered of this robot (open passes first)."""
+        st = self._job_state
+        if not st:
+            return set()
+        rows = [r for r in st["passes"] if r.get("duid") == duid and r.get("kind") in covmod.KINDS]
+        open_rows = [r for r in rows if r.get("done_at") is None]
+        return {r["kind"] for r in (open_rows or rows)}
+
+    def resolve_run_kind(self, duid: str) -> tuple[str | None, str | None]:
+        """``(kind, source)`` of this vacuum's current run: kind ∈ dry | wet | both |
+        None, source ∈ evidence | plan | signal | None."""
+        kinds = {k for ks in self._run_evidence(duid).values() for k in ks}
+        if kinds:
+            return self._kind_of(kinds), "evidence"
+        plan = self._plan_kinds(duid)
+        if len(plan) == 1:
+            return next(iter(plan)), "plan"
+        sig = self._session_clean_type.get(duid)
+        if sig in covmod.KINDS:
+            return sig, "signal"
+        return None, None
+
+    def _capture_signal(self, device: AnyVacDevice) -> None:
+        """Remember the mode knob — only during active, non-transit cleaning, the
+        FIRST value that holds for two consecutive polls, independent of whether a
+        room name is known. No "last value wins": the end-of-clean reset would win."""
+        duid = device.duid
+        if duid in self._session_clean_type:
+            return
+        d = device.data
+        if (
+            not d.get("in_cleaning")
+            or d.get("transit")
+            or d.get("status_state") not in ACTIVE_CLEAN_STATES
+        ):
+            self._signal_candidate.pop(duid, None)
+            return
+        sig = d.get("clean_type")
+        if sig not in covmod.KINDS:
+            return
+        if self._signal_candidate.get(duid) == sig:
+            self._session_clean_type[duid] = sig
+            self._signal_candidate.pop(duid, None)
+        else:
+            self._signal_candidate[duid] = sig
+
+    def _last_run_for_save(self) -> dict[str, Any]:
+        return {duid: dict(rec) for duid, rec in self._last_run.items()}
+
     def _run_event(self, device: AnyVacDevice) -> dict[str, Any]:
         """The shared payload of ``clean_finished`` / ``run_finished``."""
         duid = device.duid
         started = self._session_start.get(duid)
         duration_min = round((dt_util.utcnow() - started).total_seconds() / 60) if started else None
+        kind, source = self.resolve_run_kind(duid)
         return {
             "vacuum": device.name,
             "duid": duid,
-            # Use the clean type captured *during* the clean, not the finish-poll value
-            # (the robot resets to its default mode at the end of a clean).
-            "clean_type": self._session_clean_type.get(duid) or device.data.get("clean_type"),
+            # docs/49: `both` is possible now (a combined pass leaves both footprints).
+            "clean_type": kind,
+            "clean_type_source": source,
+            "kinds": self._kinds_list(kind),
+            "rooms_kinds": self._run_evidence(duid),
             "rooms": sorted(self._session_rooms.get(duid, set())),
             "duration_min": duration_min,
         }
@@ -2608,7 +2732,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         duid = device.duid
         rooms = sorted(self._session_rooms.get(duid, set()))
         duration_min = self._run_event(device)["duration_min"]
-        ct = self._session_clean_type.get(duid) or device.data.get("clean_type")
+        ct, ct_source = self.resolve_run_kind(duid)
         # Continuous calibration (docs/16 §4): EVERY room the run finished is a
         # sample — a single-room clean is just the trivial case. Which rooms were
         # really cleaned (not driven through) and how complete they are comes from
@@ -2676,6 +2800,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         self._last_calib[duid] = {
             "at": dt_util.utcnow().isoformat(timespec="seconds"),
             "clean_type": ct,
+            "clean_type_source": ct_source,
             "duration_min": duration_min,
             "passes": run.passes,
             "cleaned_rooms": list(run.activated),
@@ -2705,11 +2830,12 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 kinds = self._room_pins.get(r)
                 if not kinds:
                     continue
-                if ct in ("dry", "wet"):
-                    if kinds.pop(ct, None) is not None:
-                        pins_changed = True
-                        if not kinds:
-                            self._room_pins.pop(r, None)
+                if ct in ("dry", "wet", "both"):
+                    for k in self._kinds_list(ct):
+                        if kinds.pop(k, None) is not None:
+                            pins_changed = True
+                    if not kinds:
+                        self._room_pins.pop(r, None)
                 else:
                     self._room_pins.pop(r, None)
                     pins_changed = True
@@ -2725,6 +2851,15 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         self._run_targets_seen.pop(duid, None)
         self._session_confirmed[duid] = set()
         self._session_clean_type.pop(duid, None)
+        self._signal_candidate.pop(duid, None)
+        if ct is not None or rooms:
+            self._last_run[duid] = {
+                "kind": ct,
+                "source": ct_source,
+                "finished_at": dt_util.utcnow().isoformat(timespec="seconds"),
+                "rooms": rooms,
+            }
+            self._delay_save(self._last_run_store, self._last_run_for_save, 2)
         return calibrated
 
     async def _async_setup(self) -> None:
@@ -2872,6 +3007,11 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 await legacy.async_remove()
             except Exception as err:  # noqa: BLE001 - housekeeping only
                 _LOGGER.debug("AnyVac: removing a legacy store failed: %s", err)
+        last_run = await self._last_run_store.async_load()
+        if isinstance(last_run, dict):
+            self._last_run = {
+                duid: dict(rec) for duid, rec in last_run.items() if isinstance(rec, dict)
+            }
         cov_pct = await self._cov_pct_store.async_load()
         if isinstance(cov_pct, dict):
             self._room_coverage = {
@@ -3222,7 +3362,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         geo = (self._geo.get(duid) or (None, None, None))[2]
         elapsed = self._room_elapsed.get(duid, {})
         ests = self._estimates.get(duid, {})
-        ctype = self._session_clean_type.get(duid) or device.data.get("clean_type")
+        ctype = self.resolve_run_kind(duid)[0]
         out: dict[str, dict[str, Any]] = {}
         for nm in run.activated:
             res = {k: run.kind_result(geo, nm, k) for k in covmod.KINDS}
@@ -3454,6 +3594,16 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     # counted. Replaces the docs/17 `transit_cells` debug counter.
                     device.data["coverage_debug"] = self._coverage_debug(device)
                     device.data["clean_type_trace"] = self._clean_type_trace(device.duid)
+                    # docs/49: `clean_type` is the verdict about the RUN (null when
+                    # idle); the knob itself — the old meaning — moves to `mode_signal`.
+                    device.data["mode_signal"] = device.data.get("clean_type")
+                    if device.data.get("in_cleaning") or device.duid in self._run_pending:
+                        kind, kind_src = self.resolve_run_kind(device.duid)
+                    else:
+                        kind = kind_src = None
+                    device.data["clean_type"] = kind
+                    device.data["clean_type_source"] = kind_src
+                    device.data["last_run"] = self._last_run.get(device.duid)
                     # Kontrakt v2 (docs/14 §3.6 + §5): geometry in rendered image
                     # PIXELS so the card never has to do mm math again.
                     aff = _solve_affine(device.data.get("calibration_points"))
@@ -3923,7 +4073,6 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             "mop_route_name": _s("mop_route_name"),
             "water_box_status": _s("water_box_status"),
             "water_box_carriage_status": _s("water_box_carriage_status"),
-            "is_water_box_carriage_attached": _s("is_water_box_carriage_attached"),
         }
         # Dock status (docs/26 §1 vrstva A — same `properties_api.status` object
         # already read above for mop_signal, zero new polls/risk). Backs the new
@@ -4027,11 +4176,16 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             if smart_wash is not None
             else None
         )
-        # Dry/wet: "wet" only when a water level is active AND the mop carriage is
-        # actually attached (docs/13 B2 — water set + mop pad removed used to record a
-        # dry clean as wet). Unknown attachment (None) keeps the water-mode verdict.
+        # Dry/wet MODE SIGNAL: "wet" only when a water level is active AND the mop
+        # carriage is actually attached (docs/13 B2 — water set + mop pad removed used
+        # to record a dry clean as wet). python-roborock only knows
+        # `water_box_carriage_status` (0/1) — the `is_water_box_carriage_attached`
+        # this once read does not exist (docs/49, P1), so the "no carriage → dry"
+        # branch never ran. Unknown attachment (None) keeps the water-mode verdict.
+        # This is only the knob: the verdict about a RUN is `resolve_run_kind`.
         water_active = bool(water_name) and not _mode_is_off(water_name)
-        attached = _s("is_water_box_carriage_attached")
+        carriage = _s("water_box_carriage_status")
+        attached = None if carriage is None else bool(carriage)
         data["clean_type"] = (
             "wet" if water_active and (attached is None or bool(attached)) else "dry"
         )

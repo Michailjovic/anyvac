@@ -6,6 +6,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.52.0] - 2026-11-14
+
+Card 1.52.0. Audit plan 1.51.5, block A (docs/49).
+
+### Fixed
+
+- **A dry run is no longer announced as wet.** The S7 MaxV firmware resets its water
+  mode in the very state update that starts `returning_home`, and AnyVac only
+  remembered the mode while it knew a room name — so a run without one fell back to
+  the already-reset knob. The kind of a run is now decided by its real dry/wet
+  footprint, then the job's plan, and only last by the mode knob, captured during
+  active cleaning (first value held for two polls, whatever the room name).
+  `anyvac_clean_started`, `anyvac_clean_finished` and `anyvac_run_finished` carry
+  the corrected `clean_type`; the automation that reads it needs no change.
+- **The mop-carriage check works.** AnyVac read `is_water_box_carriage_attached`,
+  which python-roborock never had, so "mop pad removed → dry" never ran. It now
+  uses `water_box_carriage_status`.
+- **A first poll without trajectory points no longer loses the next poll.** The
+  dry-trace gate could open before any point existed; the next poll's first points
+  then hit an `IndexError`.
+
+### Added
+
+- Map sensor attributes `mode_signal` (the water-mode knob — what `clean_type` used
+  to show), `clean_type_source` and `last_run` (`{kind, source, finished_at, rooms}`,
+  persisted). **`clean_type` itself now describes the running run and is `null` when
+  idle.**
+- `clean_type` may be `both` (a combined pass). Events also carry `clean_type_source`,
+  `kinds` and `rooms_kinds`; `anyvac_room_done` carries `kind` / `kinds`. The
+  "Clean finished" blueprint gains `{{ clean_label }}`.
+- A pre-clean setting that does not take (for example `mop_intensity: off`) is checked
+  after it is applied: a warning in the log and `job_progress.warnings`. The clean is
+  not blocked.
+
+### Tests
+
+- 13 new tests (`tests/test_run_kind.py`), including a contract test that every
+  status name the coordinator reads exists in the installed python-roborock.
+  Full suite: 481 passed (HA 2026.11.1).
+
 ## [1.51.9] - 2026-11-13
 
 Card unchanged (1.51.5). Audit plan 1.51.5, steps C1–C3.

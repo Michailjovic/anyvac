@@ -2,7 +2,8 @@ blueprint:
   name: AnyVac — Clean finished
   description: >
     Notify when an AnyVac vacuum finishes cleaning. Fires on the anyvac_clean_finished
-    event. You can use {{ vacuum }}, {{ clean_type }} and {{ rooms }} in the message.
+    event. You can use {{ vacuum }}, {{ clean_type }}, {{ clean_label }} and {{ rooms }} in
+    the message. clean_type is dry, wet or both (a combined pass).
   domain: automation
   input:
     notify_service:
@@ -24,8 +25,8 @@ blueprint:
         text:
     message:
       name: Message
-      description: "Available: {{ vacuum }}, {{ clean_type }}, {{ rooms }}."
-      default: "{{ vacuum }} finished {{ clean_type }} cleaning: {{ rooms | join(', ') }}"
+      description: "Available: {{ vacuum }}, {{ clean_type }}, {{ clean_label }}, {{ rooms }}."
+      default: "{{ vacuum }} finished {{ clean_label }} cleaning: {{ rooms | join(', ') }}"
       selector:
         text:
           multiline: true
@@ -44,6 +45,9 @@ action:
   - variables:
       vacuum: "{{ trigger.event.data.vacuum }}"
       clean_type: "{{ trigger.event.data.clean_type }}"
+      clean_label: >
+        {{ 'dry and wet' if trigger.event.data.clean_type == 'both'
+           else (trigger.event.data.clean_type or 'unknown') }}
       rooms: "{{ trigger.event.data.rooms }}"
   - service: !input notify_service
     data:

@@ -143,6 +143,7 @@ async def _load_pins(load_value: Any) -> dict[str, dict[str, str]]:
     coord._cov_legacy_pct_store = _FakeStore()
     coord._est_store = _FakeStore()
     coord._paths_store = _FakeStore()
+    coord._last_run_store = _FakeStore()
     coord._home_frame_store = _FakeStore()
     coord._room_pins = {}  # __init__'s default, in case `load_value` isn't a dict
     await coord._async_setup()
@@ -192,7 +193,7 @@ def _pin_lifecycle_coordinator(clock_now: datetime) -> AnyVacCoordinator:
     coord = object.__new__(AnyVacCoordinator)
     coord._pending_saves = {}
     coord.hass = _FakeHass()
-    for attr in ("_store", "_est_store", "_cov_store", "_cov_pct_store", "_cov_legacy_pct_store", "_sel_store", "_seq_store", "_layers_store", "_paths_store"):
+    for attr in ("_store", "_est_store", "_cov_store", "_cov_pct_store", "_cov_legacy_pct_store", "_sel_store", "_seq_store", "_layers_store", "_paths_store", "_last_run_store"):
         setattr(coord, attr, _FakeStore())
     coord._pins_store = _FakeStore()
     coord._history = {}
@@ -205,6 +206,10 @@ def _pin_lifecycle_coordinator(clock_now: datetime) -> AnyVacCoordinator:
     coord._confirmed_room = {}
     coord._session_confirmed = {}
     coord._session_clean_type = {}
+    coord._signal_candidate = {}
+    coord._last_run = {}
+    coord._last_run_store = _FakeStore()
+    coord._job_state = None
     coord._last_calib = {}
     coord._selected_rooms = set()
     coord._room_pins = {}
@@ -260,10 +265,14 @@ def _run_dry_session_on_hall(coord: AnyVacCoordinator, duid: str) -> None:
     `ct == "dry"`. Deliberately not chasing the calibration coverage floor
     (irrelevant here: the pin-clear reads `_session_rooms`, not calibration
     acceptance)."""
-    coord._update_history(_device(duid, vacuum_room_name="Hall"))
-    coord._detect_room_done(_device(duid, vacuum_room_name="Hall"))
-    coord._track_and_emit(_device(duid, vacuum_room_name="Hall"))
-    coord._attribute_points(_device(duid, vacuum_room_name="Hall"))
+    # Two polls: the mode knob only counts once it held for two consecutive polls
+    # of active cleaning (docs/49).
+    for _ in range(2):
+        poll = _device(duid, vacuum_room_name="Hall", status_state="segment_cleaning")
+        coord._update_history(poll)
+        coord._detect_room_done(poll)
+        coord._track_and_emit(poll)
+        coord._attribute_points(poll)
     finishing = _device(duid, in_cleaning=False)
     coord._update_history(finishing)
     coord._detect_room_done(finishing)

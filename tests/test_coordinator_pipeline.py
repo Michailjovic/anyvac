@@ -84,7 +84,7 @@ def _new_coordinator(monkeypatch: pytest.MonkeyPatch, clock: _Clock) -> AnyVacCo
     coord.hass = _FakeHass()
     for attr in (
         "_store", "_est_store", "_cov_store", "_cov_pct_store", "_cov_legacy_pct_store", "_sel_store",
-        "_pins_store", "_seq_store", "_layers_store", "_paths_store",
+        "_pins_store", "_seq_store", "_layers_store", "_paths_store", "_last_run_store",
     ):
         setattr(coord, attr, _FakeStore())
     coord._history = {}
@@ -97,6 +97,10 @@ def _new_coordinator(monkeypatch: pytest.MonkeyPatch, clock: _Clock) -> AnyVacCo
     coord._confirmed_room = {}
     coord._session_confirmed = {}
     coord._session_clean_type = {}
+    coord._signal_candidate = {}
+    coord._last_run = {}
+    coord._last_run_store = _FakeStore()
+    coord._job_state = None
     coord._last_calib = {}
     coord._selected_rooms = set()
     coord._room_pins = {}
