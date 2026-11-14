@@ -191,7 +191,7 @@ def _task() -> dict[str, Any]:
 
 @pytest.mark.asyncio
 async def test_runner_registers_marks_and_clears_the_plan(monkeypatch: pytest.MonkeyPatch) -> None:
-    hass = SimpleNamespace(bus=_Bus(), services=_Svc(), data={})
+    hass = SimpleNamespace(bus=_Bus(), services=_Svc(), data={}, async_create_task=lambda coro: coro.close())
     coord = _RecCoord()
     monkeypatch.setattr(services_mod, "_coordinators", lambda h: [coord])
     monkeypatch.setattr(services_mod, "async_call_later", lambda *a, **k: (lambda: None))
@@ -207,7 +207,7 @@ async def test_runner_registers_marks_and_clears_the_plan(monkeypatch: pytest.Mo
 
 @pytest.mark.asyncio
 async def test_raw_run_job_without_a_plan_never_touches_job_progress(monkeypatch: pytest.MonkeyPatch) -> None:
-    hass = SimpleNamespace(bus=_Bus(), services=_Svc(), data={})
+    hass = SimpleNamespace(bus=_Bus(), services=_Svc(), data={}, async_create_task=lambda coro: coro.close())
     monkeypatch.setattr(services_mod, "_coordinators", lambda h: [_BareCoord()])
     monkeypatch.setattr(services_mod, "async_call_later", lambda *a, **k: (lambda: None))
     monkeypatch.setattr(services_mod.dt_util, "utcnow", lambda: T0)

@@ -206,6 +206,85 @@ async def test_select_that_did_not_take_is_reported_not_silent(monkeypatch):
     assert warned == []
 
 
+def _runner(monkeypatch, states_get, warned, call=None, data=None):
+    import custom_components.anyvac.services as services_mod
+    from types import SimpleNamespace
+
+    class _Coord:
+        def __init__(self):
+            self.data = data or {}
+
+        def add_job_warning(self, text):
+            warned.append(text)
+
+    async def _default_call(domain, service, payload, blocking=False, context=None):
+        return None
+
+    async def _no_sleep(_):
+        return None
+
+    hass = SimpleNamespace(
+        services=SimpleNamespace(async_call=call or _default_call),
+        states=SimpleNamespace(get=states_get),
+    )
+    runner = object.__new__(services_mod._JobRunner)
+    runner.hass, runner.context, runner._closed = hass, None, False
+    monkeypatch.setattr(services_mod, "_coordinators", lambda h: [_Coord()])
+    monkeypatch.setattr(services_mod.asyncio, "sleep", _no_sleep)
+    return runner
+
+
+@pytest.mark.asyncio
+async def test_select_of_a_robot_without_a_mop_is_not_a_job_warning(monkeypatch):
+    """An S6 has a `mop_intensity` select that is always "unknown"; forcing it to
+    `off` fails on every start. That is noise, not a problem of the run."""
+    from types import SimpleNamespace
+
+    warned: list[str] = []
+
+    async def _boom(domain, service, payload, blocking=False, context=None):
+        raise RuntimeError("Error while calling SET_WATER_BOX_CUSTOM_MODE")
+
+    runner = _runner(monkeypatch, lambda eid: SimpleNamespace(state="unknown"), warned, call=_boom)
+    await runner._apply_selects([{"entity_id": "select.s6_mop_intensity", "option": "off"}])
+    assert warned == []
+
+    # ...but the same failure on a select that HAS a value is still reported.
+    runner = _runner(monkeypatch, lambda eid: SimpleNamespace(state="mild"), warned, call=_boom)
+    await runner._apply_selects([{"entity_id": "select.s7_mop_intensity", "option": "off"}])
+    assert len(warned) == 1
+
+
+@pytest.mark.asyncio
+async def test_requested_passes_are_checked_against_what_the_robot_reports(monkeypatch):
+    """The robot reports the passes of a running clean. A firmware that ignores
+    `repeat` shows 1 while 2 were asked for — a warning on the job."""
+    from types import SimpleNamespace
+
+    def dev(rep):
+        return SimpleNamespace(data={"repeat": rep})
+
+    warned: list[str] = []
+    runner = _runner(monkeypatch, lambda eid: None, warned, data={"duid1": dev(1)})
+    await runner._verify_repeat("duid1", "vacuum.s6", 2)
+    assert warned == ["vacuum.s6: asked for 2 passes, the robot reports 1"]
+
+    warned.clear()
+    runner = _runner(monkeypatch, lambda eid: None, warned, data={"duid1": dev(2)})
+    await runner._verify_repeat("duid1", "vacuum.s6", 2)
+    assert warned == []
+
+    # Nothing reported at all: only a log line, never a warning.
+    runner = _runner(monkeypatch, lambda eid: None, warned, data={"duid1": dev(None)})
+    await runner._verify_repeat("duid1", "vacuum.s6", 2)
+    assert warned == []
+
+    # One pass asked for: nothing to verify.
+    runner = _runner(monkeypatch, lambda eid: None, warned, data={"duid1": dev(1)})
+    await runner._verify_repeat("duid1", "vacuum.s6", 1)
+    assert warned == []
+
+
 def test_legacy_path_is_only_decimated_when_it_is_exposed():
     """D4 (1.52.3): `path` / `mop_path` feed only the opt-in legacy mm attributes —
     with those off the RDP pass over them was wasted work on the event loop."""

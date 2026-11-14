@@ -88,6 +88,10 @@ class _FakeHass:
         self.services = _FakeServices()
         self.data: dict[str, Any] = {}
 
+    def async_create_task(self, coro):
+        # the post-dispatch repeat check is a background task; not under test here
+        coro.close()
+
 
 class _FakeCoord:
     """Records the plan-scope lifecycle so a test can assert when the scope is

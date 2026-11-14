@@ -1620,7 +1620,10 @@ class _JobRunner:
                 blocking=True,
                     context=self.context,
             )
-            _LOGGER.info("AnyVac pool %s (%s): dispatched %s", tid, entity, sorted(rooms))
+            _LOGGER.info(
+                "AnyVac pool %s (%s): dispatched %s, repeat=%s", tid, entity, sorted(rooms), pt.get("repeat", 1)
+            )
+            self.hass.async_create_task(self._verify_repeat(pt.get("duid"), entity, int(pt.get("repeat", 1) or 1)))
         except Exception as err:  # noqa: BLE001 - one bad batch must not wedge the job
             _LOGGER.warning(
                 "AnyVac run_job: pool task %s batch %s failed: %s", tid, rooms, err
@@ -1629,6 +1632,38 @@ class _JobRunner:
         self.started_vacuums.add(entity)
         self.awaiting_finish.add(pt["duid"])
         self.pool_busy[pt["duid"]] = tid
+
+    async def _verify_repeat(self, duid: str | None, entity: str, expected: int) -> None:
+        """Did the robot take the requested number of passes? (docs/49 A5 follow-up)
+
+        `app_segment_clean` carries `repeat`, but a firmware can silently ignore it
+        (or a per-room custom mode can override it). The robot reports the passes of
+        a RUNNING clean in its status, so look at it a couple of polls after the
+        dispatch. A different value is a warning on the job; a robot that reports
+        nothing is only logged — absence is not proof of a problem."""
+        if not duid or expected <= 1:
+            return
+        seen: Any = None
+        for _ in range(8):
+            await asyncio.sleep(10)
+            if self._closed:
+                return
+            for coord in _coordinators(self.hass):
+                device = (getattr(coord, "data", None) or {}).get(duid)
+                rep = getattr(device, "data", {}).get("repeat") if device is not None else None
+                if rep is not None:
+                    seen = rep
+            if seen is not None:
+                break
+        if seen is None:
+            _LOGGER.info("AnyVac %s: asked for %s passes, the robot does not report them", entity, expected)
+        elif int(seen) != int(expected):
+            problem = f"{entity}: asked for {expected} passes, the robot reports {seen}"
+            _LOGGER.warning("AnyVac run_job: %s", problem)
+            for coord in _coordinators(self.hass):
+                coord.add_job_warning(problem)
+        else:
+            _LOGGER.info("AnyVac %s: robot confirms %s passes", entity, seen)
 
     async def _apply_selects(self, selects: list[dict[str, Any]] | None) -> None:
         """Apply the pre-clean selects and CHECK that they took (docs/49 A5).
@@ -1640,6 +1675,12 @@ class _JobRunner:
         for sel in selects or []:
             entity, option = sel.get("entity_id"), sel.get("option")
             problem: str | None = None
+            states = getattr(self.hass, "states", None)
+            before = states.get(entity) if states is not None else None
+            # A select that has no value at all (a robot with no mop, like an S6, still
+            # gets a `mop_intensity` select from the integration, always "unknown")
+            # cannot matter for the run — its failure is not a job warning.
+            inert = before is not None and before.state in ("unknown", "unavailable")
             try:
                 await self.hass.services.async_call(
                     "select",
@@ -1649,6 +1690,9 @@ class _JobRunner:
                     context=self.context,
                 )
             except Exception as err:  # noqa: BLE001
+                if inert:
+                    _LOGGER.debug("AnyVac: %s has no value, %s -> %s skipped: %s", entity, entity, option, err)
+                    continue
                 problem = f"{entity} -> {option} failed: {err}"
             else:
                 states = getattr(self.hass, "states", None)
@@ -1690,6 +1734,11 @@ class _JobRunner:
                 blocking=True,
                 context=self.context,
             )
+            _LOGGER.info("AnyVac task %s: %s %s", task.get("id"), service, task.get("service_data"))
+            params = (task.get("service_data") or {}).get("params") or []
+            wanted = params[0].get("repeat", 1) if params and isinstance(params[0], dict) else 1
+            if task.get("duid") and task.get("vacuum") and isinstance(wanted, int):
+                self.hass.async_create_task(self._verify_repeat(task["duid"], task["vacuum"], wanted))
             if task.get("vacuum"):
                 self.started_vacuums.add(task["vacuum"])
             # Keep the job alive until this robot reports `anyvac_clean_finished`

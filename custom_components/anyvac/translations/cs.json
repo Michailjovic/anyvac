@@ -1,0 +1,358 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "AnyVac",
+        "description": "AnyVac čte zpracovaná data mapy (polohu robota, trasu úklidu, místnosti, kalibrační body) z tvé stávající integrace Roborock a zpřístupňuje je kartě AnyVac. Nejdřív nastav integraci Roborock."
+      }
+    },
+    "abort": {
+      "already_configured": "AnyVac je již nastaven."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Možnosti AnyVac",
+        "data": {
+          "expose_legacy_mm_attributes": "Publikovat starší atributy trasy v milimetrech",
+          "live_position_local": "Živá poloha z lokálního spojení"
+        },
+        "data_description": {
+          "expose_legacy_mm_attributes": "Vrátí na senzor mapy pole trasy z verzí před v2 v milimetrech (path, mop_path, path_dry, path_wet). Karta AnyVac je nepoužívá – čte atributy v pixelech – a přidávají zhruba 220 KB na vysavač do každé 30sekundové aktualizace posílané do prohlížeče. Zapni jen pokud tyto atributy čtou tvoje vlastní automatizace nebo šablony.",
+          "live_position_local": "Během úklidu se vysavače každých pár sekund ptá přes lokální spojení na polohu a nejnovější část stopy, takže se mapa hýbe i mezi 30sekundovými aktualizacemi oficiální integrace. Nepoužívá cloud. Vypni, pokud se vysavač s tím chová špatně."
+        }
+      }
+    }
+  },
+  "services": {
+    "clean": {
+      "name": "Uklidit",
+      "description": "Pošle plánovači AnyVac záměr úklidu (místnosti + režim). Backend rozdělí místnosti mezi schopné vysavače, vyřeší připnutí a spustí úlohu na serveru (suchý → mokrý, opakování, nastavení mopu). Toto volá tlačítko Start na kartě.",
+      "fields": {
+        "rooms": {
+          "name": "Místnosti",
+          "description": "Názvy místností podle aplikace Roborock (ne oblasti HA)."
+        },
+        "mode": {
+          "name": "Režim",
+          "description": "Které průchody spustit (suchý, mokrý, oba)."
+        },
+        "vacuums": {
+          "name": "Vysavače",
+          "description": "Omezení, které vysavače smí být použity. Seznam entit/duid, nebo objekt s oddělenými seznamy dry/wet."
+        },
+        "pin": {
+          "name": "Přepsání připnutí",
+          "description": "Jednorázové přepsání uložených připnutí místností (objekt podle názvu místnosti s volitelným dry/wet)."
+        },
+        "settings": {
+          "name": "Nastavení",
+          "description": "Nastavení sání/mopu pro jednotlivé vysavače a průchody (fan_speed, mop_mode, mop_intensity, repeat)."
+        }
+      }
+    },
+    "plan": {
+      "name": "Plán (náhled)",
+      "description": "Stejný plánovač jako anyvac.clean, ale jen vrací odpověď – přiřazení a odhad času, nic nespouští.",
+      "fields": {
+        "rooms": {
+          "name": "Místnosti",
+          "description": "Názvy místností podle aplikace Roborock."
+        },
+        "mode": {
+          "name": "Režim",
+          "description": "Které průchody spustit (suchý, mokrý, oba)."
+        },
+        "vacuums": {
+          "name": "Vysavače",
+          "description": "Omezení vysavačů – stejný tvar jako u anyvac.clean."
+        },
+        "pin": {
+          "name": "Přepsání připnutí",
+          "description": "Jednorázové přepsání připnutí – stejný tvar jako u anyvac.clean."
+        },
+        "settings": {
+          "name": "Nastavení",
+          "description": "Nastavení sání/mopu – stejný tvar jako u anyvac.clean."
+        }
+      }
+    },
+    "goto": {
+      "name": "Špendlík a jeď",
+      "description": "Pošle vysavač na jeden bod – v procentech jeho mapy (výchozí), nebo s frame: \"home\" v pixelech sdíleného rámce bytu.",
+      "fields": {
+        "entity_id": {
+          "name": "Vysavač",
+          "description": "Entita vysavače."
+        },
+        "duid": {
+          "name": "Vysavač (duid)",
+          "description": "Alternativa k entitě – duid vysavače."
+        },
+        "frame": {
+          "name": "Souřadnicový rámec",
+          "description": "Percenta mapy (výchozí), nebo „home“ pro pixely rámce bytu."
+        },
+        "x_pct": {
+          "name": "X (%)",
+          "description": "Vodorovná poloha v procentech mapy."
+        },
+        "y_pct": {
+          "name": "Y (%)",
+          "description": "Svislá poloha v procentech mapy."
+        },
+        "x_home_px": {
+          "name": "X (px rámce bytu)",
+          "description": "Vodorovná poloha v pixelech rámce bytu."
+        },
+        "y_home_px": {
+          "name": "Y (px rámce bytu)",
+          "description": "Svislá poloha v pixelech rámce bytu."
+        }
+      }
+    },
+    "zone_clean": {
+      "name": "Úklid zóny",
+      "description": "Uklidí obdélníkovou zónu zadanou dvěma protilehlými rohy – v procentech mapy, nebo s frame: \"home\" v pixelech rámce bytu.",
+      "fields": {
+        "entity_id": {
+          "name": "Vysavač",
+          "description": "Entita vysavače."
+        },
+        "duid": {
+          "name": "Vysavač (duid)",
+          "description": "Alternativa k entitě – duid vysavače."
+        },
+        "frame": {
+          "name": "Souřadnicový rámec",
+          "description": "Percenta mapy (výchozí), nebo „home“ pro pixely rámce bytu."
+        },
+        "x1_pct": {
+          "name": "X1 (%)",
+          "description": "První roh – vodorovně."
+        },
+        "y1_pct": {
+          "name": "Y1 (%)",
+          "description": "První roh – svisle."
+        },
+        "x2_pct": {
+          "name": "X2 (%)",
+          "description": "Protilehlý roh – vodorovně."
+        },
+        "y2_pct": {
+          "name": "Y2 (%)",
+          "description": "Protilehlý roh – svisle."
+        },
+        "x1_home_px": {
+          "name": "X1 (px rámce bytu)",
+          "description": "První roh – vodorovně, pixely rámce bytu."
+        },
+        "y1_home_px": {
+          "name": "Y1 (px rámce bytu)",
+          "description": "První roh – svisle, pixely rámce bytu."
+        },
+        "x2_home_px": {
+          "name": "X2 (px rámce bytu)",
+          "description": "Protilehlý roh – vodorovně, pixely rámce bytu."
+        },
+        "y2_home_px": {
+          "name": "Y2 (px rámce bytu)",
+          "description": "Protilehlý roh – svisle, pixely rámce bytu."
+        },
+        "repeat": {
+          "name": "Opakování",
+          "description": "Kolikrát zónu projet."
+        }
+      }
+    },
+    "cancel": {
+      "name": "Zrušit",
+      "description": "Ukončí všechny běžící úlohy AnyVac a zastaví zúčastněné vysavače.",
+      "fields": {
+        "return_to_base": {
+          "name": "Vrátit do doku",
+          "description": "Po zastavení poslat vysavače do doku."
+        }
+      }
+    },
+    "select_rooms": {
+      "name": "Vybrat místnosti",
+      "description": "Změní sdílený výběr místností v doku karty (které místnosti jsou ve frontě k úklidu). Určeno hlavně pro samotnou kartu.",
+      "fields": {
+        "rooms": {
+          "name": "Místnosti",
+          "description": "Názvy vybraných místností."
+        },
+        "mode": {
+          "name": "Režim",
+          "description": "Režim plánu (dry / wet / both)."
+        }
+      }
+    },
+    "pin_room": {
+      "name": "Připnout místnost",
+      "description": "Přepíše, který vysavač uklízí místnost v daném průchodu (suchém nebo mokrém), nezávisle na automatickém rozdělení. Připnutí je sdílené mezi všemi dashboardy.",
+      "fields": {
+        "room": {
+          "name": "Místnost",
+          "description": "Název místnosti."
+        },
+        "kind": {
+          "name": "Průchod",
+          "description": "dry, nebo wet."
+        },
+        "vacuum": {
+          "name": "Vysavač",
+          "description": "Entita/duid vysavače; prázdné zruší připnutí."
+        }
+      }
+    },
+    "set_layers": {
+      "name": "Nastavit vrstvy mapy",
+      "description": "Nastaví sdílenou viditelnost suché/mokré stopy na mapě (synchronizováno mezi všemi dashboardy a prohlížeči).",
+      "fields": {
+        "dry": {
+          "name": "Suchá stopa viditelná",
+          "description": "Zobrazit suchou stopu."
+        },
+        "wet": {
+          "name": "Mokrá stopa viditelná",
+          "description": "Zobrazit mokrou stopu."
+        }
+      }
+    },
+    "set_room_sequence": {
+      "name": "Nastavit pořadí místností",
+      "description": "Nahradí uložené pořadí úklidu místností (používá se pro odhad času podle pořadí). Posílá se celý seřazený seznam.",
+      "fields": {
+        "rooms": {
+          "name": "Místnosti",
+          "description": "Úplný seřazený seznam místností."
+        }
+      }
+    },
+    "reset_learning": {
+      "name": "Vynulovat učení",
+      "description": "Smaže naučené odhady času úklidu a/nebo uložená procenta dokončení místností, např. po přestavění nábytku nebo resetu mapy robota.",
+      "fields": {
+        "duid": {
+          "name": "Vysavač (duid)",
+          "description": "Alternativa k entitě – duid vysavače."
+        },
+        "room": {
+          "name": "Místnost",
+          "description": "Omezit na jednu místnost."
+        },
+        "kind": {
+          "name": "Průchod",
+          "description": "Omezit na dry, nebo wet."
+        },
+        "estimates": {
+          "name": "Smazat odhady času",
+          "description": "Smazat naučené odhady času."
+        },
+        "baselines": {
+          "name": "Smazat uložená procenta",
+          "description": "Smazat uložená procenta dokončení."
+        }
+      }
+    },
+    "dock_empty": {
+      "name": "Dok – vyprázdnit koš",
+      "description": "Spustí nebo zastaví automatické vyprazdňování doku (sběr prachu).",
+      "fields": {
+        "entity_id": {
+          "name": "Vysavač",
+          "description": "Entita vysavače."
+        },
+        "duid": {
+          "name": "Vysavač (duid)",
+          "description": "Alternativa k entitě – duid vysavače."
+        },
+        "action": {
+          "name": "Akce",
+          "description": "Spustit, nebo zastavit cyklus (start / stop)."
+        }
+      }
+    },
+    "dock_wash": {
+      "name": "Dok – vyprat mop",
+      "description": "Spustí nebo zastaví cyklus praní mopu v doku.",
+      "fields": {
+        "entity_id": {
+          "name": "Vysavač",
+          "description": "Entita vysavače."
+        },
+        "duid": {
+          "name": "Vysavač (duid)",
+          "description": "Alternativa k entitě – duid vysavače."
+        },
+        "action": {
+          "name": "Akce",
+          "description": "Spustit, nebo zastavit cyklus (start / stop)."
+        }
+      }
+    },
+    "dock_dry": {
+      "name": "Dok – usušit mop",
+      "description": "Spustí nebo zastaví cyklus sušení mopu v doku.",
+      "fields": {
+        "entity_id": {
+          "name": "Vysavač",
+          "description": "Entita vysavače."
+        },
+        "duid": {
+          "name": "Vysavač (duid)",
+          "description": "Alternativa k entitě – duid vysavače."
+        },
+        "action": {
+          "name": "Akce",
+          "description": "Spustit, nebo zastavit cyklus (start / stop)."
+        }
+      }
+    },
+    "dock_pump": {
+      "name": "Dok – čerpadlo",
+      "description": "Vypustí zbylou vodu z čisticího dřezu doku (akce „Pump“ v aplikaci výrobce).",
+      "fields": {
+        "entity_id": {
+          "name": "Vysavač",
+          "description": "Entita vysavače."
+        },
+        "duid": {
+          "name": "Vysavač (duid)",
+          "description": "Alternativa k entitě – duid vysavače."
+        }
+      }
+    },
+    "dock_self_clean": {
+      "name": "Dok – samočištění",
+      "description": "Propláchne čisticí dřez a vestavěnou nádrž prvku Fill&Drain a provede jeho samokontrolu. Má smysl jen u doků s Fill&Drain.",
+      "fields": {
+        "entity_id": {
+          "name": "Vysavač",
+          "description": "Entita vysavače."
+        },
+        "duid": {
+          "name": "Vysavač (duid)",
+          "description": "Alternativa k entitě – duid vysavače."
+        }
+      }
+    },
+    "dock_resolve_error": {
+      "name": "Dok – vyřešit chybu",
+      "description": "Potvrdí zachycenou chybu doku, jako „Vyřešeno“ v aplikaci Roborock (např. po doplnění čisté vody).",
+      "fields": {
+        "entity_id": {
+          "name": "Vysavač",
+          "description": "Entita vysavače."
+        },
+        "duid": {
+          "name": "Vysavač (duid)",
+          "description": "Alternativa k entitě – duid vysavače."
+        }
+      }
+    }
+  }
+}

@@ -6,6 +6,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.54.1] - 2026-11-14
+
+- Diagnostics for the passes (`repeat`) of a clean: every dispatched command is logged with its params (INFO), and a couple of polls after the dispatch the robot's reported number of passes is compared with the requested one. A mismatch is a warning on the job (`job_progress.warnings`) - found when S6 ran one pass although `repeat: 2` was sent. A robot that reports nothing is only logged.
+- A pre-clean select of a robot that cannot mop (S6 `mop_intensity`, always "unknown") no longer raises a job warning on every start; the same failure on a select that has a value is still reported.
+- Tests: `test_run_kind.py` (inert select, repeat verification); job-runner test fakes got `async_create_task`.
+
+## [1.54.0] - 2026-11-14
+
+- G: Czech translation (`translations/cs.json`): config flow, options and the user-facing services (clean, plan, goto, zone_clean, cancel, select_rooms, pin_room, set_layers, set_room_sequence, reset_learning, dock_*) with their fields. Untranslated services/fields fall back to English. Diagnostic services stay English.
+- Test: `tests/test_translations.py` (cs covers every en config/options string with the same placeholders; translated services and fields exist in `services.yaml`).
+
 ## [1.52.3] - 2026-11-14
 
 Card unchanged (1.52.0). Audit plan 1.51.5, steps D1, D2 and D4.
