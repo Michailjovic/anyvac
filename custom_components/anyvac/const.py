@@ -61,4 +61,5 @@ STORE_KEYS: tuple[str, ...] = (
     "floorplan_seats",
     "home_frame",
     "last_run",
+    "reach_masks",
 )

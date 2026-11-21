@@ -95,6 +95,8 @@ class AnyVacMapSensor(CoordinatorEntity[AnyVacCoordinator], SensorEntity):
             # fast-changing map payload" reasoning as the v2 *_px attributes above.
             "home_frame", "registration", "vacuum_position_home_px", "charger_home_px",
             "path_dry_home_px", "path_wet_home_px",
+            # docs/51 §2.5 — reach mask meta (the raster itself is the image entity).
+            "reach",
         }
     )
 

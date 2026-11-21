@@ -28,7 +28,7 @@ from .services import ALL_SERVICES, _cancel_jobs, async_register_services
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS: list[Platform] = [Platform.SENSOR]
+PLATFORMS: list[Platform] = [Platform.IMAGE, Platform.SENSOR]
 
 
 def _install_blueprints(hass: HomeAssistant) -> None:

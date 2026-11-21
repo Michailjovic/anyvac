@@ -753,8 +753,11 @@ export_map_guide:
     layers:
       name: Layers
       description: >-
-        Which guide layers to produce. Any of `rooms`, `dry`, `wet`.
-      example: '["rooms", "dry", "wet"]'
+        Which guide layers to produce. Any of `rooms`, `dry`, `wet`,
+        `reach` (docs/51: where the robot's body has been in its last complete
+        clean of every room — the holes are furniture; one vacuum only, not
+        with frame: "home").
+      example: '["rooms", "dry", "wet", "reach"]'
       selector:
         object:
     labels:
@@ -974,3 +977,23 @@ list_assets:
         select:
           options:
             - furniture
+
+reset_reach:
+  name: Reset reach mask
+  description: >-
+    docs/51 §2. Forget the stored reach mask (where the robot's body has been
+    in its last complete clean of each room). The next complete clean of a
+    room records it again. Omit both fields to clear everything.
+  fields:
+    duid:
+      name: Vacuum duid
+      description: Limit to one vacuum (its Roborock duid). Omit for all vacuums.
+      required: false
+      selector:
+        text:
+    room:
+      name: Room
+      description: Limit to one room (name as in the Roborock app). Omit for all rooms.
+      required: false
+      selector:
+        text:

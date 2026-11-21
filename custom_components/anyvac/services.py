@@ -70,6 +70,7 @@ from homeassistant.helpers.event import async_call_later
 from homeassistant.util import dt as dt_util
 
 from . import livediff, localprobe
+from . import reach as reachmod
 from .const import DOMAIN
 from .planner import DEFAULT_ROOM_MIN, CleanPlanner, duid_for_entity, vacuum_entity_for_duid
 
@@ -99,6 +100,7 @@ SERVICE_SNAP_WALL_CORNER = "snap_wall_corner"
 SERVICE_DETECT_FIDUCIALS = "detect_floorplan_fiducials"
 SERVICE_SET_FLOORPLAN_SEAT = "set_floorplan_seat"
 SERVICE_LIST_ASSETS = "list_assets"
+SERVICE_RESET_REACH = "reset_reach"
 
 # docs/51 §1.4: config/www-relative folder the studio's Furniture tool lists.
 FURNITURE_DIR = ("anyvac", "furniture")
@@ -147,6 +149,7 @@ ALL_SERVICES = (
     SERVICE_DETECT_FIDUCIALS,
     SERVICE_SET_FLOORPLAN_SEAT,
     SERVICE_LIST_ASSETS,
+    SERVICE_RESET_REACH,
 )
 
 JOB_TIMEOUT_SECONDS = 3 * 3600  # safety: tear down a stuck job after 3 h
@@ -329,6 +332,12 @@ SET_ROOM_SEQUENCE_SCHEMA = vol.Schema(
         # editor always sends its complete known room list on reorder — this
         # replaces the whole stored sequence, it does not merge.
         vol.Required("rooms"): [str],
+    }
+)
+RESET_REACH_SCHEMA = vol.Schema(
+    {
+        vol.Optional("duid"): str,
+        vol.Optional("room"): str,
     }
 )
 RESET_LEARNING_SCHEMA = vol.Schema(
@@ -554,7 +563,7 @@ EXPORT_MAP_GUIDE_SCHEMA = vol.Schema(
         vol.Optional("frame_id"): str,
         vol.Optional("name"): str,
         vol.Optional("layers", default=["rooms", "dry", "wet"]): [
-            vol.In(["rooms", "dry", "wet"])
+            vol.In(["rooms", "dry", "wet", "reach"])
         ],
         vol.Optional("labels", default=True): bool,
         vol.Optional("stroke_mm", default=300): vol.All(
@@ -2034,6 +2043,12 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
         for coord in _coordinators(hass):
             coord.set_room_sequence(rooms)
 
+    async def _handle_reset_reach(call: ServiceCall) -> None:
+        # docs/51 §2.5 — forget stored reach records; the next complete clean of
+        # a room records it again.
+        for coord in _coordinators(hass):
+            coord.reset_reach(duid=call.data.get("duid"), room=call.data.get("room"))
+
     async def _handle_reset_learning(call: ServiceCall) -> None:
         for coord in _coordinators(hass):
             coord.reset_learning(
@@ -2510,7 +2525,11 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
         scale = frame.get("scale") or 4.0
         stroke_px = max(1, round(stroke_mm * (scale / cell_mm)))
 
-        requested_layers: list[str] = list(call.data.get("layers") or ["rooms", "dry", "wet"])
+        # docs/51 §2.5: the reach layer is per robot (its own map canvas) and has
+        # no home-frame rendering yet — drop it here rather than misdraw it.
+        requested_layers: list[str] = [
+            l for l in (call.data.get("layers") or ["rooms", "dry", "wet"]) if l != "reach"
+        ]
         labels = call.data.get("labels", True)
 
         # Rooms: dedupe by home_room_id — two robots' masks that IoU-matched
@@ -2678,6 +2697,11 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
 
         requested_layers: list[str] = list(call.data.get("layers") or ["rooms", "dry", "wet"])
         labels = call.data.get("labels", True)
+        reach_args = (
+            coord_for_duid.reach_render_args(duid)
+            if coord_for_duid is not None and duid and "reach" in requested_layers
+            else None
+        )
         crop_tuple = (float(x0), float(y0), float(x1), float(y1))
 
         dry_segments = (
@@ -2701,6 +2725,13 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
                     "rooms", canvas_size,
                     rects=_guide_room_rects(rooms, crop_tuple), labels=labels,
                 )
+            if layer == "reach":
+                # docs/51 §2.5 — the robot's reach mask on its own map canvas,
+                # cut to the SAME crop as every other layer (no second crop path).
+                if reach_args is None:
+                    return None
+                rgba = reachmod.render_rgba(*reach_args)
+                return reachmod.png_bytes(rgba, crop_box) if rgba is not None else None
             segs = dry_segments if layer == "dry" else wet_segments
             return _render_guide_layer(layer, canvas_size, segments=segs, stroke_px=stroke_px)
 
@@ -2877,6 +2908,7 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
         (SERVICE_SNAP_WALL_CORNER, _handle_snap_wall_corner, SNAP_WALL_CORNER_SCHEMA, SupportsResponse.ONLY),
         (SERVICE_DETECT_FIDUCIALS, _handle_detect_fiducials, DETECT_FIDUCIALS_SCHEMA, SupportsResponse.ONLY),
         (SERVICE_LIST_ASSETS, _handle_list_assets, LIST_ASSETS_SCHEMA, SupportsResponse.ONLY),
+        (SERVICE_RESET_REACH, _handle_reset_reach, RESET_REACH_SCHEMA, SupportsResponse.NONE),
     ]
     for name, handler, schema, supports in registrations:
         if name in ADMIN_SERVICES:

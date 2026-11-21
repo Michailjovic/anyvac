@@ -39,6 +39,7 @@ from homeassistant.util import dt as dt_util
 
 from . import coverage as covmod
 from . import homeframe, livediff, localchannel
+from . import reach as reachmod
 from .const import (
     DEFAULT_EXPOSE_LEGACY_MM,
     DEFAULT_LIVE_DIFF,
@@ -1387,6 +1388,18 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         self._cov_pct_store: Store = Store(hass, 1, f"{DOMAIN}_room_completion")
         self._cov_legacy_pct_store: Store = Store(hass, 1, f"{DOMAIN}_room_coverage_pct")
         self._room_coverage: dict[str, dict[str, int]] = {}
+        # Reach mask (docs/51 §2): {duid: {room: record}} — the swept footprint of
+        # the robot's last complete clean of each room (`reach.make_record`),
+        # replaced by the next one. Rendered onto the robot's own map canvas and
+        # served by the `image` platform (authenticated, never a /local/ file:
+        # it is the floor plan of the user's home, same reasoning as 1.51.9 C2).
+        self._reach_store: Store = Store(hass, 1, f"{DOMAIN}_reach_masks")
+        self._reach_masks: dict[str, dict[str, dict[str, Any]]] = {}
+        self._reach_rev: dict[str, int] = {}
+        self._reach_png: dict[str, bytes | None] = {}
+        self._reach_updated: dict[str, datetime | None] = {}
+        self._reach_sig: dict[str, tuple[Any, ...]] = {}
+        self._reach_busy: set[str] = set()
         # Segmented DRY trace (docs/14 §3.9): the parser's ``path`` is the robot's FULL
         # trajectory (transit, mop-wash trips and goto included), so it must not be shown
         # as the "dry" layer directly. Only points recorded while actively cleaning and
@@ -1547,6 +1560,188 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
     def selected_rooms(self) -> list[str]:
         """Card-level set of rooms queued to clean (shared across devices)."""
         return sorted(self._selected_rooms)
+
+    # ── Reach mask (docs/51 §2) ─────────────────────────────────────────────
+
+    @staticmethod
+    def _map_index(device: AnyVacDevice) -> Any:
+        return (device.data.get("debug_map") or {}).get("map_index")
+
+    def _reach_ready(self) -> bool:
+        """Unit tests build partial coordinators (`object.__new__`) for the poll
+        pipeline; the reach mask is an add-on there, never a reason to crash."""
+        if "_reach_masks" in self.__dict__:
+            return True
+        self._reach_masks, self._reach_rev, self._reach_png = {}, {}, {}
+        self._reach_updated, self._reach_sig, self._reach_busy = {}, {}, set()
+        self._reach_store = None  # type: ignore[assignment]
+        return False
+
+    def _reach_save(self, delay: float) -> None:
+        if self._reach_store is not None:
+            self._delay_save(self._reach_store, lambda: self._reach_masks, delay)
+
+    def _record_reach(self, device: AnyVacDevice, run: covmod.RunTracker, geo: Any) -> bool:
+        """After a finished run: replace the reach record of every room the run
+        really cleaned and swept enough of (`reach.make_record`). Rooms that do
+        not qualify keep whatever was stored."""
+        self._reach_ready()
+        if geo is None:
+            return False
+        duid = device.duid
+        at = dt_util.utcnow().isoformat(timespec="seconds")
+        map_index = self._map_index(device)
+        changed = False
+        for nm in run.activated:
+            rg = geo.rooms.get(nm)
+            kinds = run.rooms.get(nm) or {}
+            if rg is None or not kinds:
+                continue
+            cells: set[int] = set()
+            used: list[str] = []
+            for k, kr in kinds.items():
+                if kr.cells:
+                    cells |= kr.cells
+                    used.append(k)
+            rec = reachmod.make_record(
+                cells, rg.reach, segment_id=rg.segment_id, kinds=used, map_index=map_index, at=at,
+            )
+            if rec is None:
+                continue
+            self._reach_masks.setdefault(duid, {})[nm] = rec
+            changed = True
+        if changed:
+            self._reach_rev[duid] = self._reach_rev.get(duid, 0) + 1
+            self._reach_save(5)
+        return changed
+
+    def reset_reach(self, duid: str | None = None, room: str | None = None) -> None:
+        """anyvac.reset_reach — forget stored reach records (one robot, one room,
+        or everything). The next complete clean of a room records it again."""
+        self._reach_ready()
+        for dd in list(self._reach_masks):
+            if duid and dd != duid:
+                continue
+            rooms = self._reach_masks[dd]
+            for nm in list(rooms):
+                if room and nm != room:
+                    continue
+                rooms.pop(nm)
+            if not rooms:
+                self._reach_masks.pop(dd)
+            self._reach_rev[dd] = self._reach_rev.get(dd, 0) + 1
+        self._reach_save(2)
+        self.async_update_listeners()
+
+    def _reach_current(self, device: AnyVacDevice) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+        """(records that still match the robot's current map, per-room meta incl.
+        stale ones) for this robot."""
+        self._reach_ready()
+        seg_now = {
+            r.get("name"): r.get("segment_id")
+            for r in device.data.get("rooms") or []
+            if r.get("name")
+        }
+        map_index = self._map_index(device)
+        live: list[dict[str, Any]] = []
+        meta: dict[str, dict[str, Any]] = {}
+        for nm, rec in sorted((self._reach_masks.get(device.duid) or {}).items()):
+            stale = reachmod.is_stale(rec, seg_now.get(nm), map_index)
+            meta[nm] = {
+                "at": rec.get("at"),
+                "floor_pct": rec.get("floor_pct"),
+                "kinds": rec.get("kinds"),
+                "stale": stale,
+            }
+            if not stale:
+                live.append(rec)
+        return live, meta
+
+    def _reach_canvas(self, device: AnyVacDevice) -> tuple[tuple[float, ...], int, int] | None:
+        aff = _solve_affine(device.data.get("calibration_points"))
+        dims = device.data.get("image_dims") or {}
+        width, height = dims.get("width"), dims.get("height")
+        scale = dims.get("scale") or 1
+        if aff is None or not width or not height:
+            return None
+        return aff, int(round(width * scale)), int(round(height * scale))
+
+    def reach_render_args(self, duid: str) -> tuple[int, int, Any, tuple[float, ...], int, int] | None:
+        """`(x0, y0, mask, aff, width, height)` for `reach.render_rgba` — the
+        union of this robot's current (non-stale) records on its own map canvas.
+        None when there is nothing to draw or no calibration yet."""
+        device = (self.data or {}).get(duid)
+        if device is None:
+            return None
+        live, _meta = self._reach_current(device)
+        canvas = self._reach_canvas(device)
+        union = reachmod.union_mask(live)
+        if canvas is None or union is None:
+            return None
+        aff, w, h = canvas
+        x0, y0, mask = union
+        return x0, y0, mask, aff, w, h
+
+    def _reach_publish(self, device: AnyVacDevice) -> None:
+        """Per poll: publish the per-room meta, and re-render the raster when
+        its inputs changed (records, staleness, calibration or canvas size)."""
+        self._reach_ready()
+        duid = device.duid
+        live, meta = self._reach_current(device)
+        canvas = self._reach_canvas(device)
+        sig = (
+            self._reach_rev.get(duid, 0),
+            tuple(sorted(r.get("at") or "" for r in live)),
+            tuple(round(v, 4) for v in canvas[0]) if canvas else None,
+            canvas[1:] if canvas else None,
+        )
+        device.data["reach"] = {
+            "entity_id": self._reach_entity_id(duid),
+            "updated": (u.isoformat(timespec="seconds") if (u := self._reach_updated.get(duid)) else None),
+            "rooms": meta,
+        }
+        if self._reach_sig.get(duid) == sig or duid in self._reach_busy:
+            return
+        self._reach_sig[duid] = sig
+        args = self.reach_render_args(duid)
+        if args is None:
+            if self._reach_png.get(duid) is not None:
+                self._reach_png[duid] = None
+                self._reach_updated[duid] = dt_util.utcnow()
+            return
+        self._reach_busy.add(duid)
+
+        def _render() -> bytes | None:
+            rgba = reachmod.render_rgba(*args)
+            return reachmod.png_bytes(rgba) if rgba is not None else None
+
+        async def _job() -> None:
+            try:
+                png = await self.hass.async_add_executor_job(_render)
+            except Exception as err:  # noqa: BLE001 - a render failure must never break the poll
+                _LOGGER.warning("AnyVac: reach mask render failed for %s: %s", device.name, err)
+                png = None
+            finally:
+                self._reach_busy.discard(duid)
+            self._reach_png[duid] = png
+            self._reach_updated[duid] = dt_util.utcnow()
+            self.async_update_listeners()
+
+        self.hass.async_create_task(_job())
+
+    def _reach_entity_id(self, duid: str) -> str | None:
+        try:
+            from homeassistant.helpers import entity_registry as er
+
+            return er.async_get(self.hass).async_get_entity_id("image", DOMAIN, f"{duid}_anyvac_reach")
+        except Exception:  # noqa: BLE001 - registry not ready (tests, early start)
+            return None
+
+    def reach_png(self, duid: str) -> bytes | None:
+        return self._reach_png.get(duid)
+
+    def reach_updated(self, duid: str) -> datetime | None:
+        return self._reach_updated.get(duid)
 
     def reset_learning(
         self,
@@ -2801,6 +2996,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             calib_rooms[nm] = room_rec
         if coverage_changed:
             self._delay_save(self._cov_pct_store, lambda: self._room_coverage, 5)
+        self._record_reach(device, run, geo)
         self._last_calib[duid] = {
             "at": dt_util.utcnow().isoformat(timespec="seconds"),
             "clean_type": ct,
@@ -3015,6 +3211,14 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         if isinstance(last_run, dict):
             self._last_run = {
                 duid: dict(rec) for duid, rec in last_run.items() if isinstance(rec, dict)
+            }
+        reach_store = self.__dict__.get("_reach_store")  # absent in partial test coordinators
+        reach_raw = await reach_store.async_load() if reach_store is not None else None
+        if isinstance(reach_raw, dict):
+            self._reach_masks = {
+                duid: {nm: dict(rec) for nm, rec in rooms.items() if isinstance(rec, dict)}
+                for duid, rooms in reach_raw.items()
+                if isinstance(rooms, dict)
             }
         cov_pct = await self._cov_pct_store.async_load()
         if isinstance(cov_pct, dict):
@@ -3568,6 +3772,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     }
                     device.data["rooms_progress"] = progress
                     device.data["rooms_coverage"] = {k: dict(v) for k, v in self._room_coverage.items()}
+                    self._reach_publish(device)
                     device.data.pop("_path_dry", None)
                     device.data.pop("_path_wet", None)
                     device.data.pop("_lib_rooms", None)

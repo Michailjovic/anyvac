@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.56.0] - 2026-11-21
+
+Pairs with card 1.56.0.
+
+- **Reach mask (docs/51 §2).** After every finished run, each room the run really cleaned and swept at least 80 % of (the reachable floor from docs/45) gets its mask REPLACED: the robot's swept footprint (175 mm disc along the trajectory) in that clean — the edge is where the body reached, the holes are where it never fitted (under furniture). A cancelled or half-finished clean never overwrites a good mask. Per robot and room, so the masks fill in from ordinary cleans (no more forcing one robot through the whole home on one battery) and one complete clean of a room picks up moved furniture. Stored in `.storage/anyvac_reach_masks` (a packed bitmap per room, a few KB).
+- Stale records: each record keeps the room's `segment_id` and the map index. When the map is deleted and redrawn in the Roborock app the new segment ids no longer match, the old record stops being drawn and the next complete clean of the room replaces it.
+- New `image` entity per vacuum, `image.<vacuum>_reach_mask` (diagnostic): the union of the current records rendered on the robot's OWN map canvas (same size and pixel space as its Roborock map image), transparent outside. Served through Home Assistant's image entity (access token), deliberately not as a `/local/` file — it is the floor plan of your home. Not attached to the Roborock device, so cards that auto-pick the vacuum's map image are not confused by a second image there. Re-rendered only when the records, their staleness, the calibration or the canvas change, in the executor, only over the window the mask covers.
+- Map sensor attribute `reach`: `{entity_id, updated, rooms: {room: {at, floor_pct, kinds, stale}}}` (unrecorded).
+- New service `anyvac.reset_reach` (`duid`, `room`, both optional).
+- `anyvac.export_map_guide` gets a `reach` layer (one vacuum, same crop as the other layers; ignored with `frame: "home"`, which has no reach rendering yet).
+- Tests: `test_reach.py` (16).
+
 ## [1.55.0] - 2026-11-21
 
 Pairs with card 1.55.0.
