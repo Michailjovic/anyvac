@@ -48,6 +48,7 @@ import io
 import logging
 import math
 import os
+from urllib.parse import quote
 import re
 import asyncio
 import statistics
@@ -97,6 +98,11 @@ SERVICE_DUMP_RAW_MAP = "dump_raw_map"
 SERVICE_SNAP_WALL_CORNER = "snap_wall_corner"
 SERVICE_DETECT_FIDUCIALS = "detect_floorplan_fiducials"
 SERVICE_SET_FLOORPLAN_SEAT = "set_floorplan_seat"
+SERVICE_LIST_ASSETS = "list_assets"
+
+# docs/51 §1.4: config/www-relative folder the studio's Furniture tool lists.
+FURNITURE_DIR = ("anyvac", "furniture")
+FURNITURE_EXTS = (".webp", ".png", ".svg", ".jpg", ".jpeg")
 
 # 1.51.9 (plan po auditu, C2): config-relative folder for `dump_raw_map`.
 DEBUG_DUMP_DIR = "anyvac/debug"
@@ -112,6 +118,7 @@ ADMIN_SERVICES: frozenset[str] = frozenset(
         SERVICE_DUMP_RAW_MAP,
         SERVICE_PROBE_MAP_RATE,
         SERVICE_DETECT_FIDUCIALS,
+        SERVICE_LIST_ASSETS,
     }
 )
 
@@ -139,6 +146,7 @@ ALL_SERVICES = (
     SERVICE_SNAP_WALL_CORNER,
     SERVICE_DETECT_FIDUCIALS,
     SERVICE_SET_FLOORPLAN_SEAT,
+    SERVICE_LIST_ASSETS,
 )
 
 JOB_TIMEOUT_SECONDS = 3 * 3600  # safety: tear down a stuck job after 3 h
@@ -925,6 +933,53 @@ def _resolve_local_www_path(hass: HomeAssistant, path: str) -> str:
     if os.path.commonpath([www, target]) != www or target == www:
         raise ValueError(f"path must point to a file under config/www/, got: {path!r}")
     return target
+
+
+LIST_ASSETS_SCHEMA = vol.Schema(
+    {vol.Optional("kind", default="furniture"): vol.In(["furniture"])}
+)
+
+
+def _list_furniture_assets(www_dir: str) -> dict[str, Any]:
+    """Blocking (executor) — docs/51 §1.4. Lists the image files the studio's
+    Furniture tool can place: `config/www/anyvac/furniture/`, non-recursive,
+    creating the folder on first use so the user has an obvious place to drop
+    files. Only regular files with an image extension, and only ones that
+    still resolve inside that folder (a symlink pointing elsewhere is
+    skipped, same containment rule as `_resolve_local_www_path`). Raster
+    files report their pixel size (Pillow, lazily imported — the card uses it
+    to keep the aspect ratio when a piece is added); SVG has none.
+    Returned URLs carry no cache-buster: the card stores them as-is in
+    `image_base.furniture[].src`, and `mtime` lets it bust the cache itself."""
+    folder = os.path.join(www_dir, *FURNITURE_DIR)
+    os.makedirs(folder, exist_ok=True)
+    root = os.path.realpath(folder)
+    assets: list[dict[str, Any]] = []
+    for name in sorted(os.listdir(folder), key=str.casefold):
+        if not name.lower().endswith(FURNITURE_EXTS) or name.startswith("."):
+            continue
+        full = os.path.realpath(os.path.join(folder, name))
+        if os.path.dirname(full) != root or not os.path.isfile(full):
+            continue
+        st = os.stat(full)
+        item: dict[str, Any] = {
+            "name": name,
+            "url": "/local/" + "/".join((*FURNITURE_DIR, quote(name))),
+            "bytes": st.st_size,
+            "mtime": int(st.st_mtime),
+            "width": None,
+            "height": None,
+        }
+        if not name.lower().endswith(".svg"):
+            try:
+                from PIL import Image
+
+                with Image.open(full) as im:
+                    item["width"], item["height"] = im.size
+            except Exception:  # noqa: BLE001 - an unreadable file is still listed, just without size
+                pass
+        assets.append(item)
+    return {"folder": "www/" + "/".join(FURNITURE_DIR), "assets": assets}
 
 
 def _detect_fiducials(image_bytes: bytes, known: list[dict[str, Any]]) -> dict[str, Any]:
@@ -2777,6 +2832,15 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
             )
         return result
 
+    async def _handle_list_assets(call: ServiceCall) -> dict[str, Any]:
+        # docs/51 §1.4 — the browser cannot list config/www itself.
+        try:
+            return await hass.async_add_executor_job(
+                _list_furniture_assets, hass.config.path("www")
+            )
+        except OSError as err:
+            raise HomeAssistantError(f"anyvac.list_assets: {err}") from err
+
     async def _handle_cancel(call: ServiceCall) -> None:
         started = _cancel_jobs(hass)
         if call.data.get("return_to_base", True) and started:
@@ -2812,6 +2876,7 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
         (SERVICE_PROBE_MAP_RATE, _handle_probe_map_rate, PROBE_MAP_RATE_SCHEMA, SupportsResponse.ONLY),
         (SERVICE_SNAP_WALL_CORNER, _handle_snap_wall_corner, SNAP_WALL_CORNER_SCHEMA, SupportsResponse.ONLY),
         (SERVICE_DETECT_FIDUCIALS, _handle_detect_fiducials, DETECT_FIDUCIALS_SCHEMA, SupportsResponse.ONLY),
+        (SERVICE_LIST_ASSETS, _handle_list_assets, LIST_ASSETS_SCHEMA, SupportsResponse.ONLY),
     ]
     for name, handler, schema, supports in registrations:
         if name in ADMIN_SERVICES:

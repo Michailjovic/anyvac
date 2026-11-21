@@ -956,3 +956,21 @@ detect_floorplan_fiducials:
       example: '[{"id": "tl", "home_px": {"x": 12, "y": 8}}]'
       selector:
         object:
+
+list_assets:
+  name: List furniture images
+  description: >-
+    docs/51 §1.4. Lists the image files in config/www/anyvac/furniture/
+    (.webp, .png, .svg, .jpg) that the studio's Furniture tool can place on
+    the floorplan, with their /local/ URL and pixel size. Creates the folder
+    on first use. Administrators only.
+  fields:
+    kind:
+      name: Kind
+      description: Which asset folder to list. Only "furniture" exists today.
+      required: false
+      default: furniture
+      selector:
+        select:
+          options:
+            - furniture

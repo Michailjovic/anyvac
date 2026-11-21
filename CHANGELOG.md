@@ -6,6 +6,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.55.0] - 2026-11-21
+
+Pairs with card 1.55.0.
+
+- New service `anyvac.list_assets` (docs/51 §1.4): lists the images in `config/www/anyvac/furniture/` (`.webp`, `.png`, `.svg`, `.jpg`) with their `/local/` URL, size in bytes, modification time and pixel size, for the card's Visual editor Furniture tab. Creates the folder on first use. Non-recursive; hidden files, non-images and links pointing outside the folder are skipped. Administrators only (same rule as the other file services).
+- Furniture itself needs no backend change: it is saved inside the card-level `image_base` override of `anyvac.set_floorplan_seat`, which already stores that record as-is.
+- Tests: `test_list_assets.py` (7); `test_admin_services.py` updated.
+
 ## [1.54.1] - 2026-11-14
 
 - Diagnostics for the passes (`repeat`) of a clean: every dispatched command is logged with its params (INFO), and a couple of polls after the dispatch the robot's reported number of passes is compared with the requested one. A mismatch is a warning on the job (`job_progress.warnings`) - found when S6 ran one pass although `repeat: 2` was sent. A robot that reports nothing is only logged.
