@@ -101,6 +101,8 @@ SERVICE_DETECT_FIDUCIALS = "detect_floorplan_fiducials"
 SERVICE_SET_FLOORPLAN_SEAT = "set_floorplan_seat"
 SERVICE_LIST_ASSETS = "list_assets"
 SERVICE_RESET_REACH = "reset_reach"
+SERVICE_FLOORPLAN_SCALE = "floorplan_scale"
+SERVICE_UPLOAD_ASSET = "upload_asset"
 
 # docs/51 §1.4: config/www-relative folder the studio's Furniture tool lists.
 FURNITURE_DIR = ("anyvac", "furniture")
@@ -121,6 +123,7 @@ ADMIN_SERVICES: frozenset[str] = frozenset(
         SERVICE_PROBE_MAP_RATE,
         SERVICE_DETECT_FIDUCIALS,
         SERVICE_LIST_ASSETS,
+        SERVICE_UPLOAD_ASSET,
     }
 )
 
@@ -150,6 +153,8 @@ ALL_SERVICES = (
     SERVICE_SET_FLOORPLAN_SEAT,
     SERVICE_LIST_ASSETS,
     SERVICE_RESET_REACH,
+    SERVICE_FLOORPLAN_SCALE,
+    SERVICE_UPLOAD_ASSET,
 )
 
 JOB_TIMEOUT_SECONDS = 3 * 3600  # safety: tear down a stuck job after 3 h
@@ -989,6 +994,171 @@ def _list_furniture_assets(www_dir: str) -> dict[str, Any]:
                 pass
         assets.append(item)
     return {"folder": "www/" + "/".join(FURNITURE_DIR), "assets": assets}
+
+
+# docs/51 §1.3 — how many mm one floorplan unit is (the floorplan's width = 100
+# units), so the studio can offer furniture sizes in centimetres. Geometry stays
+# in the backend (docs/14 §1): the card only multiplies by the number returned.
+_PT_SCHEMA = vol.Schema({vol.Required("x"): vol.Coerce(float), vol.Required("y"): vol.Coerce(float)})
+FLOORPLAN_SCALE_SCHEMA = vol.Schema(
+    {
+        vol.Optional("crop_box"): vol.Schema(
+            {
+                vol.Optional("entity"): str,
+                vol.Optional("frame_id"): str,
+                vol.Required("x0"): vol.Coerce(float),
+                vol.Required("y0"): vol.Coerce(float),
+                vol.Required("x1"): vol.Coerce(float),
+                vol.Required("y1"): vol.Coerce(float),
+            }
+        ),
+        vol.Optional("home_anchors"): [
+            vol.Schema({vol.Required("home_px"): _PT_SCHEMA, vol.Required("floor_pct"): _PT_SCHEMA})
+        ],
+        vol.Optional("home_anchors_frame_id"): str,
+        # floorplan width / height — needed to read `floor_pct.y` in units
+        vol.Optional("aspect"): vol.All(vol.Coerce(float), vol.Range(min=0.01, max=100)),
+    }
+)
+
+
+def _similarity_scale(src: list[tuple[float, float]], dst: list[tuple[float, float]]) -> float | None:
+    """Least-squares scale of the similarity (rotation + uniform scale +
+    translation, no mirroring) mapping `src` onto `dst` — Umeyama's closed
+    form. None for fewer than 2 distinct points."""
+    if len(src) < 2 or len(src) != len(dst):
+        return None
+    a = np.asarray(src, dtype=float)
+    b = np.asarray(dst, dtype=float)
+    ac, bc = a - a.mean(axis=0), b - b.mean(axis=0)
+    var_a = float((ac**2).sum()) / len(a)
+    if var_a < 1e-12:
+        return None
+    cov = bc.T @ ac / len(a)
+    u, d, vt = np.linalg.svd(cov)
+    sign = np.diag([1.0, 1.0 if np.linalg.det(u) * np.linalg.det(vt) >= 0 else -1.0])
+    scale = float(np.trace(np.diag(d) @ sign)) / var_a
+    return scale if scale > 0 else None
+
+
+def _floorplan_mm_per_unit(
+    crop_box: dict[str, Any] | None,
+    home_anchors: list[dict[str, Any]] | None,
+    aspect: float | None,
+    *,
+    vacuum_px_per_mm: float | None,
+    frame: dict[str, Any] | None,
+) -> tuple[float | None, str | None]:
+    """Pure: mm per floorplan unit and which input it came from.
+
+    * `crop_box` cut from one vacuum's map (`entity`): the crop's width in that
+      map's rendered px over the map's px-per-mm.
+    * `crop_box` cut from a home frame (`frame_id`): home px are
+      `scale / cell_mm` per mm.
+    * `home_anchors` (a drawing calibrated against the home frame, cesta B):
+      the least-squares similarity scale from floorplan units to home px,
+      then home px to mm. Needs the floorplan's `aspect`.
+    """
+    if crop_box:
+        width_px = float(crop_box["x1"]) - float(crop_box["x0"])
+        if width_px > 0:
+            if crop_box.get("frame_id") and frame is not None:
+                cell_mm = float(frame.get("cell_mm") or 50.0)
+                scale = float(frame.get("scale") or 4.0)
+                return width_px * cell_mm / scale / 100.0, "crop_frame"
+            if crop_box.get("entity") and vacuum_px_per_mm:
+                return width_px / vacuum_px_per_mm / 100.0, "crop_vacuum"
+    if home_anchors and len(home_anchors) >= 2 and aspect and frame is not None:
+        src = [(float(a["floor_pct"]["x"]), float(a["floor_pct"]["y"]) / aspect) for a in home_anchors]
+        dst = [(float(a["home_px"]["x"]), float(a["home_px"]["y"])) for a in home_anchors]
+        s = _similarity_scale(src, dst)
+        if s:
+            cell_mm = float(frame.get("cell_mm") or 50.0)
+            scale = float(frame.get("scale") or 4.0)
+            return s * cell_mm / scale, "home_anchors"
+    return None, None
+
+
+# docs/51 §1.4 — upload a furniture image straight from the studio. The file
+# arrives base64-encoded in the service call (furniture images are small);
+# written into the same folder `list_assets` lists.
+UPLOAD_MAX_BYTES = 2 * 1024 * 1024
+UPLOAD_ASSET_SCHEMA = vol.Schema(
+    {
+        vol.Required("name"): vol.All(str, vol.Length(min=1, max=120)),
+        vol.Required("data"): str,
+        vol.Optional("kind", default="furniture"): vol.In(["furniture"]),
+        vol.Optional("overwrite", default=False): bool,
+    }
+)
+
+
+def _safe_asset_name(name: str) -> str:
+    """A plain file name in the furniture folder: no folders, no hidden files,
+    only letters/digits/`._-` (spaces become `_`), an image extension."""
+    base = os.path.basename(name.replace("\\", "/")).strip()
+    stem, ext = os.path.splitext(base)
+    ext = ext.lower()
+    if ext not in FURNITURE_EXTS:
+        raise ValueError(f"only {', '.join(FURNITURE_EXTS)} files are accepted, got {base!r}")
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._-")
+    if not stem:
+        raise ValueError(f"not a usable file name: {name!r}")
+    return stem[:100] + ext
+
+
+def _store_asset(www_dir: str, name: str, data_b64: str, overwrite: bool) -> dict[str, Any]:
+    """Blocking (executor): validate and write one uploaded image, return the
+    same item shape `list_assets` gives. Raster files must open as images
+    (Pillow); SVG must look like SVG markup. Never overwrites unless asked —
+    a clash gets a `_2`, `_3` … suffix instead."""
+    import base64
+    import binascii
+
+    filename = _safe_asset_name(name)
+    try:
+        raw = base64.b64decode(data_b64.split(",", 1)[-1], validate=True)
+    except (binascii.Error, ValueError) as err:
+        raise ValueError("data is not valid base64") from err
+    if not raw:
+        raise ValueError("the file is empty")
+    if len(raw) > UPLOAD_MAX_BYTES:
+        raise ValueError(f"the file is larger than {UPLOAD_MAX_BYTES // 1024} KB")
+    width = height = None
+    if filename.lower().endswith(".svg"):
+        head = raw[:2048].decode("utf-8", "ignore").lower()
+        if "<svg" not in head:
+            raise ValueError("not an SVG image")
+    else:
+        from PIL import Image
+
+        try:
+            with Image.open(io.BytesIO(raw)) as im:
+                im.verify()
+            with Image.open(io.BytesIO(raw)) as im:
+                width, height = im.size
+        except Exception as err:  # noqa: BLE001 - any decode failure = not an image
+            raise ValueError("not a readable image") from err
+    folder = os.path.join(www_dir, *FURNITURE_DIR)
+    os.makedirs(folder, exist_ok=True)
+    stem, ext = os.path.splitext(filename)
+    target = os.path.join(folder, filename)
+    n = 2
+    while os.path.exists(target) and not overwrite:
+        filename = f"{stem}_{n}{ext}"
+        target = os.path.join(folder, filename)
+        n += 1
+    with open(target, "wb") as f:
+        f.write(raw)
+    st = os.stat(target)
+    return {
+        "name": filename,
+        "url": "/local/" + "/".join((*FURNITURE_DIR, quote(filename))),
+        "bytes": st.st_size,
+        "mtime": int(st.st_mtime),
+        "width": width,
+        "height": height,
+    }
 
 
 def _detect_fiducials(image_bytes: bytes, known: list[dict[str, Any]]) -> dict[str, Any]:
@@ -2525,12 +2695,17 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
         scale = frame.get("scale") or 4.0
         stroke_px = max(1, round(stroke_mm * (scale / cell_mm)))
 
-        # docs/51 §2.5: the reach layer is per robot (its own map canvas) and has
-        # no home-frame rendering yet — drop it here rather than misdraw it.
-        requested_layers: list[str] = [
-            l for l in (call.data.get("layers") or ["rooms", "dry", "wet"]) if l != "reach"
-        ]
+        requested_layers: list[str] = list(call.data.get("layers") or ["rooms", "dry", "wet"])
         labels = call.data.get("labels", True)
+        # docs/51 §2.5 — every robot of the frame on the frame's own canvas.
+        reach_home_args: list[Any] = []
+        if "reach" in requested_layers:
+            for coord in _coordinators(hass):
+                for duid in duids:
+                    if (coord.data or {}).get(duid) is not None:
+                        a = coord.reach_home_args(duid)
+                        if a is not None:
+                            reach_home_args.append(a)
 
         # Rooms: dedupe by home_room_id — two robots' masks that IoU-matched
         # into the same physical room (docs/40 §4.2 point 6) must draw ONCE,
@@ -2570,6 +2745,18 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
         def _render(layer: str) -> bytes | None:
             if layer == "rooms":
                 return _render_guide_layer("rooms", canvas_size, polygons=polygons, labels=labels)
+            if layer == "reach":
+                layers = [r for a in reach_home_args if (r := reachmod.render_rgba(*a)) is not None]
+                if not layers:
+                    return None
+                h = max(r.shape[0] for r in layers)
+                w = max(r.shape[1] for r in layers)
+                out = np.zeros((max(h, y1), max(w, x1), 4), dtype=np.uint8)
+                for r in layers:
+                    view = out[: r.shape[0], : r.shape[1]]
+                    hit = r[..., 3] > 0
+                    view[hit] = r[hit]
+                return reachmod.png_bytes(out, crop_box)
             segs = dry_segments if layer == "dry" else wet_segments
             return _render_guide_layer(layer, canvas_size, segments=segs, stroke_px=stroke_px)
 
@@ -2863,6 +3050,41 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
             )
         return result
 
+    async def _handle_floorplan_scale(call: ServiceCall) -> dict[str, Any]:
+        # docs/51 §1.3 — mm per floorplan unit, for the studio's cm fields.
+        crop = call.data.get("crop_box")
+        anchors = call.data.get("home_anchors")
+        ppm: float | None = None
+        frame: dict[str, Any] | None = None
+        if crop and crop.get("entity"):
+            duid = duid_for_entity(hass, crop["entity"])
+            for coord in _coordinators(hass):
+                if duid and (coord.data or {}).get(duid) is not None:
+                    ppm = coord.px_per_mm(duid)
+                    break
+        frame_id = (crop or {}).get("frame_id") or call.data.get("home_anchors_frame_id")
+        if (crop and crop.get("frame_id")) or anchors:
+            try:
+                _fid, frame = _select_home_frame(hass, frame_id, service="floorplan_scale")
+            except HomeAssistantError:
+                frame = None
+        mm, source = _floorplan_mm_per_unit(
+            crop, anchors, call.data.get("aspect"), vacuum_px_per_mm=ppm, frame=frame,
+        )
+        return {"mm_per_unit": round(mm, 4) if mm else None, "source": source}
+
+    async def _handle_upload_asset(call: ServiceCall) -> dict[str, Any]:
+        # docs/51 §1.4 — a furniture image uploaded from the studio.
+        try:
+            return await hass.async_add_executor_job(
+                _store_asset, hass.config.path("www"), call.data["name"], call.data["data"],
+                call.data.get("overwrite", False),
+            )
+        except ValueError as err:
+            raise HomeAssistantError(f"anyvac.upload_asset: {err}") from err
+        except OSError as err:
+            raise HomeAssistantError(f"anyvac.upload_asset: could not write the file: {err}") from err
+
     async def _handle_list_assets(call: ServiceCall) -> dict[str, Any]:
         # docs/51 §1.4 — the browser cannot list config/www itself.
         try:
@@ -2909,6 +3131,8 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
         (SERVICE_DETECT_FIDUCIALS, _handle_detect_fiducials, DETECT_FIDUCIALS_SCHEMA, SupportsResponse.ONLY),
         (SERVICE_LIST_ASSETS, _handle_list_assets, LIST_ASSETS_SCHEMA, SupportsResponse.ONLY),
         (SERVICE_RESET_REACH, _handle_reset_reach, RESET_REACH_SCHEMA, SupportsResponse.NONE),
+        (SERVICE_FLOORPLAN_SCALE, _handle_floorplan_scale, FLOORPLAN_SCALE_SCHEMA, SupportsResponse.ONLY),
+        (SERVICE_UPLOAD_ASSET, _handle_upload_asset, UPLOAD_ASSET_SCHEMA, SupportsResponse.ONLY),
     ]
     for name, handler, schema, supports in registrations:
         if name in ADMIN_SERVICES:

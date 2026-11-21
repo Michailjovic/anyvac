@@ -42,8 +42,24 @@ or mm math on the card side:
 | `rooms_last_cleaned` | per-room last-cleaned info by clean type (mirrors the timestamp sensors below) |
 | `room_sequence` / `room_pins` / `selected_rooms` / `view_layers` | orchestration/UI state the card reads and writes via services below |
 | `floorplan_seats` | Visual editor manual seat + appearance + per-room + room-style override layer (docs/41 + docs/42), keyed by floorplan `image_base.src` — set/cleared via `anyvac.set_floorplan_seat`, merged over config by the card |
+| `reach` | docs/51: reach mask meta — `{entity_id, home_entity_id, home_frame_id, updated, home_ready, rooms: {room: {at, floor_pct, kinds, stale}}}`; the rasters themselves are the image entities below |
 | `pipeline_ok` / `pipeline_error` | integration self-diagnostic for the current poll |
 | `duid`, `calib_debug`, `transit_cells` | diagnostics — device id, calibration solve debug info, "seen but not counted" cells outside the active job's room scope |
+
+### Reach mask images (docs/51)
+
+Two diagnostic `image` entities per vacuum, not attached to the Roborock device:
+`image.<vacuum>_reach_mask` (on the vacuum's own map canvas — same size and pixel
+space as its Roborock map image) and `image.<vacuum>_reach_mask_home` (on its
+home-frame canvas, empty without a home-frame registration). Both show where the
+vacuum's body has been in its last complete clean of every room: after each
+finished run, every room the run cleaned and swept at least 80 % of gets its mask
+replaced; a half-finished clean never overwrites a good one, and rooms of a map
+that was deleted and redrawn in the Roborock app (new segment ids) stop being
+drawn until they are cleaned again. Transparent PNG, served through Home
+Assistant's image entity (access token) rather than as a `/local/` file, since it
+is the floor plan of your home. The card's Visual editor uses them as a
+calibration and furniture guide.
 
 ### Home frame (multi-vacuum, `schema_version: 3`)
 
@@ -189,9 +205,12 @@ closing) — the AnyVac card sends an *intent*, not a pre-built plan:
 | `anyvac.goto` | Pin & go: `x_pct`/`y_pct` (percent of the rendered map image) → the integration converts to real coordinates and sends the robot. With `frame: "home"`, `x_home_px`/`y_home_px` (pixels in the shared home frame) instead. |
 | `anyvac.zone_clean` | Zone clean: two corners as percent of the map image, same conversion (or `frame: "home"` + `*_home_px` corners). |
 | `anyvac.snapshot_map_as_floorplan` | Saves a map image entity's picture as the shared floorplan file. With `frame: "home"`, renders a composite of every vacuum registered into the shared home frame instead, straight from their aligned floor/wall masks — no single vacuum's `image_entity` involved. |
-| `anyvac.export_map_guide` | Draws room-boundary/dry/wet tracing-aid layers for one vacuum's map. With `frame: "home"`, draws every vacuum's rooms and paths on one canvas, with each room's real traced outline (`outline_home_px`) instead of one vacuum's bounding box. |
+| `anyvac.export_map_guide` | Draws room-boundary/dry/wet/reach tracing-aid layers for one vacuum's map. With `frame: "home"`, draws every vacuum's rooms and paths on one canvas, with each room's real traced outline (`outline_home_px`) instead of one vacuum's bounding box. |
 | `anyvac.snap_wall_corner` | Snaps a home-frame pixel point to the nearest wall corner detected from that frame's own wall mask — response-only, `{frame_id?, x_home_px, y_home_px}` in, `{frame_id, snapped, x_home_px, y_home_px, distance_px?}` back (`snapped: false` echoes the input unchanged when the frame has no wall data yet). Used by the card's editor while calibrating a foreign-origin floorplan against the home frame (docs/40 §5.B) to remove most click noise — not something you'd normally call directly. |
 | `anyvac.detect_floorplan_fiducials` | Scans a floorplan file for the invisible fiducial markers `snapshot_map_as_floorplan` embedded (`fiducials: true`) and returns `home_anchors` calibration pairs with zero clicking (docs/40 §5.A.2) — response-only, `{path, fiducials}` in, `{home_anchors, found, missing, image_width, image_height}` back. Only works if the file kept its alpha channel through whatever crop/resize/rotate you did to it externally; not something you'd normally call directly — the editor's "Detect markers in edited file" button does. |
+| `anyvac.list_assets` / `anyvac.upload_asset` | docs/51: list / upload the furniture images in `config/www/anyvac/furniture/` for the card's Furniture tab (administrators only; upload takes base64, at most 2 MB, `.webp`/`.png`/`.svg`/`.jpg`). |
+| `anyvac.floorplan_scale` | docs/51: mm per floorplan unit (floorplan width = 100) from a floorplan's `crop_box` or `home_anchors` + `aspect` — response-only, used for furniture sizes in centimetres. |
+| `anyvac.reset_reach` | docs/51: forget stored reach masks (`duid`, `room` optional). |
 | `anyvac.cancel` | Stops the running job and (by default) returns started robots to base. |
 | `anyvac.select_rooms` / `anyvac.pin_room` / `anyvac.set_layers` / `anyvac.set_room_sequence` / `anyvac.reset_learning` | UI/learning state — room selection, per-room robot pinning, dry/wet layer visibility, the Roborock app's room order (used for ETA), and clearing bad learned estimates. |
 | `anyvac.set_floorplan_seat` | Save or clear a manual Visual editor floorplan override (docs/41 §4.6 + docs/42) — `vacuum` with `map`/`appearance`/`rooms` for one vacuum's seat geometry, style and/or per-room overrides (`map`/`appearance` each independently nullable; `rooms` merges per room_key instead, `null` on one room_key clearing just that room), or `vacuum` omitted for the card-level overrides instead (`image_base` the floorplan itself, `rooms` the shared merged-mode room list, `room_style` the global room border widths — each independently nullable); `null` clears the given part. Shared across every dashboard/browser showing that floorplan. |

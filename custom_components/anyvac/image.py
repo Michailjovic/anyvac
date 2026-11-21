@@ -40,7 +40,9 @@ async def async_setup_entry(
         for duid, device in (coordinator.data or {}).items():
             if duid not in known:
                 known.add(duid)
-                new.append(AnyVacReachImage(coordinator, duid, getattr(device, "name", None) or duid))
+                name = getattr(device, "name", None) or duid
+                new.append(AnyVacReachImage(coordinator, duid, name))
+                new.append(AnyVacReachImage(coordinator, duid, name, home=True))
         if new:
             async_add_entities(new)
 
@@ -50,18 +52,21 @@ async def async_setup_entry(
 
 class AnyVacReachImage(CoordinatorEntity[AnyVacCoordinator], ImageEntity):
     """The robot's reach mask as a transparent PNG (empty until the first
-    complete clean of a room has been recorded)."""
+    complete clean of a room has been recorded). `home=True` is the same mask
+    on the robot's home-frame canvas (docs/40 px space) — empty while the robot
+    has no home-frame registration."""
 
     _attr_content_type = "image/png"
     _attr_entity_category = EntityCategory.DIAGNOSTIC
     _attr_icon = "mdi:texture-box"
 
-    def __init__(self, coordinator: AnyVacCoordinator, duid: str, name: str) -> None:
+    def __init__(self, coordinator: AnyVacCoordinator, duid: str, name: str, home: bool = False) -> None:
         CoordinatorEntity.__init__(self, coordinator)
         ImageEntity.__init__(self, coordinator.hass)
         self._duid = duid
-        self._attr_unique_id = f"{duid}_anyvac_reach"
-        self._attr_name = f"{name} reach mask"
+        self._home = home
+        self._attr_unique_id = f"{duid}_anyvac_reach_home" if home else f"{duid}_anyvac_reach"
+        self._attr_name = f"{name} reach mask (home frame)" if home else f"{name} reach mask"
         self._attr_image_last_updated = coordinator.reach_updated(duid)
 
     @property
@@ -69,7 +74,7 @@ class AnyVacReachImage(CoordinatorEntity[AnyVacCoordinator], ImageEntity):
         return super().available and (self.coordinator.data or {}).get(self._duid) is not None
 
     async def async_image(self) -> bytes | None:
-        return self.coordinator.reach_png(self._duid)
+        return self.coordinator.reach_png(self._duid, home=self._home)
 
     @callback
     def _handle_coordinator_update(self) -> None:

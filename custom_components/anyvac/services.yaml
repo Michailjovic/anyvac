@@ -755,8 +755,8 @@ export_map_guide:
       description: >-
         Which guide layers to produce. Any of `rooms`, `dry`, `wet`,
         `reach` (docs/51: where the robot's body has been in its last complete
-        clean of every room — the holes are furniture; one vacuum only, not
-        with frame: "home").
+        clean of every room — the holes are furniture; with frame: "home"
+        every registered vacuum of the frame).
       example: '["rooms", "dry", "wet", "reach"]'
       selector:
         object:
@@ -997,3 +997,61 @@ reset_reach:
       required: false
       selector:
         text:
+
+floorplan_scale:
+  name: Floorplan scale
+  description: >-
+    docs/51 §1.3. How many millimetres one floorplan unit is (the floorplan's
+    width = 100 units) — lets the card's Furniture tab take sizes in
+    centimetres. Works for a floorplan cut from a vacuum map or a home frame
+    (crop_box) and for a drawing calibrated against the home frame
+    (home_anchors + aspect). Returns mm_per_unit = null otherwise.
+  fields:
+    crop_box:
+      name: Crop box
+      description: The floorplan's image_base.crop_box, as stored by the card.
+      selector:
+        object:
+    home_anchors:
+      name: Home anchors
+      description: The floorplan's image_base.home_anchors, as stored by the card.
+      selector:
+        object:
+    home_anchors_frame_id:
+      name: Home frame id
+      description: image_base.home_anchors_frame_id, when set.
+      selector:
+        text:
+    aspect:
+      name: Aspect ratio
+      description: Floorplan width divided by height (needed with home_anchors).
+      selector:
+        number:
+          min: 0.01
+          max: 100
+          step: 0.001
+
+upload_asset:
+  name: Upload furniture image
+  description: >-
+    docs/51 §1.4. Store an image (base64) in config/www/anyvac/furniture/ for
+    the card's Furniture tab. .webp, .png, .svg, .jpg; at most 2 MB. A name
+    that already exists gets a _2, _3 … suffix unless overwrite is set.
+    Administrators only.
+  fields:
+    name:
+      name: File name
+      required: true
+      selector:
+        text:
+    data:
+      name: Data
+      description: The file content, base64 (a data: URL prefix is accepted).
+      required: true
+      selector:
+        text:
+    overwrite:
+      name: Overwrite
+      default: false
+      selector:
+        boolean:

@@ -206,9 +206,12 @@ async def test_publish_renders_once_per_change(monkeypatch: pytest.MonkeyPatch) 
         return fn(*a)
 
     c.hass = SimpleNamespace(async_add_executor_job=_exec, async_create_task=lambda coro: tasks.append(coro))
-    monkeypatch.setattr(c, "_reach_entity_id", lambda duid: "image.s8_reach_mask")
+    monkeypatch.setattr(c, "_reach_entity_id", lambda duid, home=False: "image.s8_reach_mask_home" if home else "image.s8_reach_mask")
     c._reach_publish(dev)
-    assert dev.data["reach"] == {"entity_id": "image.s8_reach_mask", "updated": None, "rooms": {}}
+    assert dev.data["reach"] == {
+        "entity_id": "image.s8_reach_mask", "home_entity_id": "image.s8_reach_mask_home",
+        "home_frame_id": None, "updated": None, "home_ready": False, "rooms": {},
+    }
     assert tasks == []  # nothing recorded yet
     c._record_reach(dev, _run({"Kitchen": _cells(10, 10, 10, 10)}), _geo())
     c._reach_publish(dev)
@@ -241,3 +244,63 @@ async def test_image_entity_serves_the_coordinators_png(monkeypatch: pytest.Monk
     assert ent.unique_id == "s8_anyvac_reach"
     assert ent.name == "S8 reach mask"
     assert await ent.async_image() == b"png"
+
+
+# ── home-frame variant (docs/51 §2.5) ──────────────────────────────────────
+
+
+def _with_frame(c: AnyVacCoordinator, rot: float = 90.0) -> None:
+    c._home_frames = {"f1": {
+        "origin_mm": (-1000.0, -2000.0), "cell_mm": 50.0, "scale": 4, "width": 200, "height": 150,
+        "robots": {"s8": {"rot_deg": rot, "tx_mm": 3000.0, "ty_mm": 500.0}},
+    }}
+    c._robot_frame = {"s8": "f1"}
+
+
+def test_home_affine_matches_mm_to_home_px() -> None:
+    c = _coord()
+    _with_frame(c, rot=33.0)
+    a, b, cc, d, e, f = c._home_affine("s8")
+    for x, y in [(0, 0), (1234.5, -50), (700, 4000)]:
+        hx, hy = c.mm_to_home_px("s8", x, y)
+        assert a * x + b * y + cc == pytest.approx(hx)
+        assert d * x + e * y + f == pytest.approx(hy)
+
+
+def test_home_raster_lands_where_mm_to_home_px_says() -> None:
+    c = _coord()
+    _with_frame(c)
+    c.data = {"s8": _device()}
+    c._record_reach(c.data["s8"], _run({"Kitchen": _cells(10, 10, 10, 10)}), _geo())
+    x0, y0, mask, aff, w, h = c.reach_home_args("s8")
+    assert (w, h) == (800, 600)
+    rgba = reachmod.render_rgba(x0, y0, mask, aff, w, h)
+    # centre of cell (15, 15) in robot mm -> home px
+    hx, hy = c.mm_to_home_px("s8", 15 * 50 + 25, 15 * 50 + 25)
+    assert rgba[int(hy), int(hx), 3] == 255
+    # a cell outside the mask stays clear
+    hx2, hy2 = c.mm_to_home_px("s8", 25 * 50 + 25, 15 * 50 + 25)
+    assert rgba[int(hy2), int(hx2), 3] == 0
+
+
+def test_no_home_raster_without_registration() -> None:
+    c = _coord()
+    c._home_frames, c._robot_frame = {}, {}
+    c.data = {"s8": _device()}
+    c._record_reach(c.data["s8"], _run({"Kitchen": _cells(10, 10, 10, 10)}), _geo())
+    assert c.reach_home_args("s8") is None
+    assert c.reach_render_args("s8") is not None
+
+
+@pytest.mark.asyncio
+async def test_home_image_entity(monkeypatch: pytest.MonkeyPatch) -> None:
+    from custom_components.anyvac.image import AnyVacReachImage
+
+    c = _coord()
+    c._reach_png["s8"], c._reach_png_home["s8"] = b"map", b"home"
+    c.hass = SimpleNamespace()
+    monkeypatch.setattr("homeassistant.components.image.entity.get_async_client", lambda *a, **k: None)
+    ent = AnyVacReachImage(c, "s8", "S8", home=True)
+    assert ent.unique_id == "s8_anyvac_reach_home"
+    assert ent.name == "S8 reach mask (home frame)"
+    assert await ent.async_image() == b"home"

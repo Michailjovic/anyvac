@@ -6,6 +6,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.57.0] - 2026-11-21
+
+Pairs with card 1.57.0. Completes docs/51.
+
+- **Reach mask on the home frame.** A second image entity per vacuum, `image.<vacuum>_reach_mask_home`: the same records on the vacuum's home-frame canvas (the frame's own px space, `*_home_px` / `crop_box.frame_id`), through the same transform as every `*_home_px` attribute (probed as one affine from `mm_to_home_px`). Empty without a registration. `reach` attribute gains `home_entity_id`, `home_frame_id`, `home_ready`. `anyvac.export_map_guide` with `frame: "home"` now draws the `reach` layer for every vacuum of the frame.
+- **New service `anyvac.floorplan_scale`** (response-only): mm per floorplan unit (width = 100) from the floorplan's `crop_box` (cut from a vacuum map: crop width over the map's px-per-mm; from a home frame: `cell_mm / scale` per home px) or its `home_anchors` + `aspect` (least-squares similarity scale, no mirroring). `null` for a floorplan with no known scale. Lets the card take furniture sizes in centimetres while the geometry stays in the backend.
+- **New service `anyvac.upload_asset`** (administrators only, response-only): stores a base64 image (`.webp`, `.png`, `.svg`, `.jpg`; at most 2 MB; a `data:` URL prefix is accepted) in `config/www/anyvac/furniture/`. The name is reduced to a plain file name; a clash gets `_2`, `_3` … unless `overwrite`. Raster files must decode with Pillow, SVG must contain `<svg`. Returns the same item shape as `list_assets`.
+- README: reach mask entities, the `reach` attribute and the new services.
+- Tests: `test_floorplan_scale_and_upload.py` (14), `test_reach.py` +4 (home affine, home raster position, no registration, home image entity).
+
 ## [1.56.0] - 2026-11-21
 
 Pairs with card 1.56.0.

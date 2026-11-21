@@ -59,6 +59,7 @@ def test_admin_set_is_exactly_the_file_and_debug_services() -> None:
         "probe_map_rate",
         "detect_floorplan_fiducials",
         "list_assets",
+        "upload_asset",
     }
     # Everything the card uses in normal operation stays open to every user.
     for name in ("clean", "plan", "goto", "zone_clean", "cancel", "select_rooms", "set_layers"):

@@ -1397,6 +1397,8 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         self._reach_masks: dict[str, dict[str, dict[str, Any]]] = {}
         self._reach_rev: dict[str, int] = {}
         self._reach_png: dict[str, bytes | None] = {}
+        # Same records on the robot's home-frame canvas (docs/51 §2.5, home variant).
+        self._reach_png_home: dict[str, bytes | None] = {}
         self._reach_updated: dict[str, datetime | None] = {}
         self._reach_sig: dict[str, tuple[Any, ...]] = {}
         self._reach_busy: set[str] = set()
@@ -1573,6 +1575,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         if "_reach_masks" in self.__dict__:
             return True
         self._reach_masks, self._reach_rev, self._reach_png = {}, {}, {}
+        self._reach_png_home = {}
         self._reach_updated, self._reach_sig, self._reach_busy = {}, {}, set()
         self._reach_store = None  # type: ignore[assignment]
         return False
@@ -1682,63 +1685,118 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         x0, y0, mask = union
         return x0, y0, mask, aff, w, h
 
+    def _home_affine(self, duid: str) -> tuple[float, float, float, float, float, float] | None:
+        """This robot's mm -> home-frame px as one affine, probed through the SAME
+        `mm_to_home_px` every `*_home_px` attribute uses (registration rotation +
+        translation, then the frame's origin/cell/scale — all affine, so three
+        points determine it exactly; docs/14 rule 1, no second transform)."""
+        p0 = self.mm_to_home_px(duid, 0.0, 0.0)
+        px = self.mm_to_home_px(duid, 1000.0, 0.0)
+        py = self.mm_to_home_px(duid, 0.0, 1000.0)
+        if p0 is None or px is None or py is None:
+            return None
+        return (
+            (px[0] - p0[0]) / 1000.0, (py[0] - p0[0]) / 1000.0, p0[0],
+            (px[1] - p0[1]) / 1000.0, (py[1] - p0[1]) / 1000.0, p0[1],
+        )
+
+    def _home_canvas(self, duid: str) -> tuple[str, tuple[float, ...], int, int] | None:
+        frame_id = self._robot_frame.get(duid) if "_robot_frame" in self.__dict__ else None
+        frame = self._home_frames.get(frame_id) if frame_id else None
+        aff = self._home_affine(duid) if frame is not None else None
+        if frame is None or aff is None:
+            return None
+        scale = frame.get("scale", homeframe.HOME_PX_SCALE)
+        return frame_id, aff, int(frame["width"] * scale), int(frame["height"] * scale)
+
+    def reach_home_args(self, duid: str) -> tuple[int, int, Any, tuple[float, ...], int, int] | None:
+        """Like `reach_render_args`, on the robot's home-frame canvas — the frame's
+        own px space (`*_home_px`, `crop_box.frame_id`). None without a
+        registration or without current records."""
+        device = (self.data or {}).get(duid)
+        if device is None:
+            return None
+        live, _meta = self._reach_current(device)
+        canvas = self._home_canvas(duid)
+        union = reachmod.union_mask(live)
+        if canvas is None or union is None:
+            return None
+        _fid, aff, w, h = canvas
+        x0, y0, mask = union
+        return x0, y0, mask, aff, w, h
+
     def _reach_publish(self, device: AnyVacDevice) -> None:
-        """Per poll: publish the per-room meta, and re-render the raster when
-        its inputs changed (records, staleness, calibration or canvas size)."""
+        """Per poll: publish the per-room meta, and re-render the rasters (robot
+        map canvas + home-frame canvas) when their inputs changed (records,
+        staleness, calibration, registration or canvas size)."""
         self._reach_ready()
         duid = device.duid
         live, meta = self._reach_current(device)
         canvas = self._reach_canvas(device)
+        home = self._home_canvas(duid)
         sig = (
             self._reach_rev.get(duid, 0),
             tuple(sorted(r.get("at") or "" for r in live)),
             tuple(round(v, 4) for v in canvas[0]) if canvas else None,
             canvas[1:] if canvas else None,
+            (home[0], tuple(round(v, 4) for v in home[1]), home[2], home[3]) if home else None,
         )
         device.data["reach"] = {
             "entity_id": self._reach_entity_id(duid),
+            "home_entity_id": self._reach_entity_id(duid, home=True),
+            "home_frame_id": home[0] if home else None,
             "updated": (u.isoformat(timespec="seconds") if (u := self._reach_updated.get(duid)) else None),
+            "home_ready": self._reach_png_home.get(duid) is not None,
             "rooms": meta,
         }
         if self._reach_sig.get(duid) == sig or duid in self._reach_busy:
             return
         self._reach_sig[duid] = sig
         args = self.reach_render_args(duid)
-        if args is None:
-            if self._reach_png.get(duid) is not None:
+        hargs = self.reach_home_args(duid)
+        if args is None and hargs is None:
+            if self._reach_png.get(duid) is not None or self._reach_png_home.get(duid) is not None:
                 self._reach_png[duid] = None
+                self._reach_png_home[duid] = None
                 self._reach_updated[duid] = dt_util.utcnow()
             return
         self._reach_busy.add(duid)
 
-        def _render() -> bytes | None:
-            rgba = reachmod.render_rgba(*args)
+        def _one(a: Any) -> bytes | None:
+            if a is None:
+                return None
+            rgba = reachmod.render_rgba(*a)
             return reachmod.png_bytes(rgba) if rgba is not None else None
+
+        def _render() -> tuple[bytes | None, bytes | None]:
+            return _one(args), _one(hargs)
 
         async def _job() -> None:
             try:
-                png = await self.hass.async_add_executor_job(_render)
+                png, png_home = await self.hass.async_add_executor_job(_render)
             except Exception as err:  # noqa: BLE001 - a render failure must never break the poll
                 _LOGGER.warning("AnyVac: reach mask render failed for %s: %s", device.name, err)
-                png = None
+                png = png_home = None
             finally:
                 self._reach_busy.discard(duid)
             self._reach_png[duid] = png
+            self._reach_png_home[duid] = png_home
             self._reach_updated[duid] = dt_util.utcnow()
             self.async_update_listeners()
 
         self.hass.async_create_task(_job())
 
-    def _reach_entity_id(self, duid: str) -> str | None:
+    def _reach_entity_id(self, duid: str, home: bool = False) -> str | None:
         try:
             from homeassistant.helpers import entity_registry as er
 
-            return er.async_get(self.hass).async_get_entity_id("image", DOMAIN, f"{duid}_anyvac_reach")
+            uid = f"{duid}_anyvac_reach_home" if home else f"{duid}_anyvac_reach"
+            return er.async_get(self.hass).async_get_entity_id("image", DOMAIN, uid)
         except Exception:  # noqa: BLE001 - registry not ready (tests, early start)
             return None
 
-    def reach_png(self, duid: str) -> bytes | None:
-        return self._reach_png.get(duid)
+    def reach_png(self, duid: str, home: bool = False) -> bytes | None:
+        return (self._reach_png_home if home else self._reach_png).get(duid)
 
     def reach_updated(self, duid: str) -> datetime | None:
         return self._reach_updated.get(duid)
