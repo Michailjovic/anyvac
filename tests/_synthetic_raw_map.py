@@ -26,6 +26,7 @@ def make_raw_map(
     map_index: int = 1,
     map_sequence: int = 1,
     rooms: dict[int, tuple[int, int, int, int]] | None = None,
+    walls: list[tuple[int, int, int, int]] | None = None,
 ) -> bytes:
     """Build a minimal synthetic raw map blob. `rooms` is
     `{segment_id: (x0, y0, x1, y1)}` in the image's own (col, row) cell
@@ -42,6 +43,8 @@ def make_raw_map(
     grid[:, -1] = 0x01
     for room_id, (x0, y0, x1, y1) in rooms.items():
         grid[y0:y1, x0:x1] = (room_id << 3) | 7
+    for x0, y0, x1, y1 in walls or []:  # interior walls, painted over rooms
+        grid[y0:y1, x0:x1] = 0x01
     image_bytes = grid.tobytes()
 
     image_header_len = 24

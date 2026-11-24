@@ -675,6 +675,7 @@ def _apply_home_frame_contract(
         "rotation_deg": rec.get("rot_deg"),
         "score": rec.get("score"),
         "iou": rec.get("iou"),
+        "wall_conflict": rec.get("wall_conflict"),
     }
     device.data["vacuum_position_home_px"] = _home_px_point(
         device.data.get("vacuum_position"), rec, frame
@@ -955,6 +956,7 @@ def _compute_home_frame_result(
         "iou": None,
         "method": None,
         "rot_deg": None,
+        "wall_conflict": None,
         "segment_masks": {},
     }
     try:
@@ -998,29 +1000,59 @@ def _compute_home_frame_result(
         }
 
     # Continuity first (docs/40 §4.2 point 5): the frame this duid is already
-    # in gets tried before any other, and a pass there short-circuits the
-    # search — never wander to a different frame while the current one still
-    # matches.
+    # in keeps it as long as it still matches AND other robots share it.
+    #
+    # 1.57.1: a frame this duid holds ALONE does not short-circuit the search.
+    # Registrations used to run concurrently against one snapshot, so on a
+    # fresh start every robot saw no frames and founded its own; continuity
+    # then kept each one in its private frame forever (it always matches
+    # itself). Now a robot alone in its frame joins another frame that passes
+    # the gate, and its old frame — left empty — is marked stale.
+    #
+    # The gate is floor overlap (covered / IoU) AND `wall_conflict`: floor
+    # blobs alone matched a one-room cellar to the flat at covered 0.72 / IoU
+    # 0.67; its walls cut through the flat's open floor (conflict 0.72+), the
+    # same flat's robots stay at 0.21-0.41.
     current_frame_id = robot_frame_snapshot.get(duid)
     candidates: list[str] = [current_frame_id] if current_frame_id in frames_snapshot else []
     candidates += [fid for fid in frames_snapshot if fid not in candidates]
 
-    best: tuple[str, Any] | None = None  # (frame_id, Registration)
+    def _others(fid: str) -> bool:
+        return any(d != duid for d in (frames_snapshot[fid].get("robots") or {}))
+
+    passing: list[tuple[str, Any, tuple[float, float, float], float]] = []
     for fid in candidates:
         frame = frames_snapshot[fid]
         if frame.get("stale") or not frame.get("width") or not frame.get("height"):
             continue
+        if fid != current_frame_id and not _others(fid):
+            continue  # an empty frame is no reference
         reg = homeframe.register_with_fallback(grid.floor, frame["floor_mask"])
-        passes = reg.covered >= homeframe.DEFAULT_GATE_COVERED and reg.iou >= homeframe.DEFAULT_GATE_IOU
-        if passes and (best is None or (reg.covered, reg.iou) > (best[1].covered, best[1].iou)):
-            best = (fid, reg)
-        if fid == current_frame_id and passes:
+        if reg.covered < homeframe.DEFAULT_GATE_COVERED or reg.iou < homeframe.DEFAULT_GATE_IOU:
+            continue
+        affine = homeframe.affine_from_registration(reg, grid, frame["origin_mm"])
+        if fid == current_frame_id and not _others(fid):
+            conflict = 0.0  # its own map: walls agree by construction
+        else:
+            conflict = homeframe.wall_conflict(frame, grid, *affine)
+        if conflict > homeframe.DEFAULT_GATE_WALL_CONFLICT:
+            continue
+        passing.append((fid, reg, affine, conflict))
+        if fid == current_frame_id and _others(fid):
             break
 
+    best: tuple[str, Any, tuple[float, float, float], float] | None = None
+    shared = [p for p in passing if _others(p[0])]
+    pool = shared or passing
+    for cand in pool:
+        if best is None or (cand[1].covered, cand[1].iou) > (best[1].covered, best[1].iou):
+            best = cand
+    if shared and current_frame_id in [p[0] for p in shared]:
+        best = next(p for p in shared if p[0] == current_frame_id)
+
     if best is not None:
-        fid, reg = best
+        fid, reg, (rot_deg, tx_mm, ty_mm), conflict = best
         frame = frames_snapshot[fid]
-        rot_deg, tx_mm, ty_mm = homeframe.affine_from_registration(reg, grid, frame["origin_mm"])
         merged = homeframe.merge_robot_into_frame(frame, grid, rot_deg, tx_mm, ty_mm)
         was_founder = (frame.get("robots") or {}).get(duid, {}).get("method") == "reference"
         status = "reference" if was_founder else "aligned"
@@ -1028,6 +1060,7 @@ def _compute_home_frame_result(
             rot_deg, tx_mm, ty_mm, reg.covered, reg.iou,
             "reference" if was_founder else reg.method, status,
         )
+        merged["robots"][duid]["wall_conflict"] = round(conflict, 3)
         result["updated_frames"][fid] = merged
         result["robot_frame"] = fid
         result["status"] = status
@@ -1035,6 +1068,7 @@ def _compute_home_frame_result(
         result["iou"] = reg.iou
         result["method"] = reg.method
         result["rot_deg"] = rot_deg
+        result["wall_conflict"] = conflict
         # docs/40 §4.2 point 6 byproduct (`outline_home_px`/`home_room_id`):
         # one full-frame-sized mask per room segment, registered the SAME
         # point-based way the floor/wall masks were just merged — computed
@@ -3353,7 +3387,16 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     self._wet_path_open[duid] = True
         hf_raw = await self._home_frame_store.async_load()
         if isinstance(hf_raw, dict):
-            self._home_frames, self._robot_frame = homeframe.frames_from_storage(hf_raw)
+            if homeframe.storage_is_current(hf_raw):
+                self._home_frames, self._robot_frame = homeframe.frames_from_storage(hf_raw)
+            elif hf_raw.get("frames"):
+                _LOGGER.warning(
+                    "AnyVac: home frames were built under older registration rules — "
+                    "dropping %d frame(s) and rebuilding them from the vacuums' current "
+                    "maps. A floorplan snapshotted from a home frame (crop_box.frame_id) "
+                    "or calibrated against one (home_anchors) needs to be redone.",
+                    len(hf_raw.get("frames") or {}),
+                )
 
     def _history_for_save(self) -> dict[str, dict[str, str]]:
         return self._history
@@ -3375,7 +3418,12 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         (`_async_run_home_frame_registration`), so this never blocks the
         polling coroutine it's called from."""
         duid = device.duid
-        if duid in self._home_frame_disabled or duid in self._home_frame_inflight:
+        # 1.57.1: one registration at a time, for ALL robots. Concurrent runs
+        # each worked on a snapshot taken before the others' results landed —
+        # on a fresh start every robot saw no frames and founded its own, and
+        # two robots joining one frame at once lost one merge. A robot skipped
+        # here keeps its old cache key, so the next poll tries again.
+        if duid in self._home_frame_disabled or self._home_frame_inflight:
             return
         dbg = device.data.get("debug_map")
         if not isinstance(dbg, dict):
@@ -3383,13 +3431,28 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         raw_sha1 = dbg.get("raw_sha1")
         if raw_sha1 is None:
             return
-        key = (dbg.get("map_index"), dbg.get("map_sequence"), raw_sha1)
-        if self._home_frame_cache_key.get(duid) == key:
+        seen = self.__dict__.setdefault("_home_frame_raw_seen", {})
+        if seen.get(duid) == raw_sha1:
             return
         fetched = self.raw_map_for(duid)
         if fetched is None:
             return
         raw, _meta = fetched
+        # 1.57.1: the cache key is the decoded floor/wall grid, not the raw map.
+        # The raw map (and its header's map_index counter) changes with every
+        # upload — trace and position included — so 1.57.0 re-ran the FFT
+        # registration on every map upload of a cleaning robot. Decoding the
+        # grid costs ~1 ms; the registration only runs when the floor plan
+        # itself changed.
+        try:
+            grid_sha1 = homeframe.grid_signature(homeframe.decode_grid(raw))
+        except Exception:  # noqa: BLE001 - malformed raw: let the registration report it
+            grid_sha1 = raw_sha1
+        key = (dbg.get("map_index"), dbg.get("map_sequence"), grid_sha1)
+        if (self._home_frame_cache_key.get(duid) or (None, None, None))[2] == grid_sha1:
+            seen[duid] = raw_sha1
+            return
+        seen[duid] = raw_sha1
         lib_rooms = dict(device.data.get("_lib_rooms") or {})
         self._home_frame_inflight.add(duid)
         self.hass.async_create_task(
@@ -3447,6 +3510,10 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             if old_frame is not None and duid in (old_frame.get("robots") or {}):
                 trimmed = dict(old_frame)
                 trimmed["robots"] = {k: v for k, v in old_frame["robots"].items() if k != duid}
+                if not trimmed["robots"]:
+                    # 1.57.1: left empty (its robot joined a shared frame) —
+                    # nothing references it as a live reference any more.
+                    trimmed["stale"] = True
                 self._home_frames[old_fid] = trimmed
             old_masks = dict(self._home_frame_room_masks.get(old_fid) or {})
             if duid in old_masks:

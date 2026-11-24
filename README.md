@@ -73,7 +73,7 @@ any manual "seat" configuration per robot:
 | Attribute | Meaning |
 | --- | --- |
 | `home_frame` | `{id, cell_mm, scale, width_px, height_px}` — the shared raster this vacuum currently belongs to, or `null` if it has none yet (just restarted, or its map failed the decoder self-test) |
-| `registration` | `{status, method, rotation_deg, score, iou}` — `status` is `reference` (this vacuum's map founded/still founds the frame), `aligned` (successfully registered onto it), or `unaligned` (its map doesn't currently match anything, e.g. a different floor — it gets its own frame automatically) |
+| `registration` | `{status, method, rotation_deg, score, iou, wall_conflict}` — `wall_conflict` is the share of walls that cut through the other map's open floor (0 for a frame's founder; a match needs at most 0.55). `status` is `reference` (this vacuum's map founded/still founds the frame), `aligned` (successfully registered onto it), or `unaligned` (its map doesn't currently match anything, e.g. a different floor — it gets its own frame automatically) |
 | `vacuum_position_home_px` / `charger_home_px` | the same points as `vacuum_position_px`/`charger_px`, in the shared frame's px space. `vacuum_position_home_px.a` (heading) is its OWN self-consistent convention — standard image-px `atan2` (0°=+x/right, 90°=+y/down), integration ≥ 1.8.1 — distinct from the legacy `vacuum_position_px.a` contract, where a consumer negates `sin` to undo a flip baked into that contract's solved affine |
 | `path_dry_home_px` / `path_wet_home_px` | the same segmented trajectories, in the shared frame's px space |
 | `rooms[].bbox_home_px` | room bounding box in the shared frame's px space |

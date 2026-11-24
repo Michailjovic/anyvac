@@ -211,21 +211,37 @@ def _device_with_debug(duid: str, map_index: Any, map_sequence: Any, raw_sha1: s
     )
 
 
-def test_unchanged_cache_key_never_dispatches_a_registration_job() -> None:
+def test_unchanged_raw_map_never_dispatches_a_registration_job() -> None:
     coord = _bare_coordinator()
-    coord._home_frame_cache_key["s7"] = (1, 1, "sha1")
+    coord._home_frame_raw_seen = {"s7": "sha1"}
     device = _device_with_debug("s7", 1, 1, "sha1")
     coord._maybe_register_home_frame(device)
     assert coord.hass.created_tasks == []
 
 
-def test_changed_cache_key_dispatches_a_registration_job(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_changed_floor_plan_dispatches_a_registration_job(monkeypatch: pytest.MonkeyPatch) -> None:
     coord = _bare_coordinator()
-    coord._home_frame_cache_key["s7"] = (1, 1, "sha1")
-    monkeypatch.setattr(coord, "raw_map_for", lambda duid: (b"rawbytes", {}))
-    device = _device_with_debug("s7", 1, 2, "sha2")
-    coord._maybe_register_home_frame(device)
+    raw = make_raw_map(60, 60, top=5, left=3, rooms={1: (10, 10, 40, 40)})
+    monkeypatch.setattr(coord, "raw_map_for", lambda duid: (raw, {}))
+    coord._home_frame_cache_key["s7"] = (1, 1, "other-grid")
+    coord._maybe_register_home_frame(_device_with_debug("s7", 1, 2, "sha2"))
     assert len(coord.hass.created_tasks) == 1
+
+
+def test_new_upload_of_the_same_floor_plan_does_not_reregister(monkeypatch: pytest.MonkeyPatch) -> None:
+    """1.57.1: a cleaning robot uploads a new map every few seconds (new trace,
+    new position, new header counter) while its floor plan stays the same — the
+    FFT registration must not run for each upload."""
+    from custom_components.anyvac import homeframe
+
+    coord = _bare_coordinator()
+    raw = make_raw_map(60, 60, top=5, left=3, map_index=7, rooms={1: (10, 10, 40, 40)})
+    monkeypatch.setattr(coord, "raw_map_for", lambda duid: (raw, {}))
+    sig = homeframe.grid_signature(homeframe.decode_grid(raw))
+    coord._home_frame_cache_key["s7"] = (1, 1, sig)
+    coord._maybe_register_home_frame(_device_with_debug("s7", 3888, 75, "sha-new-upload"))
+    assert coord.hass.created_tasks == []
+    assert coord._home_frame_raw_seen["s7"] == "sha-new-upload"
 
 
 def test_disabled_duid_never_dispatches_even_on_a_changed_key(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -237,13 +253,21 @@ def test_disabled_duid_never_dispatches_even_on_a_changed_key(monkeypatch: pytes
     assert coord.hass.created_tasks == []
 
 
-def test_inflight_duid_is_not_dispatched_twice(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_registrations_run_one_at_a_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    """1.57.1: while ANY robot's registration runs, no other starts — each run
+    must see the frames the previous one produced. Concurrent runs on a fresh
+    start each saw no frames and founded one apiece. The waiting robot is not
+    marked as seen, so the next poll retries it."""
     coord = _bare_coordinator()
-    coord._home_frame_inflight.add("s7")
-    monkeypatch.setattr(coord, "raw_map_for", lambda duid: (b"rawbytes", {}))
-    device = _device_with_debug("s7", 1, 2, "sha2")
-    coord._maybe_register_home_frame(device)
+    coord._home_frame_inflight.add("s6")
+    raw = make_raw_map(60, 60, top=5, left=3, rooms={1: (10, 10, 40, 40)})
+    monkeypatch.setattr(coord, "raw_map_for", lambda duid: (raw, {}))
+    coord._maybe_register_home_frame(_device_with_debug("s7", 1, 2, "sha2"))
     assert coord.hass.created_tasks == []
+    assert "s7" not in coord.__dict__.get("_home_frame_raw_seen", {})
+    coord._home_frame_inflight.clear()
+    coord._maybe_register_home_frame(_device_with_debug("s7", 1, 2, "sha2"))
+    assert len(coord.hass.created_tasks) == 1
 
 
 # ── 7) home_px_to_mm / mm_to_home_px round trip (coordinator methods) ──────

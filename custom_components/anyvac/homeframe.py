@@ -79,6 +79,15 @@ _BLOCK_TYPE_IMAGE = 2
 # experience (Fáze 0's field report) suggests different numbers.
 DEFAULT_GATE_COVERED = 0.6
 DEFAULT_GATE_IOU = 0.4
+# Structural gate (1.57.1): the most of one map's walls that may lie inside the
+# other map's floor where both maps know the area (`wall_conflict`). Floor
+# blobs alone cannot tell two places of similar outline apart — a 68 m2
+# one-room cellar matched a 53 m2 flat at covered 0.72 / IoU 0.67, well past
+# the floor gate. Walls can: the flat's interior walls fall in the middle of the
+# cellar's open floor. Measured on four real maps (2026-11-24): same flat
+# 0.21-0.31 robot to robot and up to 0.41 against a frame two robots built
+# (each robot adds its own furniture blobs), different place 0.72-0.76.
+DEFAULT_GATE_WALL_CONFLICT = 0.55
 
 # How far (mm) beyond the founding robot's own grid origin a frame's array
 # starts, in both +/-x and +/-y — headroom so a small amount of frame growth
@@ -186,6 +195,18 @@ def decode_grid(raw: bytes) -> Grid:
         map_index=map_index,
         map_sequence=map_sequence,
     )
+
+
+def grid_signature(grid: Grid) -> str:
+    """Short hash of what registration actually looks at — the floor and wall
+    grid and its placement (1.57.1 cache key). The raw map also carries the
+    trace and robot position, so its own hash changes on every upload."""
+    import hashlib
+
+    return hashlib.sha1(
+        grid.floor.tobytes() + grid.wall.tobytes()
+        + f"{grid.left},{grid.top},{grid.width},{grid.height}".encode()
+    ).hexdigest()[:12]
 
 
 def cell_to_mm(grid: Grid, ix: int, iy: int) -> tuple[int, int]:
@@ -1079,7 +1100,7 @@ def room_identity(
 # are numpy bool arrays (not base64 strings) and `origin_mm` is a tuple.
 
 _ROBOT_RECORD_STR_KEYS = ("method", "grid_sha1", "updated", "status")
-_ROBOT_RECORD_FLOAT_KEYS = ("rot_deg", "tx_mm", "ty_mm", "score", "iou")
+_ROBOT_RECORD_FLOAT_KEYS = ("rot_deg", "tx_mm", "ty_mm", "score", "iou", "wall_conflict")
 _ROBOT_RECORD_INT_KEYS = ("map_index", "map_sequence")
 
 
@@ -1184,15 +1205,29 @@ def frame_from_storage(data: Any) -> dict[str, Any] | None:
         return None
 
 
+# Revision of the registration rules the stored frames were built with. Frames
+# from an older revision are dropped on load and rebuilt from the robots'
+# current maps (1.57.1: frames built by 1.57.0 could hold a different place
+# merged in by a floor-only match, and robots split into private frames by
+# concurrent registrations — neither heals by itself).
+GATE_REV = 2
+
+
 def frames_to_storage(
     frames: dict[str, dict[str, Any]], robot_frame: dict[str, str]
 ) -> dict[str, Any]:
     """Whole-store snapshot -> the JSON-safe dict `Store.async_delay_save`
     writes (docs/40 §4.2's top-level `{"frames": ..., "robot_frame": ...}`)."""
     return {
+        "gate_rev": GATE_REV,
         "frames": {str(fid): frame_to_storage(f) for fid, f in frames.items()},
         "robot_frame": {str(duid): str(fid) for duid, fid in robot_frame.items()},
     }
+
+
+def storage_is_current(data: Any) -> bool:
+    """False for a store written under older registration rules (`GATE_REV`)."""
+    return isinstance(data, dict) and data.get("gate_rev") == GATE_REV
 
 
 def frames_from_storage(
@@ -1273,6 +1308,63 @@ def _robot_cells_to_frame_cells(
     col = np.round((fx_mm - ox_mm) / cell_mm).astype(np.int64)
     row = np.round((fy_mm - oy_mm) / cell_mm).astype(np.int64)
     return row, col
+
+
+def _shift_or(mask: np.ndarray, r: int) -> np.ndarray:
+    """Square dilation by `r` cells (no scipy, docs/40 §6)."""
+    out = mask.copy()
+    h, w = mask.shape
+    for dy in range(-r, r + 1):
+        for dx in range(-r, r + 1):
+            if dy == 0 and dx == 0:
+                continue
+            ys0, ys1 = max(0, dy), min(h, h + dy)
+            xs0, xs1 = max(0, dx), min(w, w + dx)
+            out[ys0:ys1, xs0:xs1] |= mask[ys0 - dy : ys1 - dy, xs0 - dx : xs1 - dx]
+    return out
+
+
+def wall_conflict(
+    frame: dict[str, Any], grid: Grid, rot_deg: float, tx_mm: float, ty_mm: float
+) -> float:
+    """Structural disagreement between `grid` placed by `(rot_deg, tx_mm,
+    ty_mm)` and `frame` (1.57.1, `DEFAULT_GATE_WALL_CONFLICT`).
+
+    In both directions: of the walls one side has where the other side also
+    knows the area (its floor or wall, widened by one cell), the share that
+    lies inside the other side's floor (eroded by one cell, so a one-cell
+    misplacement of a wall line is not a conflict). Returns the larger of the
+    two. Walls the other map never saw (unexplored, beyond its reach) are
+    ignored, so a partial map of the same place is not penalised; walls that
+    cut through open floor of the other map are what two different places
+    have and the same place does not.
+
+    The candidate is placed with the same point transform the merge uses
+    (`_robot_cells_to_frame_cells`) — no second resampling (docs/14 rule 1)."""
+    h, w = int(frame["height"]), int(frame["width"])
+    cell_mm = frame.get("cell_mm", FRAME_CELL_MM)
+    ff = np.asarray(frame["floor_mask"], dtype=bool)
+    fw = np.asarray(frame["wall_mask"], dtype=bool)
+    bf = np.zeros((h, w), dtype=bool)
+    bw = np.zeros((h, w), dtype=bool)
+    for src, dst in ((grid.floor, bf), (grid.wall, bw)):
+        ys, xs = np.nonzero(src)
+        if ys.size == 0:
+            continue
+        row, col = _robot_cells_to_frame_cells(grid, ys, xs, rot_deg, tx_mm, ty_mm, frame["origin_mm"], cell_mm)
+        ok = (row >= 0) & (row < h) & (col >= 0) & (col < w)
+        dst[row[ok], col[ok]] = True
+    known_f = _shift_or(ff | fw, 1)
+    known_b = _shift_or(bf | bw, 1)
+    core_f = ~_shift_or(~ff, 1)
+    core_b = ~_shift_or(~bf, 1)
+
+    def _part(walls: np.ndarray, known_other: np.ndarray, core_other: np.ndarray) -> float:
+        seen = walls & known_other
+        n = int(seen.sum())
+        return float((seen & core_other).sum()) / n if n else 0.0
+
+    return max(_part(fw, known_b, core_b), _part(bw, known_f, core_f))
 
 
 def segment_masks_in_frame(
