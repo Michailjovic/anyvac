@@ -1640,16 +1640,14 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         """(records that still match the robot's current map, per-room meta incl.
         stale ones) for this robot."""
         self._reach_ready()
-        seg_now = {
-            r.get("name"): r.get("segment_id")
-            for r in device.data.get("rooms") or []
-            if r.get("name")
+        rooms_now = {
+            r.get("name"): r for r in device.data.get("rooms") or [] if r.get("name")
         }
-        map_index = self._map_index(device)
         live: list[dict[str, Any]] = []
         meta: dict[str, dict[str, Any]] = {}
         for nm, rec in sorted((self._reach_masks.get(device.duid) or {}).items()):
-            stale = reachmod.is_stale(rec, seg_now.get(nm), map_index)
+            room = rooms_now.get(nm) or {}
+            stale = reachmod.is_stale(rec, room.get("segment_id"), room)
             meta[nm] = {
                 "at": rec.get("at"),
                 "floor_pct": rec.get("floor_pct"),
@@ -1669,11 +1667,17 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             return None
         return aff, int(round(width * scale)), int(round(height * scale))
 
-    def reach_render_args(self, duid: str) -> tuple[int, int, Any, tuple[float, ...], int, int] | None:
+    def reach_render_args(
+        self, duid: str, device: AnyVacDevice | None = None
+    ) -> tuple[int, int, Any, tuple[float, ...], int, int] | None:
         """`(x0, y0, mask, aff, width, height)` for `reach.render_rgba` — the
         union of this robot's current (non-stale) records on its own map canvas.
-        None when there is nothing to draw or no calibration yet."""
-        device = (self.data or {}).get(duid)
+        None when there is nothing to draw or no calibration yet.
+
+        `device` is the poll's fresh device; without it the last published one
+        (`self.data`) is used — which is None during the first poll after a
+        restart (1.57.1)."""
+        device = device or (self.data or {}).get(duid)
         if device is None:
             return None
         live, _meta = self._reach_current(device)
@@ -1709,11 +1713,13 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         scale = frame.get("scale", homeframe.HOME_PX_SCALE)
         return frame_id, aff, int(frame["width"] * scale), int(frame["height"] * scale)
 
-    def reach_home_args(self, duid: str) -> tuple[int, int, Any, tuple[float, ...], int, int] | None:
+    def reach_home_args(
+        self, duid: str, device: AnyVacDevice | None = None
+    ) -> tuple[int, int, Any, tuple[float, ...], int, int] | None:
         """Like `reach_render_args`, on the robot's home-frame canvas — the frame's
         own px space (`*_home_px`, `crop_box.frame_id`). None without a
         registration or without current records."""
-        device = (self.data or {}).get(duid)
+        device = device or (self.data or {}).get(duid)
         if device is None:
             return None
         live, _meta = self._reach_current(device)
@@ -1752,8 +1758,12 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         if self._reach_sig.get(duid) == sig or duid in self._reach_busy:
             return
         self._reach_sig[duid] = sig
-        args = self.reach_render_args(duid)
-        hargs = self.reach_home_args(duid)
+        # 1.57.1: render from THIS poll's device. `self.data` is still None
+        # during the first poll after a restart; reading it there produced no
+        # args, the signature was stored anyway, and nothing re-rendered until
+        # the next recorded clean — every restart blanked the reach images.
+        args = self.reach_render_args(duid, device)
+        hargs = self.reach_home_args(duid, device)
         if args is None and hargs is None:
             if self._reach_png.get(duid) is not None or self._reach_png_home.get(duid) is not None:
                 self._reach_png[duid] = None

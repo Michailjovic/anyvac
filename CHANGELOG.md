@@ -6,6 +6,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.57.1] - 2026-11-24
+
+Pairs with card 1.57.0 (card unchanged). Reach mask fixes from the first field days.
+
+- **Fixed: the reach images went blank after every Home Assistant restart.** The first poll after a restart read the vacuum from the coordinator's previous data, which does not exist yet; it found nothing to render, stored the render signature anyway and never rendered again until the next recorded clean. The poll now renders from its own fresh device. Live: `image.*_reach_mask` turned `unknown` at each restart (2026-11-21 19:20, 2026-11-23 20:05, 2026-11-24 01:47) although the records were stored.
+- **Fixed: records went stale after the robot's next map upload.** 1.57.0 compared the map header's `map_index` as if it were a map slot; it is a counter that moves with every upload (live values 3888 / 1583 / 5905), so only the rooms of the very last clean were ever drawn. Staleness now checks the room's `segment_id` and whether the record still lies on the room's current bbox (at least 60 % of the record's bounding box within the room bbox widened by 300 mm). A map deleted and redrawn at a new origin or rotation is caught even when it reuses the same segment ids; one that lands where the old one was keeps its records, which still fit. Existing records become current again without a new clean.
+- Tests: `test_reach.py` +3 (map_index counter, record off its room, first poll after a restart), all three fail on 1.57.0.
+
 ## [1.57.0] - 2026-11-21
 
 Pairs with card 1.57.0. Completes docs/51.

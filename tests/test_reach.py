@@ -51,11 +51,33 @@ def test_record_needs_80_percent_of_the_reachable_floor() -> None:
 
 def test_stale_when_the_map_was_redrawn() -> None:
     rec = {"segment_id": 16, "map_index": 0}
-    assert not reachmod.is_stale(rec, 16, 0)
-    assert not reachmod.is_stale(rec, "16", None)  # unknown map index never stales
-    assert reachmod.is_stale(rec, 17, 0)  # new segment id = map deleted and redrawn
-    assert reachmod.is_stale(rec, None, 0)  # room gone
-    assert reachmod.is_stale(rec, 16, 1)  # other map slot
+    assert not reachmod.is_stale(rec, 16)
+    assert not reachmod.is_stale(rec, "16", None)  # no room geometry -> only the id decides
+    assert reachmod.is_stale(rec, 17)  # new segment id = map deleted and redrawn
+    assert reachmod.is_stale(rec, None)  # room gone
+
+
+def test_map_index_counter_never_stales_a_record() -> None:
+    """1.57.1: the header's map_index moves with every map upload (live values
+    3888 / 1583 / 5905) — 1.57.0 treated it as a map slot and staled every
+    record after the robot's next upload."""
+    rec = {"segment_id": 16, "map_index": 3880, "x0": 440, "y0": 270, "w": 80, "h": 120}
+    room = {"segment_id": 16, "x0": 22000, "y0": 13500, "x1": 26000, "y1": 19500}
+    assert not reachmod.is_stale(rec, 16, room)
+
+
+def test_stale_when_the_record_no_longer_lies_on_its_room() -> None:
+    # record 4 x 6 m at (22.0 .. 26.0, 13.5 .. 19.5) m
+    rec = {"segment_id": 16, "x0": 440, "y0": 270, "w": 80, "h": 120}
+    same = {"x0": 22000, "y0": 13500, "x1": 26000, "y1": 19500}
+    nudged = {"x0": 22200, "y0": 13700, "x1": 26200, "y1": 19700}  # small drift: still fits
+    moved = {"x0": 24000, "y0": 30000, "x1": 28000, "y1": 36000}  # redrawn elsewhere, same id
+    rotated = {"x0": 18000, "y0": 15000, "x1": 24000, "y1": 19000}  # 90 deg turn, half overlap
+    assert not reachmod.is_stale(rec, 16, same)
+    assert not reachmod.is_stale(rec, 16, nudged)
+    assert reachmod.is_stale(rec, 16, moved)
+    assert reachmod.is_stale(rec, 16, rotated)
+    assert not reachmod.is_stale(rec, 16, {"x0": None})  # unreadable bbox never stales
 
 
 def test_union_of_rooms() -> None:
@@ -225,6 +247,29 @@ async def test_publish_renders_once_per_change(monkeypatch: pytest.MonkeyPatch) 
     c._reach_publish(dev)
     assert tasks == []  # unchanged inputs -> no re-render
     assert dev.data["reach"]["rooms"]["Kitchen"]["floor_pct"] == 100
+
+
+@pytest.mark.asyncio
+async def test_first_poll_after_restart_renders(monkeypatch: pytest.MonkeyPatch) -> None:
+    """1.57.1: right after a restart `self.data` is still None. 1.57.0 read the
+    device from there, found nothing to render, stored the signature anyway and
+    never rendered again until the next recorded clean."""
+    c = _coord()
+    dev = _device()
+    c._record_reach(dev, _run({"Kitchen": _cells(10, 10, 10, 10)}), _geo())
+    c._reach_rev = {}  # as loaded from the store: no revision bump this session
+    c.data = None
+    tasks: list = []
+
+    async def _exec(fn, *a):
+        return fn(*a)
+
+    c.hass = SimpleNamespace(async_add_executor_job=_exec, async_create_task=lambda coro: tasks.append(coro))
+    monkeypatch.setattr(c, "_reach_entity_id", lambda duid, home=False: "image.s8_reach_mask")
+    c._reach_publish(dev)
+    assert len(tasks) == 1
+    await tasks.pop()
+    assert c.reach_png("s8") is not None and c.reach_updated("s8") is not None
 
 
 def test_reach_meta_is_unrecorded() -> None:

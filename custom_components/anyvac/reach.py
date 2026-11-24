@@ -19,8 +19,8 @@ Rules (docs/51 §2.2):
 
 Coordinates are the robot's own mm, on the same 50 mm absolute grid
 `coverage.key` uses. A record therefore only means something for the map it was
-measured on; it carries the room's `segment_id` and the `map_index` so a
-re-mapped robot (new segment ids after the map was deleted and redrawn in the
+measured on; `is_stale` checks its `segment_id` and whether it still lies on the
+room's current bbox, so a re-mapped robot (map deleted and redrawn in the
 Roborock app) shows the old record as stale instead of drawing it in the wrong
 place (§2.4).
 """
@@ -110,17 +110,51 @@ def make_record(
     }
 
 
-def is_stale(rec: dict[str, Any], segment_id_now: Any, map_index_now: Any) -> bool:
-    """A record measured on a different map than the robot has now: the room is
-    gone, its segment id changed (map deleted and redrawn), or the map slot
-    changed. Unknown values on either side never make a record stale."""
+# How far (mm) a record may spill past its room's bbox and still count as
+# "inside" — the swept footprint reaches into doorways and under the bbox edge.
+STALE_MARGIN_MM = 300
+# Share of a record's bounding box that must still lie on its room for the
+# record to count as measured on the current map.
+STALE_MIN_OVERLAP = 0.6
+
+
+def is_stale(rec: dict[str, Any], segment_id_now: Any, room_bbox_mm: Any = None) -> bool:
+    """A record measured on a different map than the robot has now.
+
+    Stale when the room is gone or its segment id changed, or when the record no
+    longer lies on the room: less than `STALE_MIN_OVERLAP` of its bounding box
+    falls inside the room's current bbox (`x0..y1` in robot mm, widened by
+    `STALE_MARGIN_MM`). A map deleted and redrawn in the Roborock app can reuse
+    the same segment ids at a new origin or rotation — the geometry is what
+    tells. A redrawn map that lands where the old one was keeps its records,
+    which is correct: they still fit.
+
+    1.57.1: the map header's `map_index` is NOT used. It is a counter that moves
+    with every map upload (live: 3888 / 1583 / 5905), so 1.57.0 marked every
+    record stale as soon as the robot uploaded its next map.
+    """
     if segment_id_now is None:
         return True
     seg = rec.get("segment_id")
     if seg is not None and str(seg) != str(segment_id_now):
         return True
-    mi = rec.get("map_index")
-    return mi is not None and map_index_now is not None and mi != map_index_now
+    if not isinstance(room_bbox_mm, dict):
+        return False
+    try:
+        rx0 = float(room_bbox_mm["x0"]) - STALE_MARGIN_MM
+        ry0 = float(room_bbox_mm["y0"]) - STALE_MARGIN_MM
+        rx1 = float(room_bbox_mm["x1"]) + STALE_MARGIN_MM
+        ry1 = float(room_bbox_mm["y1"]) + STALE_MARGIN_MM
+        x0, y0 = float(rec["x0"]) * CELL_MM, float(rec["y0"]) * CELL_MM
+        x1, y1 = x0 + float(rec["w"]) * CELL_MM, y0 + float(rec["h"]) * CELL_MM
+    except (KeyError, TypeError, ValueError):
+        return False
+    area = (x1 - x0) * (y1 - y0)
+    if area <= 0:
+        return False
+    ix = max(0.0, min(x1, rx1) - max(x0, rx0))
+    iy = max(0.0, min(y1, ry1) - max(y0, ry0))
+    return (ix * iy) / area < STALE_MIN_OVERLAP
 
 
 def union_mask(records: Iterable[dict[str, Any]]) -> tuple[int, int, np.ndarray] | None:
