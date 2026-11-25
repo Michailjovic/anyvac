@@ -3,9 +3,10 @@
 The card sends an INTENT (rooms + mode + optional restrictions/settings) to
 ``anyvac.clean``; everything the card used to compute client-side — capability
 detection, LPT assignment, segment resolution, dry→wet gating, per-room pinning —
-is built here from the coordinator's own data. The output is the same task list
-format the proven ``run_job`` executor consumes, so execution semantics are
-identical to the field-tested card plans.
+is built here from the coordinator's own data. The output is a list of queue
+items, one per room and pass (docs/52): the job runner sends them to the robots
+one at a time, so the order, the settings and every edit stay under AnyVac's
+control instead of the firmware's.
 
 Room keys are Roborock-app room names (canon rule 5); internal matching against
 the robot maps goes through ``segment_id``.
@@ -35,6 +36,14 @@ DEFAULT_ROOM_MIN = 15.0
 # rule 4) — so without adding it back here the ETA silently omits every wash
 # break a wet session takes.
 WASH_DURATION_MIN = 2.25
+
+# docs/52 §8 (HW test 2026-11-25): a room-by-room robot gets its next room on
+# the way home ~20 s after finishing the previous one; a wet robot that docks
+# to wash at the end of a task loses ~6.5 min (drive home + ~5.5 min wash); a
+# job that starts from the dock with a used mop washes first (~3 min).
+CHAIN_GAP_MIN = 0.35
+END_WASH_MIN = 6.5
+PRE_WASH_MIN = 3.0
 
 
 def vacuum_entity_for_duid(hass: HomeAssistant, duid: str) -> str | None:
@@ -80,6 +89,88 @@ def selects_for_duid(hass: HomeAssistant, duid: str) -> dict[str, str]:
             if k in ent.entity_id:
                 out.setdefault(k, ent.entity_id)
     return out
+
+
+def simulate_queues(robots: dict[str, dict[str, Any]]) -> dict[str, tuple[float, float]]:
+    """Start/finish minute of every queue item (docs/52 §3, §5a).
+
+    ``robots`` = ``{key: {items, wash_mode, interval, batch, since_wash,
+    offset, pre_wash}}``; an item is ``{id, kind, rooms, est_min}`` (for the
+    item a robot is working on now, ``est_min`` is what is LEFT of it). Each
+    robot runs its items in order. A wet item waits for the dry item(s) of the
+    same room(s); dry items never wait. Between two items of a room-by-room
+    robot: ``CHAIN_GAP_MIN`` when the next one is sent on the way home, or
+    ``END_WASH_MIN`` when a wet robot docks to wash first (after every room in
+    the app's by-room mode, once the mopping since the last wash reaches the
+    interval in by-time mode). Inside one task the firmware washes on its own
+    interval (``WASH_DURATION_MIN`` each). A batch robot is one task.
+
+    The single timing model of AnyVac: the planner uses it for the plan, the
+    coordinator for the live ``job_progress`` (docs/14 rule 2)."""
+    times: dict[str, tuple[float, float]] = {}
+    dry_finish: dict[str, float] = {}
+
+    def run_robot(r: dict[str, Any]) -> None:
+        t = float(r.get("offset") or 0.0)
+        mode, interval, batch = r.get("wash_mode"), r.get("interval"), bool(r.get("batch"))
+        since_wash = float(r.get("since_wash") or 0.0)
+        prev_kind: str | None = r.get("prev_kind")
+        first = True
+        for it in r.get("items") or []:
+            kind = it.get("kind")
+            if kind == "wet":
+                if first and mode and r.get("pre_wash", True) and prev_kind is None:
+                    t += PRE_WASH_MIN
+                elif not first and not batch:
+                    wash_now = prev_kind == "wet" and (
+                        mode in ("room", "unknown")
+                        or (mode == "time" and interval and since_wash >= interval)
+                    )
+                    if wash_now:
+                        t += END_WASH_MIN
+                        since_wash = 0.0
+                    else:
+                        t += CHAIN_GAP_MIN
+                gate = max(
+                    (dry_finish.get(room, 0.0) for room in it.get("rooms") or []),
+                    default=0.0,
+                )
+                start = max(t, gate)
+            else:
+                if not first and not batch:
+                    t += CHAIN_GAP_MIN
+                start = t
+            remaining = max(float(it.get("est_min") or 0.0), 0.0)
+            end = start
+            if kind == "wet" and interval and interval > 0:
+                # The firmware's own counter only runs inside one task.
+                in_task = since_wash if batch else 0.0
+                while in_task + remaining >= interval:
+                    chunk = interval - in_task
+                    end += chunk + WASH_DURATION_MIN
+                    remaining -= chunk
+                    in_task = 0.0
+                    since_wash = 0.0
+                since_wash += remaining
+            end += remaining
+            t = end
+            times[it["id"]] = (start, end)
+            if kind == "dry":
+                for room in it.get("rooms") or []:
+                    dry_finish[room] = max(dry_finish.get(room, 0.0), end)
+            prev_kind = kind
+            first = False
+
+    # Gates point from wet items to dry items, possibly of another robot, and a
+    # both-capable robot may run its wet items before somebody's dry ones —
+    # iterate to a fixed point (a few rounds always settle: gates are acyclic).
+    for _ in range(6):
+        before = dict(times)
+        for r in robots.values():
+            run_robot(r)
+        if times == before:
+            break
+    return times
 
 
 class CleanPlanner:
@@ -267,102 +358,117 @@ class CleanPlanner:
             )
         return out, unassigned
 
-    # -- timing estimate (docs/19) ---------------------------------------------------
+    # -- queue order + timing (docs/52 §3, §5a) -----------------------------------
+
+    def wash_mode(self, duid: str) -> tuple[str | None, float | None]:
+        """How the robot's dock decides to wash the mop (docs/52 §3.2).
+
+        ``("room", interval)`` when the app is set to wash after every room
+        (``smart_wash``; the interval is a hidden leftover, possibly still a cap
+        inside a long room — docs/52 V8), ``("time", interval)`` for washing by
+        time, ``("unknown", None)`` for a washing dock whose setting is not
+        readable, ``(None, None)`` for a robot whose dock cannot wash at all."""
+        dev = self.devices.get(duid)
+        dock = (dev.data.get("dock_status") or {}) if dev is not None else {}
+        interval = dock.get("wash_interval_min")
+        if dock.get("smart_wash_enabled"):
+            return "room", interval
+        if interval:
+            return "time", interval
+        if (dock.get("features") or {}).get("is_washable"):
+            # A washing dock we cannot read the setting of: let it dock and
+            # wash after every wet room — the safe choice (docs/52 §3.2).
+            return "unknown", None
+        return None, None
+
+    def wash_info(self, duid: str) -> dict[str, Any]:
+        """The job runner's wash state of one robot (docs/52 §9.4 `wash`)."""
+        mode, interval = self.wash_mode(duid)
+        return {"mode": mode, "interval_min": interval, "mop_min_since_wash": 0.0}
+
+    def _app_sequence(self, duid: str) -> dict[str, int]:
+        """{room name: position} of the Roborock app's room order, read from the
+        robot (`get_clean_sequence`). Only a batch robot's firmware follows it."""
+        seqs = getattr(self.coord, "app_sequence", None) or {}
+        return dict(seqs.get(duid) or {})
+
+    def order_rooms(
+        self,
+        duid: str,
+        rooms: list[str],
+        kind: str,
+        dry_finish: dict[str, float] | None = None,
+        batch: bool = False,
+    ) -> list[str]:
+        """Queue order of one robot's rooms for one pass.
+
+        Batch robots run in the app's order (the firmware decides, docs/19).
+        Room-by-room robots: dry shortest first, so the slow mopping can start
+        as early as possible; wet in the order their dry pass finishes. The
+        full planner (docs/53, 1.59.0) replaces this ordering."""
+        if batch:
+            seq = self._app_sequence(duid)
+            return sorted(rooms, key=lambda r: (seq.get(r, 10_000), r))
+
+        def est(r: str) -> float:
+            return self._estimate(duid, r, kind) or DEFAULT_ROOM_MIN
+
+        if kind == "wet" and dry_finish:
+            return sorted(rooms, key=lambda r: (dry_finish.get(r, 0.0), est(r), r))
+        return sorted(rooms, key=lambda r: (est(r), r))
+
+    def robot_model(self, duid: str, batch: bool = False) -> dict[str, Any]:
+        """What `simulate_queues` needs to know about one robot."""
+        mode, interval = self.wash_mode(duid)
+        return {"wash_mode": mode, "interval": interval, "batch": batch}
 
     def _estimate_timeline(
         self,
         dry_assign: dict[str, list[str]],
         wet_assign: dict[str, list[str]],
+        batch: set[str] | None = None,
     ) -> dict[str, Any]:
-        """Sequence-aware completion estimate.
-
-        The Roborock app's configured room order is dominant regardless of what
-        order HA sends segment ids in — the firmware always visits rooms in that
-        order (confirmed in the field across thousands of cleans, docs/19). We
-        don't control it, we just need to KNOW it: `coordinator.room_sequence` is
-        the user-maintained {room: 1-based position}. Rooms missing a position
-        sort after all sequenced ones (stable, so ties keep assignment order) —
-        the plan's ``unsequenced`` list flags them so the card can warn.
-
-        Replaces the old client-side estimate, which summed
-        ``max(any vacuum's room estimate)`` per room with no notion of sequence,
-        parallelism or dry→wet gating — for a room needing both passes it took
-        ``max(dry, wet)`` instead of ``dry + wet``, i.e. assumed a simultaneous
-        start that never happens.
-
-        Gating mirrors the REAL runtime gate (``anyvac_room_done`` is per room,
-        not "wait for the whole dry batch"): a wet room's start is the specific
-        dry-assigning robot's cumulative time up to (and including) that room,
-        not that robot's total dry session.
-        """
-        seq = self.coord.room_sequence or {}
-        unsequenced: set[str] = set()
-
-        def ordered(rooms: list[str]) -> list[str]:
-            def key(r: str) -> float:
-                if r not in seq:
-                    unsequenced.add(r)
-                return seq.get(r, float("inf"))
-            return sorted(rooms, key=key)
-
-        dry_robot_finish: dict[str, float] = {}
-        room_dry_finish: dict[str, float] = {}
-        for duid, rooms in dry_assign.items():
-            t = 0.0
-            for room in ordered(rooms):
-                t += self._estimate(duid, room, "dry") or DEFAULT_ROOM_MIN
-                room_dry_finish[room] = t
-            dry_robot_finish[duid] = t
-
-        wet_robot_finish: dict[str, float] = {}
-        room_wet_finish: dict[str, float] = {}
-        for duid, rooms in wet_assign.items():
-            own_dry_finish = dry_robot_finish.get(duid, 0.0) if duid in dry_assign else 0.0
-            # Mop wash cadence (docs/23 §6) — None on a dock that can't wash the mop
-            # at all (empty-only dock, no dock, coordinator.py `wash_interval_min`).
-            dev = self.devices.get(duid)
-            wash_interval = (
-                (dev.data.get("dock_status") or {}).get("wash_interval_min")
-                if dev is not None
-                else None
-            )
-            t = 0.0
-            active_since_wash = 0.0
-            for room in ordered(rooms):
-                gate = room_dry_finish.get(room, 0.0)
-                start = max(t, gate, own_dry_finish)
-                remaining = self._estimate(duid, room, "wet") or DEFAULT_ROOM_MIN
-                # Spend this room's active cleaning time, inserting a wash break
-                # (and resetting the cadence counter) every time it crosses the
-                # configured interval — may fire more than once within one long
-                # room, or not at all within a short one.
-                while (
-                    wash_interval
-                    and wash_interval > 0
-                    and active_since_wash + remaining >= wash_interval
-                ):
-                    chunk = wash_interval - active_since_wash
-                    start += chunk + WASH_DURATION_MIN
-                    remaining -= chunk
-                    active_since_wash = 0.0
-                start += remaining
-                active_since_wash += remaining
-                t = start
-                room_wet_finish[room] = t
-            wet_robot_finish[duid] = t
-
-        eta = max(
-            [f for d, f in dry_robot_finish.items() if d not in wet_assign] +
-            list(wet_robot_finish.values()),
-            default=0.0,
-        )
+        """Finish-time estimate of a job whose queues are already in order
+        (``{duid: [room, ...]}`` per pass). Thin wrapper over `simulate_queues`,
+        the same model the live `job_progress` uses."""
+        batch = batch or set()
+        robots: dict[str, dict[str, Any]] = {}
+        for kind, assign_ in (("dry", dry_assign), ("wet", wet_assign)):
+            for duid, rooms in assign_.items():
+                r = robots.setdefault(duid, {**self.robot_model(duid, duid in batch), "items": []})
+                if duid in batch:
+                    r["items"].append({
+                        "id": f"{kind}-{duid}-batch", "kind": kind, "rooms": list(rooms),
+                        "est_min": sum(self._estimate(duid, x, kind) or DEFAULT_ROOM_MIN for x in rooms),
+                    })
+                    continue
+                for i, room in enumerate(rooms):
+                    r["items"].append({
+                        "id": f"{kind}-{duid}-{i}", "kind": kind, "rooms": [room],
+                        "est_min": self._estimate(duid, room, kind) or DEFAULT_ROOM_MIN,
+                    })
+        times = simulate_queues(robots)
+        room_finish: dict[str, dict[str, float]] = {"dry": {}, "wet": {}}
+        queues: dict[str, list[dict[str, Any]]] = {}
+        for duid, r in robots.items():
+            rows = queues.setdefault(self.entity_of.get(duid) or duid, [])
+            for it in r["items"]:
+                start, finish = times[it["id"]]
+                for room in it["rooms"]:
+                    room_finish[it["kind"]][room] = finish
+                rows.append({
+                    "room": it["rooms"][0] if len(it["rooms"]) == 1 else None,
+                    "rooms": it["rooms"], "kind": it["kind"],
+                    "start_min": round(start, 1), "finish_min": round(finish, 1),
+                })
+        eta = max((f for _, f in times.values()), default=0.0)
         return {
             "eta_min": round(eta),
-            "timeline": {"dry": room_dry_finish, "wet": room_wet_finish},
-            "unsequenced": sorted(unsequenced),
+            "timeline": room_finish,
+            "queues": queues,
+            # Kept for older cards: the room order no longer depends on the app.
+            "unsequenced": [],
         }
-
-    # -- task building ---------------------------------------------------------------
 
     def _settings_for_duid(
         self, settings: dict[str, Any] | None, kind: str, duid: str
@@ -413,156 +519,102 @@ class CleanPlanner:
         vacuums: Any = None,
         pin: dict[str, dict[str, str]] | None = None,
         settings: dict[str, dict[str, dict[str, Any]]] | None = None,
+        batch: list[str] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        """Build the run_job task list + a human-readable plan summary.
+        """Build the job's queue items + a plan summary (docs/52 §9.1).
 
-        Dry tasks start immediately. Wet tasks gate on the dry robot's per-room
-        ``anyvac_room_done`` (matched by duid + room name) and — when the same robot
-        also runs a dry pass — on its own session finishing. Repeat is passed to the
-        firmware in ``app_segment_clean`` (no dock-restart hacks, docs/14 §3.8).
+        Room-by-room (default): one item per room and pass, in queue order per
+        robot. A wet item waits for the dry item of the same room — gating is
+        by room, so it stays right through every later edit of the queues.
+        Batch robots (``batch``, docs/52 R7): one item per pass with all the
+        robot's rooms in the app's order; its wet item waits for all of them.
 
         ``settings`` is ``{"dry"/"wet": {vacuum_ref: {fan_speed, mop_mode,
-        mop_intensity, repeat}}}`` — per-vacuum since 2026-07-26 (see
-        ``_settings_for_duid``), because a fleet with several same-kind vacuums
-        (e.g. two dry-only robots) needs each to keep its own preset rather than
-        one shared per pass.
-
-        docs/23 (2026-07-18): a wet-capable robot with 2+ assigned rooms in a
-        ``both`` job gets a **pool task** instead of one static all-or-nothing
-        task, so ``_JobRunner`` can dispatch a first batch as soon as SOME of
-        its rooms are ready rather than waiting for all of them — a single
-        wet-capable robot covering both a quick room and a slow one no longer
-        sits idle until the slow one catches up. A robot with just one room
-        (or a standalone ``wet`` job with no dry gating at all) has nothing to
-        stagger and keeps the plain static task.
+        mop_intensity, repeat}}}``, per vacuum (2026-07-26).
         """
-        settings = settings or {}
-        tasks: list[dict[str, Any]] = []
+        batch_duids = {d for ref in (batch or []) if (d := self._resolve_duid(str(ref)))}
         plan: dict[str, Any] = {"dry": {}, "wet": {}, "unassigned": {}}
 
         dry_assign: dict[str, list[str]] = {}
         wet_assign: dict[str, list[str]] = {}
         if mode in ("dry", "both"):
-            dry_assign, dry_un = self.assign(
-                rooms, "dry", vacuums, self._pin_for_kind(pin, "dry")
-            )
+            dry_assign, dry_un = self.assign(rooms, "dry", vacuums, self._pin_for_kind(pin, "dry"))
             if dry_un:
                 plan["unassigned"]["dry"] = dry_un
-        room_dry_duid: dict[str, str] = {}
-        for i, (duid, rms) in enumerate(dry_assign.items()):
-            entity = self.entity_of.get(duid)
-            if not entity:
-                _LOGGER.warning("AnyVac clean: no vacuum entity for duid %s; skipping", duid)
-                continue
-            kind_settings = self._settings_for_duid(settings, "dry", duid)
-            selects, fan = self._settings_calls(duid, "dry", kind_settings)
-            segs = [self._segment_for(duid, r) for r in rms]
-            repeat = max(1, int(kind_settings.get("repeat") or 1))
-            tasks.append(
-                {
-                    "id": f"dry{i}",
-                    "vacuum": entity,
-                    # `duid` lets _JobRunner match this task against the
-                    # `anyvac_clean_finished` event (which is keyed by duid) so
-                    # the job stays alive until the robot has actually FINISHED,
-                    # not merely until the command was dispatched — pool tasks
-                    # already carried it, static ones didn't (2026-08-08 fix).
-                    "duid": duid,
-                    "selects": selects,
-                    "fan_speed": fan,
-                    "service": "vacuum.send_command",
-                    "service_data": {
-                        "entity_id": entity,
-                        "command": "app_segment_clean",
-                        "params": [{"segments": segs, "repeat": repeat}],
-                    },
-                }
-            )
-            plan["dry"][entity] = list(rms)
-            for r in rms:
-                room_dry_duid[r] = duid
-
-        timeline: dict[str, Any] | None = None
+            dry_assign = {
+                d: self.order_rooms(d, rms, "dry", batch=d in batch_duids)
+                for d, rms in dry_assign.items()
+                if self.entity_of.get(d)
+            }
+        dry_finish = self._estimate_timeline(dry_assign, {}, batch_duids)["timeline"]["dry"]
         if mode in ("wet", "both"):
-            wet_assign, wet_un = self.assign(
-                rooms, "wet", vacuums, self._pin_for_kind(pin, "wet")
-            )
+            wet_assign, wet_un = self.assign(rooms, "wet", vacuums, self._pin_for_kind(pin, "wet"))
             if wet_un:
                 plan["unassigned"]["wet"] = wet_un
-            # docs/23: the pool tasks' per-room `eta_min` hint needs the
-            # dry-finish timeline, so compute it now (right after wet_assign is
-            # known) instead of at the very end — reused below for `plan.update`.
-            timeline = self._estimate_timeline(dry_assign, wet_assign)
-            room_dry_finish = timeline["timeline"]["dry"]
-            for j, (duid, rms) in enumerate(wet_assign.items()):
-                entity = self.entity_of.get(duid)
-                if not entity:
-                    _LOGGER.warning(
-                        "AnyVac clean: no vacuum entity for duid %s; skipping", duid
-                    )
-                    continue
-                kind_settings = self._settings_for_duid(settings, "wet", duid)
-                selects, fan = self._settings_calls(duid, "wet", kind_settings)
-                repeat = max(1, int(kind_settings.get("repeat") or 1))
-                own_gate = {"duid": duid} if duid in dry_assign else None
+            wet_assign = {
+                d: self.order_rooms(d, rms, "wet", dry_finish, batch=d in batch_duids)
+                for d, rms in wet_assign.items()
+                if self.entity_of.get(d)
+            }
 
-                if mode == "both" and len(rms) >= 2:
-                    # Pool task (docs/23): per-room gate + a timing hint for the
-                    # wait-vs-go decision, no single all-or-nothing `after` list.
-                    pool = {
-                        r: {
-                            "gate": {"duid": room_dry_duid[r], "room": r},
-                            "eta_min": room_dry_finish.get(r, 0.0),
-                            "segment": self._segment_for(duid, r),
-                        }
-                        for r in rms
-                        if r in room_dry_duid
-                    }
-                    tasks.append(
-                        {
-                            "id": f"wet{j}",
-                            "vacuum": entity,
-                            "duid": duid,
-                            "pool": pool,
-                            "selects": selects,
-                            "fan_speed": fan,
-                            "repeat": repeat,
-                            "own_gate": own_gate,
-                        }
+        items: list[dict[str, Any]] = []
+        for kind, assign_ in (("dry", dry_assign), ("wet", wet_assign)):
+            for duid, rms in assign_.items():
+                plan[kind][self.entity_of[duid]] = list(rms)
+                groups = [list(rms)] if duid in batch_duids else [[r] for r in rms]
+                for i, group in enumerate(groups):
+                    items.append(
+                        self.make_item(
+                            duid, kind, group, settings,
+                            item_id=f"{kind}-{duid}-{'batch' if duid in batch_duids else i}",
+                            batch=duid in batch_duids,
+                        )
                     )
-                else:
-                    segs = [self._segment_for(duid, r) for r in rms]
-                    after: list[dict[str, Any]] = []
-                    if mode == "both":
-                        # Release the wet pass per room done by the DRY robot; a
-                        # both-capable robot additionally waits for its own dry
-                        # session (single-room case — no benefit to pooling).
-                        after = [
-                            {"duid": room_dry_duid[r], "room": r}
-                            for r in rms
-                            if r in room_dry_duid
-                        ]
-                        if own_gate:
-                            after.append(own_gate)
-                    tasks.append(
-                        {
-                            "id": f"wet{j}",
-                            "vacuum": entity,
-                            "duid": duid,  # see the dry task above
-                            "selects": selects,
-                            "fan_speed": fan,
-                            "service": "vacuum.send_command",
-                            "service_data": {
-                                "entity_id": entity,
-                                "command": "app_segment_clean",
-                                "params": [{"segments": segs, "repeat": repeat}],
-                            },
-                            "after": after,
-                        }
-                    )
-                plan["wet"][entity] = list(rms)
 
+        timeline = self._estimate_timeline(dry_assign, wet_assign, batch_duids)
         if not plan["unassigned"]:
             plan.pop("unassigned")
-        plan.update(timeline or self._estimate_timeline(dry_assign, wet_assign))
-        return tasks, plan
+        if batch_duids:
+            plan["batch"] = sorted(self.entity_of.get(d) or d for d in batch_duids)
+        plan.update(timeline)
+        return items, plan
+
+    def make_item(
+        self,
+        duid: str,
+        kind: str,
+        rooms: list[str],
+        settings: dict[str, Any] | None,
+        item_id: str,
+        batch: bool = False,
+    ) -> dict[str, Any]:
+        """One queue item: everything the job runner needs to send it, check
+        it was taken and re-apply the settings after the firmware reset them
+        (docs/52 §3.3)."""
+        kind_settings = self._settings_for_duid(settings, kind, duid)
+        selects, fan = self._settings_calls(duid, kind, kind_settings)
+        mop_mode = kind_settings.get("mop_mode") if kind == "wet" else None
+        return {
+            "id": item_id,
+            "vacuum": self.entity_of.get(duid),
+            "duid": duid,
+            "kind": kind,
+            "batch": batch,
+            "room": rooms[0] if len(rooms) == 1 else None,
+            "rooms": list(rooms),
+            "segments": [self._segment_for(duid, r) for r in rooms],
+            "selects": selects,
+            "fan_speed": fan,
+            "repeat": max(1, int(kind_settings.get("repeat") or 1)),
+            # What the robot must report once it runs (`mop_signal`).
+            "expect": {
+                "fan_speed": fan,
+                "mop_mode": mop_mode,
+                "water_off": kind == "dry" and any(
+                    s.get("option") == "off" for s in selects
+                ),
+            },
+            "est_min": round(sum(
+                self._estimate(duid, r, kind) or DEFAULT_ROOM_MIN for r in rooms
+            ), 1),
+        }

@@ -83,7 +83,6 @@ def _new_coordinator(monkeypatch: pytest.MonkeyPatch, clock: _Clock) -> AnyVacCo
     coord._last_calib = {}
     coord._selected_rooms = set()
     coord._room_pins = {}
-    coord._room_sequence = {}
     coord._room_elapsed = {}
     coord._last_poll = {}
     coord._runs = {}
@@ -91,7 +90,15 @@ def _new_coordinator(monkeypatch: pytest.MonkeyPatch, clock: _Clock) -> AnyVacCo
     coord._job_seq = 0
     coord._job_id = {}
     coord._path_job_id = {}
-    coord._run_pending = {}
+    coord._prev_state = {}
+    coord._task_open = {}
+    coord._task_item = {}
+    coord._task_last = {}
+    coord._task_rooms_done = {}
+    coord.app_sequence = {}
+    coord._app_sequence_at = {}
+    coord._job_store = _FakeStore() if "_FakeStore" in globals() else None
+    coord._job_saved = None
     coord._run_targets_seen = {}
     coord._path_seen = {}
     coord._cov_gate = {}
@@ -253,7 +260,7 @@ def test_a_target_crossed_before_its_turn_is_not_counted(monkeypatch, clock) -> 
     """Whole-flat run: every room is a target, so the targets alone cannot filter
     the corridor crossing — the sequence (and the dwell) does."""
     coord = _new_coordinator(monkeypatch, clock)
-    coord._room_sequence = {"Hall": 1, "Bath": 2, "Kitchen": 3}
+    coord.app_sequence = {"d1": {"Hall": 1, "Bath": 2, "Kitchen": 3}}
     hall = lawn(80, 920)
     cross = line((920, 920), (3080, 500))
     bath = lawn(3080, 3920)
@@ -281,16 +288,22 @@ def test_the_tail_delivered_with_the_return_poll_is_counted(monkeypatch, clock) 
     path = lawn(80, 920)
     cut = int(len(path) * 0.75)
     _run(coord, clock, "d1", path, targets=["Hall"], until=cut)
+    elapsed_before = dict(coord._room_elapsed["d1"])
     clock.advance(seconds=30)
+    # docs/52 §9.3: the return poll ENDS the task — the tail is attributed
+    # first, then the task is harvested on that same poll.
     _poll(coord, _device("d1", transit=True, status_state="returning_home",
                          _path_dry=path, target_segments=[1]))
-    live = coord._build_progress(_device("d1"))["Hall"]
-    assert live["dry_floor"] >= 95
-    elapsed_before = dict(coord._room_elapsed["d1"])
-    _dock(coord, clock, "d1", path)
     assert coord._room_coverage["Hall"]["dry"] == 100
     # the tail adds coverage only — its time delta stays unattributed
     assert coord._last_calib["d1"]["rooms"]["Hall"]["active_min"] == round(elapsed_before["Hall"] / 60)
+    finished = [d for n, d in coord.hass.bus.events if n == "anyvac_clean_finished"]
+    assert finished and finished[-1]["rooms_result"][0]["room"] == "Hall"
+    assert finished[-1]["rooms_result"][0]["dry"] == 100
+    _dock(coord, clock, "d1", path)
+    # Docking afterwards adds nothing: no second harvest, one run_finished.
+    assert [n for n, _ in coord.hass.bus.events].count("anyvac_clean_finished") == 1
+    assert [n for n, _ in coord.hass.bus.events].count("anyvac_run_finished") == 1
 
 
 def test_an_interrupted_room_keeps_its_partial_completion(monkeypatch, clock) -> None:
@@ -306,7 +319,7 @@ def test_an_interrupted_room_keeps_its_partial_completion(monkeypatch, clock) ->
 
 def test_moving_on_to_the_next_target_finishes_the_room(monkeypatch, clock) -> None:
     coord = _new_coordinator(monkeypatch, clock)
-    coord._room_sequence = {"Hall": 1, "Bath": 2}
+    coord.app_sequence = {"d1": {"Hall": 1, "Bath": 2}}
     hall = lawn(80, 920)[: len(lawn(80, 920)) // 2]
     path = hall + line((920, 500), (3080, 500)) + lawn(3080, 3920)
     _run(coord, clock, "d1", path, targets=["Hall", "Bath"], room_of=_room_of)

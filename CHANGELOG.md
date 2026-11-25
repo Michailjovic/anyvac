@@ -6,6 +6,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.58.0] - 2026-11-25
+
+Pairs with card 1.58.0. First part of 2.0.0: the clean queue is held by AnyVac,
+one room per command (docs/52). Based on three hardware tests on S6, S7 MaxV and
+S8 MaxV Ultra on 2026-11-25 (docs/52 §6–§8).
+
+**Why.** The firmware silently ignores a new `app_segment_clean` while it cleans
+or washes (the service still reports success), restarts the room from zero after
+a swap, and goes back to its default settings whenever a task closes. A batch
+sent at the start could therefore not be changed, its settings drifted, and a
+learned time could mix two rooms.
+
+- **Room-by-room jobs.** `anyvac.clean` builds a queue per vacuum and the new job
+  runner (`jobrunner.py`) sends one room at a time: the next room as soon as the
+  robot turns home (measured gap ~20 s), a wet room only after the dry pass of the
+  same room. Each item goes `queued → sent → active → done | blocked | removed`.
+  Interim order until the planner of 1.59.0: dry rooms shortest first, wet rooms
+  in the order their dry pass ends.
+- **The command is checked.** A robot must start the sent room within 45 s
+  (`target_segments` or an active state); otherwise it is sent once more, then the
+  room is `blocked` ("command not accepted") and the queue goes on.
+- **Settings are sent again after the robot took the room.** S8 resets fan and mop
+  mode when it takes a task, S7 MaxV resets the water at the end of one. Selects and
+  fan are applied before the command and again ~6 s after acceptance, then checked
+  against `mop_signal` / the select states (fan, water off for a dry pass), with
+  one more try; what still differs is a job warning.
+- **Mop washing between rooms.** The firmware counts its wash interval inside one
+  task only. With the app set to wash after every room (or a washing dock whose
+  setting cannot be read) the robot docks and washes after each wet room before
+  the next is sent; washing by time, AnyVac counts the mopping across rooms and lets
+  it dock once the interval is reached. Read from `dock_status.smart_wash_enabled` /
+  `wash_interval_min`.
+- **Battery:** a docked robot below 30 % is not sent (the firmware refuses a forced
+  start); it goes when charged. Full battery model in 1.60.0.
+- **Rooms the robot could not clean are `blocked` with a reason** (`water_shortage`,
+  `error`, `could not reach the room`) and listed in the vacuum's report.
+- **`anyvac.edit_job`** (new): `add` / `remove` rooms, `move` a room in its vacuum's
+  queue (marked manual), `pin` a room's pass to another vacuum. A queued room just
+  changes in the queue; the room a vacuum is cleaning is left right away (`pause`,
+  then the next room, or home when nothing is left) and nothing of it is learned.
+  Without a running job, `add` starts one. A batch already sent cannot be changed.
+- **Batch option:** vacuums listed in `batch` (on `anyvac.clean` / `anyvac.plan`) get
+  all their rooms in one command, in the order set in the Roborock app — now read
+  from the robot (`get_clean_sequence`, cached for an hour), not kept by hand.
+- **Reports per vacuum (docs/52 R6).** `anyvac_run_finished` fires once per vacuum
+  when its part of the job is done — `vacuum`, `entity_id`, `duid`, `job_id`, `kind`,
+  `started_at`, `finished_at`, `duration_min`, `battery_used`, `rooms`,
+  `rooms_result` (per room: kind, active minutes, completion, passes), `blocked`.
+  New `anyvac_job_finished` after the last vacuum. Before, reports came only after
+  the whole job, with the last robot's data.
+- **A job survives a restart (R3).** Saved in `.storage/anyvac_job` on every change
+  and resumed: a robot still on its room carries on, a docked one gets the
+  unfinished room again (rather than skipping it), a robot running something else
+  stops the job with a warning. Jobs older than 6 h are dropped. Unloading or
+  reloading the integration keeps the saved job; `anyvac.cancel` and the end of a
+  job clear it.
+- **One measurement per task (docs/52 O3).** The end of a task is the edge into
+  `returning_home` (unless the battery is at 25 % or less — that is the firmware's
+  recharge trip) or the fall of `in_cleaning`: field history of 2026-11-25 shows
+  `in_cleaning` stays on while the robot drives home and while the dock washes the
+  mop. Calibration, completion % and `anyvac_clean_finished` (now with
+  `rooms_result`, `battery`, `water_shortage`) happen at every task end, so a
+  learned time never mixes two rooms (field: S6 Corridor 5 → 6 min from a swap).
+  `anyvac_room_done` for the task's room also fires at its end. The drawn trace
+  still stitches across the whole job (docs/27). The deferred harvest of docs/36
+  (`_run_pending`) is gone.
+- **`job_progress` v2** for the card: `schema: 2`, `job_id`, `queues` per vacuum
+  (`mode`, `state`, `items` with `state`, `pct`, `est_min`, `start_at`, `finish_at`,
+  `reason`, `manual`, and `wash`). Every time comes from one model,
+  `planner.simulate_queues`, used both for the plan and live — so an edit or a slow
+  room moves the finish time at once. All v1 fields stay.
+- **ETA:** chaining gaps, docking to wash, the wash before the first wet room and
+  the washes inside a long room are now in the estimate; by-room washing was
+  missing before.
+- Fixed: the "asked for 2 passes, the robot reports 1" warning right after a start
+  (the status still showed the previous task); passes are only compared while the
+  item runs with its own segments.
+- Fixed: a mop carriage that is down while the water is off (S7 MaxV dry pass) no
+  longer counts as wet evidence (`water_off` from the status).
+- Fixed: `services.yaml` did not parse since 1.57.0 (`data:` in a plain description
+  of `upload_asset`), so Home Assistant showed no AnyVac service descriptions. New
+  test parses it and checks it lists every service.
+- The clean-finished blueprint now triggers on `anyvac_run_finished` (one
+  notification per vacuum, not per room) and offers `{{ blocked }}`; an unedited
+  copy installed by an earlier version is replaced on start.
+- **Removed:** `anyvac.set_room_sequence` and its stored order (docs/52 O1;
+  `room_sequence` on the sensor stays empty), the progressive pool dispatch of
+  docs/23 (`BATCH_WAIT_*`), the 3 h job timeout (now 6 h).
+- Tests: fake fleet modelled on the measured firmware (`tests/_fake_robot.py`);
+  runner, lifecycle/edit/restart, `job_progress` v2, per-task lifecycle and timing
+  model rewritten (files keep their names); 553 in total.
+
 ## [1.57.1] - 2026-11-24
 
 Pairs with card 1.57.0 (card unchanged). Reach mask fixes from the first field days.

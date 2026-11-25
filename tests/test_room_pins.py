@@ -213,7 +213,6 @@ def _pin_lifecycle_coordinator(clock_now: datetime) -> AnyVacCoordinator:
     coord._last_calib = {}
     coord._selected_rooms = set()
     coord._room_pins = {}
-    coord._room_sequence = {}
     coord._room_elapsed = {}
     coord._last_poll = {}
     coord._runs = {}
@@ -221,7 +220,15 @@ def _pin_lifecycle_coordinator(clock_now: datetime) -> AnyVacCoordinator:
     coord._job_seq = 0
     coord._job_id = {}
     coord._path_job_id = {}
-    coord._run_pending = {}
+    coord._prev_state = {}
+    coord._task_open = {}
+    coord._task_item = {}
+    coord._task_last = {}
+    coord._task_rooms_done = {}
+    coord.app_sequence = {}
+    coord._app_sequence_at = {}
+    coord._job_store = _FakeStore() if "_FakeStore" in globals() else None
+    coord._job_saved = None
     coord._run_targets_seen = {}
     coord._path_seen = {}
     coord._cov_gate = {}

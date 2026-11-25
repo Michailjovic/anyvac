@@ -1,181 +1,169 @@
-"""Tests for CleanPlanner._estimate_timeline (docs/19 sequence-aware ETA).
+"""Tests for the job timing model (docs/52 §3, §5a): `simulate_queues` and the
+planner's `_estimate_timeline` wrapper over it.
 
-The Roborock app's configured room order is dominant regardless of what order
-HA sends segment ids in — the firmware always visits rooms in that order
-(field-confirmed across thousands of cleans). These tests lock down the
-timeline math against that assumption: per-robot cumulative dry time IN
-SEQUENCE ORDER, and per-room wet gating on the specific dry-assigning robot's
-cumulative time for that room (not "wait for the whole dry batch").
+A room-by-room robot gets one room per command. Between two rooms it either
+takes the next one on its way home (``CHAIN_GAP_MIN``) or, as a wet robot, docks
+and washes first (``END_WASH_MIN``) — after every room when the app washes by
+room, once the mopping since the last wash reaches the interval when it washes
+by time. Inside one task the firmware washes on its own interval. A wet room
+waits for the dry pass of the same room. The app's room order no longer plays
+any part (docs/52 O1).
 
-``_estimate_timeline`` only touches ``self.coord.room_sequence`` and (via
-``_estimate``) ``self.coord.rooms_estimate`` — so the planner is built via
-``object.__new__`` to skip ``CleanPlanner.__init__`` (which needs a real
-``hass`` + device registry, irrelevant to this pure computation).
+The planner is built via ``object.__new__`` (no hass / registries needed).
 """
 
 from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from custom_components.anyvac.planner import (
+    CHAIN_GAP_MIN,
     DEFAULT_ROOM_MIN,
+    END_WASH_MIN,
+    PRE_WASH_MIN,
     WASH_DURATION_MIN,
     CleanPlanner,
+    simulate_queues,
 )
 
-
-class _FakeCoordinator:
-    def __init__(self, room_sequence: dict, rooms_estimate: dict) -> None:
-        self.room_sequence = room_sequence
-        self.rooms_estimate = rooms_estimate
+G = CHAIN_GAP_MIN
 
 
-def _dev(wash_interval_min: float | None = None) -> SimpleNamespace:
-    """Fake AnyVacDevice — only the `dock_status.wash_interval_min` shape that
-    `_estimate_timeline` reads (coordinator.py, docs/23 §6)."""
-    return SimpleNamespace(data={"dock_status": {"wash_interval_min": wash_interval_min}})
+def _dev(interval: float | None = None, by_room: bool = False, washable: bool | None = None) -> SimpleNamespace:
+    dock: dict = {"wash_interval_min": interval, "smart_wash_enabled": by_room}
+    if washable is not None:
+        dock["features"] = {"is_washable": washable}
+    return SimpleNamespace(data={"dock_status": dock})
 
 
-def _planner(
-    room_sequence: dict, rooms_estimate: dict, devices: dict | None = None
-) -> CleanPlanner:
+def _planner(rooms_estimate: dict, devices: dict | None = None) -> CleanPlanner:
     planner = object.__new__(CleanPlanner)
-    planner.coord = _FakeCoordinator(room_sequence, rooms_estimate)
+    planner.coord = SimpleNamespace(rooms_estimate=rooms_estimate)
     planner.devices = devices or {}
+    planner.entity_of = {}
     return planner
 
 
 def test_single_both_capable_robot_dry_then_wet() -> None:
-    """One robot does its own dry pass, then its own wet pass — wet must wait
-    for the robot's own dry session to finish, not start alongside it."""
-    seq = {"Hall": 1, "Bathroom": 2}
     est = {"d1": {"Hall": {"dry": 10, "wet": 6}, "Bathroom": {"dry": 8, "wet": 5}}}
-    planner = _planner(seq, est)
-
-    result = planner._estimate_timeline(
+    result = _planner(est)._estimate_timeline(
         dry_assign={"d1": ["Hall", "Bathroom"]},
         wet_assign={"d1": ["Hall", "Bathroom"]},
     )
-
-    assert result["timeline"]["dry"] == {"Hall": 10, "Bathroom": 18}
-    assert result["timeline"]["wet"] == {"Hall": 24, "Bathroom": 29}
-    assert result["eta_min"] == 29
+    assert result["timeline"]["dry"] == pytest.approx({"Hall": 10, "Bathroom": 18 + G})
+    # No washing dock: the wet rooms are chained too.
+    assert result["timeline"]["wet"] == pytest.approx({"Hall": 24 + 2 * G, "Bathroom": 29 + 3 * G})
+    assert result["eta_min"] == round(29 + 3 * G)
     assert result["unsequenced"] == []
 
 
-def test_two_dry_robots_one_wet_robot() -> None:
-    """Mirrors the real field scenario: two dry robots split the shared
-    sequence, one wet robot follows behind gated per-room. Bathroom's wet pass
-    isn't gated (dry finishes before the wet robot even gets there from Hall),
-    but LivingRoom's is (the wet robot catches up to its own dry robot)."""
-    seq = {"Hall": 1, "Bathroom": 2, "LivingRoom": 3, "Kitchen": 4}
+def test_wet_room_waits_for_the_dry_pass_of_the_same_room() -> None:
+    """Two dry robots, one wet robot. The wet robot starts with the room whose
+    dry pass ends first and waits whenever it catches up."""
     est = {
-        "d1": {"Hall": {"dry": 10}, "LivingRoom": {"dry": 12}},
-        "d2": {"Bathroom": {"dry": 8}, "Kitchen": {"dry": 9}},
-        "d3": {
-            "Hall": {"wet": 6}, "Bathroom": {"wet": 5},
-            "LivingRoom": {"wet": 7}, "Kitchen": {"wet": 6},
-        },
+        "s6": {"Corridor": {"dry": 5}, "Living": {"dry": 30}},
+        "s7": {"Bath": {"dry": 8}},
+        "s8": {"Corridor": {"wet": 10}, "Bath": {"wet": 6}, "Living": {"wet": 20}},
     }
-    planner = _planner(seq, est)
-
-    result = planner._estimate_timeline(
-        dry_assign={"d1": ["Hall", "LivingRoom"], "d2": ["Bathroom", "Kitchen"]},
-        wet_assign={"d3": ["Hall", "Bathroom", "LivingRoom", "Kitchen"]},
+    result = _planner(est)._estimate_timeline(
+        dry_assign={"s6": ["Corridor", "Living"], "s7": ["Bath"]},
+        wet_assign={"s8": ["Corridor", "Bath", "Living"]},
     )
-
-    assert result["timeline"]["dry"] == {
-        "Hall": 10, "LivingRoom": 22, "Bathroom": 8, "Kitchen": 17,
-    }
-    assert result["timeline"]["wet"] == {
-        "Hall": 16, "Bathroom": 21, "LivingRoom": 29, "Kitchen": 35,
-    }
-    assert result["eta_min"] == 35
-
-
-def test_room_missing_sequence_falls_back_to_end() -> None:
-    """A room with no configured sequence position sorts after every
-    sequenced room and is flagged in `unsequenced`, regardless of the order
-    it was passed in (the assignment loop order is not a substitute)."""
-    seq = {"Hall": 1}
-    est = {"d1": {"Hall": {"dry": 10}, "Mystery": {"dry": 5}}}
-    planner = _planner(seq, est)
-
-    result = planner._estimate_timeline(
-        dry_assign={"d1": ["Mystery", "Hall"]}, wet_assign={},
-    )
-
-    assert list(result["timeline"]["dry"].keys()) == ["Hall", "Mystery"]
-    assert result["unsequenced"] == ["Mystery"]
+    dry = result["timeline"]["dry"]
+    wet = result["timeline"]["wet"]
+    assert dry["Corridor"] == 5
+    assert dry["Living"] == pytest.approx(35 + G)
+    assert wet["Corridor"] == pytest.approx(15)  # starts at 5 (gate)
+    assert wet["Bath"] == pytest.approx(15 + G + 6)
+    assert wet["Living"] == pytest.approx(35 + G + 20)  # waited for the dry pass
 
 
 def test_no_rooms_assigned_gives_zero_eta() -> None:
-    """Unassigned/empty plans (e.g. every room came back unassigned) must not
-    crash and must report a zero estimate rather than raising on max()."""
-    planner = _planner({}, {})
-
-    result = planner._estimate_timeline(dry_assign={}, wet_assign={})
-
+    result = _planner({})._estimate_timeline(dry_assign={}, wet_assign={})
     assert result["eta_min"] == 0
     assert result["timeline"] == {"dry": {}, "wet": {}}
-    assert result["unsequenced"] == []
 
 
 def test_default_room_min_used_when_no_estimate_exists() -> None:
-    """A fresh install with no learned estimate yet falls back to
-    DEFAULT_ROOM_MIN rather than treating the room as free."""
-    planner = _planner({"Hall": 1}, {})
-
-    result = planner._estimate_timeline(dry_assign={"d1": ["Hall"]}, wet_assign={})
-
+    result = _planner({})._estimate_timeline(dry_assign={"d1": ["Hall"]}, wet_assign={})
     assert result["timeline"]["dry"]["Hall"] == DEFAULT_ROOM_MIN
 
 
-def test_wet_pass_adds_one_wash_break_when_interval_crossed() -> None:
-    """docs/23 §6 — a wet session longer than the dock's configured wash
-    interval must pick up a WASH_DURATION_MIN pause once it crosses that
-    threshold. Two rooms totalling 20 min of active wet time against a 15 min
-    interval (real field value: 900s == 15 min, live-verified 2026-07-31)
-    cross the threshold once, inside the second room."""
-    seq = {"Hall": 1, "Bathroom": 2}
-    est = {"d1": {"Hall": {"wet": 10}, "Bathroom": {"wet": 10}}}
-    planner = _planner(seq, est, devices={"d1": _dev(wash_interval_min=15)})
-
-    result = planner._estimate_timeline(dry_assign={}, wet_assign={"d1": ["Hall", "Bathroom"]})
-
-    # Hall alone (10 min) doesn't cross 15 min yet, so it finishes on time.
-    assert result["timeline"]["wet"]["Hall"] == 10
-    # Bathroom crosses the 15 min mark 5 min in -> one wash break inserted.
-    assert result["timeline"]["wet"]["Bathroom"] == 20 + WASH_DURATION_MIN
-    assert result["eta_min"] == round(20 + WASH_DURATION_MIN)
+def test_by_room_washing_docks_after_every_wet_room() -> None:
+    """The app washes after every room: the robot first washes at the start
+    (used mop), then docks and washes between rooms."""
+    est = {"s8": {"Hall": {"wet": 10}, "Bath": {"wet": 6}}}
+    result = _planner(est, {"s8": _dev(interval=20, by_room=True)})._estimate_timeline(
+        dry_assign={}, wet_assign={"s8": ["Hall", "Bath"]}
+    )
+    assert result["timeline"]["wet"] == pytest.approx(
+        {"Hall": PRE_WASH_MIN + 10, "Bath": PRE_WASH_MIN + 10 + END_WASH_MIN + 6}
+    )
 
 
-def test_wet_pass_adds_multiple_wash_breaks_across_long_session() -> None:
-    """A single very long room (45 min active) against a 15 min interval must
-    pick up THREE breaks (crossed at 15, 30 and 45 min), not one."""
-    seq = {"Kitchen": 1}
-    est = {"d1": {"Kitchen": {"wet": 45}}}
-    planner = _planner(seq, est, devices={"d1": _dev(wash_interval_min=15)})
+def test_by_time_washing_chains_until_the_interval_is_reached() -> None:
+    """Washing by time (15 min): two 10-min rooms are chained (10 < 15), the
+    third waits for a wash (20 >= 15)."""
+    est = {"s8": {"A": {"wet": 10}, "B": {"wet": 10}, "C": {"wet": 4}}}
+    result = _planner(est, {"s8": _dev(interval=15)})._estimate_timeline(
+        dry_assign={}, wet_assign={"s8": ["A", "B", "C"]}
+    )
+    wet = result["timeline"]["wet"]
+    assert wet["A"] == pytest.approx(PRE_WASH_MIN + 10)
+    assert wet["B"] == pytest.approx(PRE_WASH_MIN + 20 + G)
+    assert wet["C"] == pytest.approx(PRE_WASH_MIN + 20 + G + END_WASH_MIN + 4)
 
-    result = planner._estimate_timeline(dry_assign={}, wet_assign={"d1": ["Kitchen"]})
 
-    assert result["timeline"]["wet"]["Kitchen"] == 45 + 3 * WASH_DURATION_MIN
+def test_long_room_washes_inside_the_task() -> None:
+    """A 45-min room against a 15-min interval: the firmware washes three times
+    inside the task (at 15, 30 and 45 min)."""
+    est = {"s8": {"Kitchen": {"wet": 45}}}
+    result = _planner(est, {"s8": _dev(interval=15)})._estimate_timeline(
+        dry_assign={}, wet_assign={"s8": ["Kitchen"]}
+    )
+    assert result["timeline"]["wet"]["Kitchen"] == pytest.approx(PRE_WASH_MIN + 45 + 3 * WASH_DURATION_MIN)
 
 
-def test_wet_pass_unaffected_without_wash_interval() -> None:
-    """No wash_interval_min (no washable dock, or robot not in `devices` at
-    all e.g. a stale/incomplete fixture) must leave the wet timeline exactly
-    as it was before docs/23 §6 — no silent behaviour change for dry-only or
-    empty-only-dock fleets."""
-    seq = {"Hall": 1, "Bathroom": 2}
-    est = {"d1": {"Hall": {"wet": 10}, "Bathroom": {"wet": 10}}}
-    planner = _planner(seq, est, devices={"d1": _dev(wash_interval_min=None)})
+def test_unreadable_washing_dock_is_treated_as_by_room() -> None:
+    est = {"s8": {"A": {"wet": 5}, "B": {"wet": 5}}}
+    planner = _planner(est, {"s8": _dev(washable=True)})
+    assert planner.wash_mode("s8") == ("unknown", None)
+    wet = planner._estimate_timeline(dry_assign={}, wet_assign={"s8": ["A", "B"]})["timeline"]["wet"]
+    assert wet["B"] == pytest.approx(PRE_WASH_MIN + 5 + END_WASH_MIN + 5)
 
-    result = planner._estimate_timeline(dry_assign={}, wet_assign={"d1": ["Hall", "Bathroom"]})
 
-    assert result["timeline"]["wet"] == {"Hall": 10, "Bathroom": 20}
+def test_no_washing_dock_means_no_washing() -> None:
+    est = {"s7": {"A": {"wet": 10}, "B": {"wet": 10}}}
+    planner = _planner(est, {"s7": _dev()})
+    assert planner.wash_mode("s7") == (None, None)
+    wet = planner._estimate_timeline(dry_assign={}, wet_assign={"s7": ["A", "B"]})["timeline"]["wet"]
+    assert wet == pytest.approx({"A": 10, "B": 20 + G})
 
-    # Same result when the duid is missing from `devices` entirely.
-    planner2 = _planner(seq, est)
-    result2 = planner2._estimate_timeline(dry_assign={}, wet_assign={"d1": ["Hall", "Bathroom"]})
-    assert result2["timeline"]["wet"] == {"Hall": 10, "Bathroom": 20}
+
+def test_batch_robot_has_no_gaps_and_counts_the_interval_across_rooms() -> None:
+    """A batch is one task: no chaining gap, and the firmware's interval runs
+    across its rooms."""
+    est = {"s8": {"A": {"wet": 10}, "B": {"wet": 10}}}
+    result = _planner(est, {"s8": _dev(interval=15)})._estimate_timeline(
+        dry_assign={}, wet_assign={"s8": ["A", "B"]}, batch={"s8"}
+    )
+    assert result["eta_min"] == round(PRE_WASH_MIN + 20 + WASH_DURATION_MIN)
+
+
+def test_simulate_live_queue_with_a_partly_done_room() -> None:
+    """The live job_progress model: what is left of the active room, then the
+    rest, and a wet room on another robot gated by it."""
+    times = simulate_queues({
+        "s6": {"items": [
+            {"id": "a", "kind": "dry", "rooms": ["Living"], "est_min": 12},  # what is left
+            {"id": "b", "kind": "dry", "rooms": ["Hall"], "est_min": 5},
+        ]},
+        "s8": {"wash_mode": None, "items": [
+            {"id": "c", "kind": "wet", "rooms": ["Living"], "est_min": 20},
+        ], "prev_kind": "wet"},
+    })
+    assert times["a"] == (0.0, 12.0)
+    assert times["b"] == pytest.approx((12 + G, 17 + G))
+    assert times["c"] == pytest.approx((12.0, 32.0))

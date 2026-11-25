@@ -28,7 +28,7 @@
   "services": {
     "clean": {
       "name": "Uklidit",
-      "description": "Pošle plánovači AnyVac záměr úklidu (místnosti + režim). Backend rozdělí místnosti mezi schopné vysavače, vyřeší připnutí a spustí úlohu na serveru (suchý → mokrý, opakování, nastavení mopu). Toto volá tlačítko Start na kartě.",
+      "description": "Pošle plánovači AnyVac záměr úklidu (místnosti + režim). Backend rozdělí místnosti mezi schopné vysavače, vyřeší připnutí a spustí úlohu na serveru: každý vysavač dostává jednu místnost na příkaz, mokrá místnost čeká na suchou, nastavení se posílá s každou místností. Toto volá tlačítko Start na kartě.",
       "fields": {
         "rooms": {
           "name": "Místnosti",
@@ -49,6 +49,10 @@
         "settings": {
           "name": "Nastavení",
           "description": "Nastavení sání/mopu pro jednotlivé vysavače a průchody (fan_speed, mop_mode, mop_intensity, repeat)."
+        },
+        "batch": {
+          "name": "Vysavače v dávce",
+          "description": "Vysavače, které dostanou všechny místnosti jedním příkazem (pořadí podle aplikace Roborock). Jejich odeslanou část úklidu už nejde měnit."
         }
       }
     },
@@ -75,6 +79,10 @@
         "settings": {
           "name": "Nastavení",
           "description": "Nastavení sání/mopu – stejný tvar jako u anyvac.clean."
+        },
+        "batch": {
+          "name": "Vysavače v dávce",
+          "description": "Vysavače, které dostanou všechny místnosti jedním příkazem (pořadí podle aplikace Roborock). Jejich odeslanou část úklidu už nejde měnit."
         }
       }
     },
@@ -166,6 +174,36 @@
         }
       }
     },
+    "edit_job": {
+      "name": "Upravit úklid",
+      "description": "Změní běžící úklid. Místnosti, které ještě neodešly, se jen změní ve frontě; místnost, kterou vysavač právě uklízí, opustí hned (pauza, pak další místnost nebo domů). Bez běžícího úklidu „add“ úklid spustí.",
+      "fields": {
+        "add": {
+          "name": "Přidat místnosti",
+          "description": "Názvy místností, které se přidají."
+        },
+        "remove": {
+          "name": "Odebrat místnosti",
+          "description": "Názvy místností, které se odeberou."
+        },
+        "mode": {
+          "name": "Režim",
+          "description": "Průchod přidávaných/odebíraných místností. Výchozí pro přidání: režim úklidu; pro odebrání: oba."
+        },
+        "move": {
+          "name": "Přesunout",
+          "description": "Dá místnost na pozici ve frontě jejího vysavače ({room, kind, index}, 0 = další). Plánovač ji zpět nepřesune."
+        },
+        "pin": {
+          "name": "Přeřadit",
+          "description": "Předá průchod místnosti jinému vysavači ({room: {dry/wet: vysavač}})."
+        },
+        "settings": {
+          "name": "Nastavení",
+          "description": "Nastavení přidaných místností — stejný tvar jako u anyvac.clean."
+        }
+      }
+    },
     "cancel": {
       "name": "Zrušit",
       "description": "Ukončí všechny běžící úlohy AnyVac a zastaví zúčastněné vysavače.",
@@ -219,16 +257,6 @@
         "wet": {
           "name": "Mokrá stopa viditelná",
           "description": "Zobrazit mokrou stopu."
-        }
-      }
-    },
-    "set_room_sequence": {
-      "name": "Nastavit pořadí místností",
-      "description": "Nahradí uložené pořadí úklidu místností (používá se pro odhad času podle pořadí). Posílá se celý seřazený seznam.",
-      "fields": {
-        "rooms": {
-          "name": "Místnosti",
-          "description": "Úplný seřazený seznam místností."
         }
       }
     },

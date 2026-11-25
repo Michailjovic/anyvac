@@ -62,4 +62,5 @@ STORE_KEYS: tuple[str, ...] = (
     "home_frame",
     "last_run",
     "reach_masks",
+    "job",
 )

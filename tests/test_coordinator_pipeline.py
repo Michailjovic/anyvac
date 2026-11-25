@@ -104,7 +104,6 @@ def _new_coordinator(monkeypatch: pytest.MonkeyPatch, clock: _Clock) -> AnyVacCo
     coord._last_calib = {}
     coord._selected_rooms = set()
     coord._room_pins = {}
-    coord._room_sequence = {}
     coord._room_elapsed = {}
     coord._last_poll = {}
     coord._runs = {}
@@ -112,7 +111,15 @@ def _new_coordinator(monkeypatch: pytest.MonkeyPatch, clock: _Clock) -> AnyVacCo
     coord._job_seq = 0
     coord._job_id = {}
     coord._path_job_id = {}
-    coord._run_pending = {}
+    coord._prev_state = {}
+    coord._task_open = {}
+    coord._task_item = {}
+    coord._task_last = {}
+    coord._task_rooms_done = {}
+    coord.app_sequence = {}
+    coord._app_sequence_at = {}
+    coord._job_store = _FakeStore() if "_FakeStore" in globals() else None
+    coord._job_saved = None
     coord._run_targets_seen = {}
     coord._path_seen = {}
     coord._cov_gate = {}
@@ -292,7 +299,7 @@ def test_multi_room_calibration_in_one_session(
     time — not the whole session's duration split evenly, and not just the
     last room cleaned."""
     coord = _new_coordinator(monkeypatch, clock)
-    coord._room_sequence = {"Hall": 1, "Bathroom": 2}
+    coord.app_sequence = {"d3": {"Hall": 1, "Bathroom": 2}}
     duid = "d3"
     path = HALL + BATH
     half = len(HALL) // 2
@@ -460,14 +467,11 @@ def test_path_stitches_across_job_sorties(monkeypatch: pytest.MonkeyPatch, clock
     assert coord._dry_path[duid] == [[{"x": 100, "y": 100}], [{"x": 200, "y": 100}]]
     assert coord._wet_path[duid] == [[{"x": 100, "y": 100}], [{"x": 200, "y": 100}]]
 
-    # docs/36 (this assertion was the exact opposite until 2026-09-02): the RUN's
-    # accumulators now follow the same lifetime as the trace above. A dock trip
-    # inside one job is not a new clean, so the run keeps its original start time
-    # and its coverage cells instead of restarting from zero — the per-sortie
-    # reset was what made a room's coverage % read a partial number and then drag
-    # its learned baseline down to the size of a single batch.
-    assert coord._session_start[duid] == clock.now - timedelta(minutes=6)
-    assert coord._runs[duid] is run_sortie1
+    # docs/52 §9.3 (1.58.0): the trace stitches across the job, but what is
+    # MEASURED is per task — every task is one room's clean measurement, so the
+    # new sortie starts a fresh run tracker and its own start time.
+    assert coord._session_start[duid] == clock.now
+    assert coord._runs[duid] is not run_sortie1
 
 
 def test_path_resets_across_sorties_without_job_scope(

@@ -58,12 +58,15 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-# Safety cap (seconds) on how long a finished sortie may keep its RUN open waiting for
-# the orchestrated job to release the vacuum (docs/36). Normally the job runner clears
-# the scope within one poll of the last batch; this only catches a scope that never
-# clears at all, and is deliberately longer than services.py's own 3 h JOB_TIMEOUT so
-# the job's cleanup path always wins the race.
-_RUN_DEFER_MAX_S = 3 * 3600 + 600
+# docs/52 §2, HW 2026-11-25: ``in_cleaning`` stays on while the robot drives
+# home after a finished task and while the dock washes the mop at its end
+# (S8 19:29 -> 19:48:52 over two chained rooms). The end of a TASK is the
+# state edge from active cleaning to ``returning_home`` — unless the battery is
+# this low, which is the firmware's own trip home to recharge mid-task
+# (it returns at 20 %).
+LOW_BATTERY_RETURN_PCT = 25
+# How long the app room order read from the robot stays valid (docs/52 O1).
+APP_SEQUENCE_TTL_S = 3600
 
 # Raw Roborock states in which the robot is driving somewhere / servicing itself rather
 # than cleaning the room it is physically in. CRITICAL (docs/13 A1+A2, docs/14 rule 4):
@@ -74,6 +77,20 @@ _RUN_DEFER_MAX_S = 3 * 3600 + 600
 # Raw Roborock states that mean "the dock is washing the mop right now" — the same
 # pair HA 2026.9's `switch.<vacuum>_mop_washing` uses for its `is_on`.
 WASH_STATES = {"washing_the_mop", "washing_the_mop_2"}
+
+
+def _clean_sequence_segments(resp: Any) -> list[int]:
+    """Segment ids of a `get_clean_sequence` answer, in order. The firmware
+    answers a flat list (``[16, 19, 17]``); tolerate one level of wrapping."""
+    if isinstance(resp, dict):
+        resp = resp.get("result", resp.get("clean_sequence"))
+    if isinstance(resp, (list, tuple)) and len(resp) == 1 and isinstance(resp[0], (list, tuple)):
+        resp = resp[0]
+    out: list[int] = []
+    for v in resp if isinstance(resp, (list, tuple)) else []:
+        if isinstance(v, (int, float)) and int(v) > 0:
+            out.append(int(v))
+    return out
 
 
 def _mode_is_off(name: Any) -> bool:
@@ -1307,8 +1324,29 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # for the same reason as room_pins: it's a physical fact, not a per-dashboard
         # preference, and multiple cards/browsers would otherwise duplicate it.
         # Persisted across restarts.
+        # Legacy store of the hand-edited room order (docs/19, removed in 1.58.0,
+        # docs/52 O1). Never read again; kept so uninstall removes the file.
         self._seq_store: Store = Store(hass, 1, f"{DOMAIN}_room_sequence")
-        self._room_sequence: dict[str, int] = {}
+        # The running room-by-room job (docs/52 §9.5), saved on every change of an
+        # item so a Home Assistant restart resumes it. Written by the job runner.
+        self._job_store: Store = Store(hass, 1, f"{DOMAIN}_job")
+        self._job_saved: dict[str, Any] | None = None
+        # The room order set in the Roborock app, read from the robot
+        # (`get_clean_sequence`, docs/52 O1): {duid: {room: position}} + when.
+        # Only a batch dispatch (or a multi-room clean started outside AnyVac)
+        # follows it — room-by-room jobs choose their own order.
+        self.app_sequence: dict[str, dict[str, int]] = {}
+        self._app_sequence_at: dict[str, datetime] = {}
+        # Per-TASK state (docs/52 §9.3): one task = one room in a room-by-room
+        # job. `_task_open` = a task is running; `_task_item` = the room(s) the
+        # job runner sent with it (the measurement targets); `_task_last` = the
+        # last closed task's event, re-fired as `run_finished` once a robot with
+        # no job docks.
+        self._task_open: dict[str, bool] = {}
+        self._task_item: dict[str, set[str]] = {}
+        self._task_last: dict[str, dict[str, Any]] = {}
+        self._prev_state: dict[str, str | None] = {}
+        self._task_rooms_done: dict[str, set[str]] = {}
         # Live per-room elapsed cleaning seconds this session (for the debug progress
         # gauge's time-ratio) + last poll timestamp to measure the per-poll delta.
         self._room_elapsed: dict[str, dict[str, float]] = {}
@@ -1383,11 +1421,6 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # restart, and neither should a stale "done around HH:MM".
         self._job_state: dict[str, Any] | None = None
         self._path_job_id: dict[str, int | None] = {}
-        # Runs whose harvest is waiting for the job to release this vacuum (docs/36).
-        # {duid: utc time the last sortie ended}; absent = nothing pending. Not
-        # persisted — an in-flight run does not survive a restart anyway, same as
-        # `_job_rooms` above. See `_run_still_open` / `_harvest_run`.
-        self._run_pending: dict[str, datetime] = {}
         # Room completion (docs/45): one `coverage.RunTracker` per vacuum for the
         # whole RUN (docs/36 — a dock trip between two batches of one job keeps it).
         # It decides which room is really being cleaned (run targets + sequence +
@@ -2227,131 +2260,170 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
 
     @property
     def room_sequence(self) -> dict[str, int]:
-        """Room cleaning order {room_name: 1-based position} (docs/19)."""
-        return dict(self._room_sequence)
+        """Kept for older cards (docs/19): the hand-edited order is gone (docs/52
+        O1); the app's own order is read from each robot (`app_sequence`)."""
+        return {}
 
-    def set_room_sequence(self, rooms: list[str]) -> None:
-        """Replace the whole sequence (anyvac.set_room_sequence) — the card sends the
-        complete reordered room list; position in the list = the sequence number.
-        A room omitted from a later call keeps whatever position it last had only if
-        it's still present in the new list; rooms not in ``rooms`` at all are dropped
-        from the map entirely (the editor always sends its full known room list)."""
-        self._room_sequence = {str(r): i + 1 for i, r in enumerate(rooms) if r}
-        self._delay_save(self._seq_store, lambda: dict(self._room_sequence), 2)
-        self.async_update_listeners()
+    async def async_refresh_app_sequence(self, duid: str, force: bool = False) -> dict[str, int]:
+        """Read the room order set in the Roborock app from the robot
+        (`get_clean_sequence`, docs/52 O1). Cached for an hour; any failure
+        keeps what we had — the order is a nicety, never a reason to fail."""
+        at = self._app_sequence_at.get(duid)
+        if not force and at is not None and (dt_util.utcnow() - at).total_seconds() < APP_SEQUENCE_TTL_S:
+            return dict(self.app_sequence.get(duid) or {})
+        rb = self.roborock_coordinator_for(duid)
+        api = getattr(rb, "properties_api", None)
+        channel = getattr(getattr(api, "map_content", None), "rpc_channel", None)
+        if channel is None:
+            channel = getattr(getattr(api, "command", None), "rpc_channel", None)
+        if channel is None:
+            return dict(self.app_sequence.get(duid) or {})
+        try:
+            from roborock.roborock_typing import RoborockCommand  # official integration's library
+
+            resp = await channel.send_command(RoborockCommand.GET_CLEAN_SEQUENCE)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("AnyVac: get_clean_sequence for %s failed: %s", duid, err)
+            return dict(self.app_sequence.get(duid) or {})
+        segs = _clean_sequence_segments(resp)
+        dev = (self.data or {}).get(duid)
+        names = {
+            r.get("segment_id"): r.get("name")
+            for r in ((getattr(dev, "data", None) or {}).get("rooms") or [])
+        }
+        seq: dict[str, int] = {}
+        for seg in segs:
+            nm = names.get(seg)
+            if nm and nm not in seq:
+                seq[nm] = len(seq) + 1
+        self.app_sequence[duid] = seq
+        self._app_sequence_at[duid] = dt_util.utcnow()
+        return dict(seq)
 
     # -- docs/44 F2: job progress (read by the card's hero bar) -----------------
 
-    def set_job_plan(
-        self,
-        passes: list[dict[str, Any]],
-        eta_min: float,
-        started_at: Any = None,
-    ) -> None:
-        """Register the running job's room passes.
-
-        ``passes`` = ``[{room, kind, vacuum, duid, est_min, finish_min}]`` in
-        planned order (``finish_min`` = the planner's sequence-aware finish time
-        for that pass, docs/19). Replaces whatever job was registered before —
-        a new job always cancels the old one first (docs/13 C6)."""
-        rows = sorted(
-            (dict(p, done_at=None) for p in passes),
-            key=lambda p: (p.get("finish_min") or 0.0, 0 if p.get("kind") == "dry" else 1),
-        )
-        self._job_state = {
-            "started_at": started_at or dt_util.utcnow(),
-            "eta_min": float(eta_min or 0.0),
-            "passes": rows,
-        }
+    def set_job_state(self, state: dict[str, Any] | None) -> None:
+        """The running job, as the job runner holds it (docs/52 §9.4):
+        ``{job_id, started_at, mode, queues: {duid: {vacuum, batch, items:
+        [{id, room, rooms, kind, state, est_min, reason, manual, ...}],
+        wash: {...}}}, warnings}``. None when no job runs. The runner owns
+        the queues; the coordinator only turns them into `job_progress`."""
+        self._job_state = state
         self.async_update_listeners()
 
-    def mark_job_room_done(self, duid: str, room: str) -> None:
-        """An ``anyvac_room_done`` for this job. The event carries no clean type,
-        so the FIRST open pass of that robot in that room is the one completed
-        (a both-capable robot's dry pass precedes its wet pass of the same room
-        by construction — planner gates wet on the room's dry finish)."""
-        st = self._job_state
-        if not st:
-            return
-        for row in st["passes"]:
-            if row.get("duid") == duid and row.get("room") == room and row.get("done_at") is None:
-                row["done_at"] = dt_util.utcnow()
-                self.async_update_listeners()
-                return
+    def _live_robot_model(self, duid: str, q: dict[str, Any]) -> dict[str, Any]:
+        """`planner.simulate_queues` input for one robot of the running job:
+        the items still to run, the active one reduced to what is left of it."""
+        dev = (self.data or {}).get(duid)
+        dd = getattr(dev, "data", None) or {}
+        items: list[dict[str, Any]] = []
+        prev_kind: str | None = None
+        for it in q.get("items") or []:
+            st = it.get("state")
+            if st in ("done", "blocked", "removed"):
+                prev_kind = it.get("kind")
+                continue
+            est = float(it.get("est_min") or 0.0)
+            if st == "active":
+                est *= 1 - min(self._item_pct(dd, it), 100) / 100
+            items.append({"id": it["id"], "kind": it.get("kind"), "rooms": it.get("rooms") or [], "est_min": est})
+        wash = q.get("wash") or {}
+        return {
+            "items": items,
+            "wash_mode": wash.get("mode"),
+            "interval": wash.get("interval_min"),
+            "batch": bool(q.get("batch")),
+            "since_wash": wash.get("mop_min_since_wash") or 0.0,
+            "prev_kind": prev_kind,
+        }
 
-    def clear_job_plan(self) -> None:
-        if self._job_state is not None:
-            self._job_state = None
-            self.async_update_listeners()
+    @staticmethod
+    def _item_pct(dd: dict[str, Any], it: dict[str, Any]) -> int:
+        """Live % of an active item from the room-completion tracker."""
+        prog = dd.get("rooms_progress") or {}
+        vals = []
+        for room in it.get("rooms") or []:
+            raw = (prog.get(room) or {}).get(f"{it.get('kind')}_pct")
+            vals.append(int(raw) if isinstance(raw, (int, float)) else 0)
+        return round(sum(vals) / len(vals)) if vals else 0
 
     @property
     def job_progress(self) -> dict[str, Any]:
-        """Card-facing snapshot of the running job (docs/44 F2).
+        """Card-facing snapshot of the running job (docs/44 F2, v2 docs/52 §9.4).
 
-        The card never estimates time itself (docs/14): ``finish_at`` is computed
-        here as ``now + eta_min_left`` where ``eta_min_left`` is the larger of
-        (a) the planner's sequence-aware ETA minus elapsed time and (b) the
-        slowest robot's remaining own work (not-done passes, the active one
-        scaled by its live coverage %). (a) keeps dry→wet gating in the answer,
-        (b) stops the estimate from reaching zero while a robot is visibly still
-        working because the job runs late."""
+        The card never estimates time itself (docs/14): every item's start and
+        finish come from `planner.simulate_queues` over what is left — the same
+        model the plan was made with — so an edit, a slow room or a blocked one
+        moves the finish time at once."""
+        from .planner import simulate_queues  # local: planner imports nothing from here
+
         st = self._job_state
         if not st:
             return {"active": False}
         now = dt_util.utcnow()
         data = self.data or {}
-        rows = st["passes"]
-        # Which pass is each robot working on right now?
-        active_idx: dict[str, int] = {}
-        for i, row in enumerate(rows):
-            duid = row.get("duid")
-            if row.get("done_at") is not None or duid in active_idx:
-                continue
-            dev = data.get(duid)
-            dd = getattr(dev, "data", None) or {}
-            if dd.get("in_cleaning") and dd.get("vacuum_room_name") == row.get("room"):
-                active_idx[duid] = i
+        queues = st.get("queues") or {}
+        robots = {duid: self._live_robot_model(duid, q) for duid, q in queues.items()}
+        times = simulate_queues(robots)
+        left = max((f for _, f in times.values()), default=0.0)
+
+        def at(minutes: float) -> str:
+            return (now + timedelta(minutes=minutes)).isoformat(timespec="seconds")
+
         out_rows: list[dict[str, Any]] = []
-        remaining_by_robot: dict[str, float] = {}
-        for i, row in enumerate(rows):
-            duid = row.get("duid")
-            kind = row.get("kind")
-            est = float(row.get("est_min") or 0.0)
-            if row.get("done_at") is not None:
-                state, pct = "done", 100
-            elif active_idx.get(duid) == i:
-                dev = data.get(duid)
-                prog = ((getattr(dev, "data", None) or {}).get("rooms_progress") or {}).get(row.get("room")) or {}
-                raw = prog.get(f"{kind}_pct")
-                pct = int(raw) if isinstance(raw, (int, float)) else 0
-                state = "active"
-            else:
-                state, pct = "queued", 0
-            if state != "done":
-                remaining_by_robot[duid] = remaining_by_robot.get(duid, 0.0) + est * (1 - min(pct, 100) / 100)
-            out_rows.append({
-                "room": row.get("room"), "kind": kind, "vacuum": row.get("vacuum"),
-                "state": state, "pct": pct,
-            })
-        elapsed = (now - st["started_at"]).total_seconds() / 60
-        static_left = st["eta_min"] - elapsed
-        dynamic_left = max(remaining_by_robot.values(), default=0.0)
-        left = max(static_left, dynamic_left, 0.0)
+        out_queues: dict[str, dict[str, Any]] = {}
+        vacs: dict[str, dict[str, Any]] = {}
+        for duid, q in queues.items():
+            dd = getattr(data.get(duid), "data", None) or {}
+            entity = q.get("vacuum")
+            qitems: list[dict[str, Any]] = []
+            for it in q.get("items") or []:
+                state = it.get("state")
+                if state == "removed":
+                    continue
+                pct = 100 if state == "done" else (self._item_pct(dd, it) if state == "active" else 0)
+                start_finish = times.get(it["id"])
+                row = {
+                    "id": it["id"], "room": it.get("room"), "rooms": it.get("rooms"),
+                    "kind": it.get("kind"), "state": state, "pct": pct,
+                    "est_min": it.get("est_min"), "manual": bool(it.get("manual")),
+                    "start_at": at(start_finish[0]) if start_finish else None,
+                    "finish_at": at(start_finish[1]) if start_finish else it.get("done_at"),
+                }
+                if it.get("reason"):
+                    row["reason"] = it["reason"]
+                qitems.append(row)
+                # v1 rows: queued / active / done (blocked kept as its own word).
+                legacy = {"sent": "active", "queued": "queued"}.get(state, state)
+                for room in it.get("rooms") or []:
+                    out_rows.append({
+                        "room": room, "kind": it.get("kind"), "vacuum": entity,
+                        "state": legacy, "pct": pct,
+                    })
+            v = vacs.setdefault(entity, {"room": None, "kind": None, "pct": None, "next_room": None})
+            for r in qitems:
+                if r["state"] in ("active", "sent") and v["room"] is None:
+                    v.update(room=r["room"], kind=r["kind"], pct=r["pct"])
+                elif r["state"] == "queued" and v["next_room"] is None:
+                    v["next_room"] = r["room"]
+            out_queues[entity] = {
+                "mode": "batch" if q.get("batch") else "rooms",
+                "state": q.get("phase") or "idle",
+                "items": qitems,
+                "wash": dict(q.get("wash") or {}),
+                "planned_stops": [],
+            }
         rooms = {r["room"] for r in out_rows}
         rooms_done = {
             rm for rm in rooms if all(r["state"] == "done" for r in out_rows if r["room"] == rm)
         }
-        vacs: dict[str, dict[str, Any]] = {}
-        for r in out_rows:
-            v = vacs.setdefault(r["vacuum"], {"room": None, "kind": None, "pct": None, "next_room": None})
-            if r["state"] == "active":
-                v.update(room=r["room"], kind=r["kind"], pct=r["pct"])
-            elif r["state"] == "queued" and v["next_room"] is None:
-                v["next_room"] = r["room"]
+        started = st.get("started_at")
         return {
             "active": True,
-            "started_at": st["started_at"].isoformat(timespec="seconds"),
-            "finish_at": (now + timedelta(minutes=left)).isoformat(timespec="seconds"),
+            "schema": 2,
+            "job_id": st.get("job_id"),
+            "started_at": started.isoformat(timespec="seconds") if hasattr(started, "isoformat") else started,
+            "finish_at": at(left),
             "eta_min_left": round(left, 1),
             "rooms_total": len(rooms),
             "rooms_done": len(rooms_done),
@@ -2359,6 +2431,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             "passes_done": sum(1 for r in out_rows if r["state"] == "done"),
             "rooms": out_rows,
             "vacuums": vacs,
+            "queues": out_queues,
             # docs/49 A5: pre-clean settings that did not take (e.g. the dry run's
             # `mop_intensity: off`) — the run was NOT blocked, the card may say so.
             "warnings": list(st.get("warnings") or []),
@@ -2374,7 +2447,35 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             warnings.append(text)
             self.async_update_listeners()
 
-    def set_job_rooms(self, duid: str, rooms: set[str] | None) -> None:
+    def save_job(self, snapshot: dict[str, Any] | None) -> None:
+        """Persist the running job (None = no job any more)."""
+        self._job_saved = snapshot
+        self._delay_save(self._job_store, lambda: self._job_saved or {}, 2)
+
+    async def async_load_job(self) -> dict[str, Any] | None:
+        data = await self._job_store.async_load()
+        return data if isinstance(data, dict) and data.get("job_id") else None
+
+    def set_task_item(self, duid: str, rooms: set[str] | None) -> None:
+        """The room(s) of the queue item a job just sent to this robot — the
+        measurement targets of the task (docs/52 §9.3). None = not known."""
+        if rooms:
+            self._task_item[duid] = set(rooms)
+        else:
+            self._task_item.pop(duid, None)
+
+    def discard_task(self, duid: str) -> None:
+        """Forget what the running task measured without learning from it: the
+        job removed the room mid-clean (docs/52 §3.4) — an interrupted room
+        must never calibrate."""
+        self._room_elapsed[duid] = {}
+        self._runs[duid] = covmod.RunTracker()
+        self._run_targets_seen.pop(duid, None)
+        self._session_confirmed[duid] = set()
+        self._session_rooms[duid] = set()
+        self._task_open[duid] = False
+
+    def set_job_rooms(self, duid: str, rooms: set[str] | None, keep_id: bool = False) -> None:
         """Plan-scope transit labeling (docs/17 §1.3) — called by services.py's
         _JobRunner when an orchestrated job (anyvac.clean) starts/finishes for this
         vacuum. `rooms` = the full room-name scope of the job for this duid (union of
@@ -2383,9 +2484,13 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         `_attribute_points`, not user-facing sensor state."""
         if rooms is None:
             self._job_rooms.pop(duid, None)
+            self._task_item.pop(duid, None)
         else:
-            self._job_seq += 1
-            self._job_id[duid] = self._job_seq
+            # An edit of the running job (docs/52 §3.4) widens the scope but is
+            # still the same job: the drawn trace keeps stitching (docs/27).
+            if not (keep_id and duid in self._job_rooms):
+                self._job_seq += 1
+                self._job_id[duid] = self._job_seq
             self._job_rooms[duid] = set(rooms)
 
     def _sortie_is_new_job(self, duid: str) -> bool:
@@ -2490,11 +2595,13 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         self._geo[duid] = ((raw_sha1, names), gkey, geo)
         return geo
 
-    def _next_room(self, run: covmod.RunTracker, targets: set[str] | None) -> str | None:
+    def _next_room(
+        self, run: covmod.RunTracker, targets: set[str] | None, duid: str | None = None
+    ) -> str | None:
         """The room the configured sequence (docs/19) says the robot cleans next:
         the lowest-numbered target not yet finished or active. None when the
         sequence doesn't know any of the remaining targets."""
-        seq = self._room_sequence
+        seq = self.app_sequence.get(duid) or {} if duid else {}
         pool = targets if targets is not None else set(seq)
         left = [r for r in pool if r not in run.done and r != run.active]
         if targets is not None and len(left) == 1:
@@ -2513,8 +2620,13 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         }
         segs = device.data.get("target_segments") or []
         names = {seg_names.get(str(s)) for s in segs} - {None}
+        # The item the job runner sent (docs/52 §9.3) — one room per task. A
+        # job without per-item information falls back to its whole scope.
+        item = self._task_item.get(duid)
         job = self._job_rooms.get(duid)
-        if job:
+        if item:
+            names |= set(item)
+        elif job:
             names |= set(job)
         if names:
             self._run_targets_seen[duid] = set(names) | self._run_targets_seen.get(duid, set())
@@ -2678,12 +2790,15 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 if p.get("x") is not None and p.get("y") is not None
             ]
 
+        # A mop carriage that is down while the water is off leaves mop points
+        # but no wet floor (S7 MaxV, docs/49 / docs/52 O3): no wet evidence.
+        wet_pts = [] if device.data.get("water_off") else new_by_layer["wet"]
         weights = run.feed(
             geo,
             _xy(new_by_layer["dry"]),
-            _xy(new_by_layer["wet"]),
+            _xy(wet_pts),
             targets=targets,
-            next_room=self._next_room(run, targets),
+            next_room=self._next_room(run, targets, duid),
             vacuuming=vacuuming,
             restrict=not cleaning_gate,
         )
@@ -2734,18 +2849,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 # Fire done/stamp only with real cleaning evidence — a confirmed room
                 # the robot merely drove through (dock in room) must not release the
                 # orchestrator's wet pass nor stamp history.
-                kinds = self._evidence_kinds(device, prev)
-                if kinds:
-                    self._stamp_room(device, prev)
-                    self.hass.bus.async_fire(
-                        f"{DOMAIN}_room_done",
-                        {
-                            "vacuum": device.name, "duid": duid, "room": prev, "reason": "docked",
-                            "kind": self._kind_of(kinds), "kinds": list(kinds),
-                        },
-                    )
-                else:
-                    _LOGGER.debug("AnyVac: %s left %s without evidence — no room_done", device.name, prev)
+                self._emit_room_done(device, prev, "docked")
             self._confirmed_room[duid] = None
             self._raw_room[duid] = None
             self._raw_count[duid] = 0
@@ -2765,157 +2869,192 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             self._confirmed_room[duid] = raw
             self._session_confirmed.setdefault(duid, set()).add(raw)
             if prev:
-                kinds = self._evidence_kinds(device, prev)
-                if kinds:
-                    self._stamp_room(device, prev)
-                    self.hass.bus.async_fire(
-                        f"{DOMAIN}_room_done",
-                        {
-                            "vacuum": device.name, "duid": duid, "room": prev, "reason": "left",
-                            "kind": self._kind_of(kinds), "kinds": list(kinds),
-                        },
-                    )
-                else:
-                    _LOGGER.debug("AnyVac: %s left %s without evidence — no room_done", device.name, prev)
+                self._emit_room_done(device, prev, "left")
+
+    def _emit_room_done(self, device: AnyVacDevice, room: str, reason: str) -> None:
+        """Stamp history + fire ``anyvac_room_done`` for `room` — only with real
+        cleaning evidence (a room merely driven through must neither release a
+        wet pass nor stamp history), and once per task."""
+        duid = device.duid
+        fired = self._task_rooms_done.setdefault(duid, set())
+        if room in fired:
+            return
+        kinds = self._evidence_kinds(device, room)
+        if not kinds:
+            _LOGGER.debug("AnyVac: %s left %s without evidence — no room_done", device.name, room)
+            return
+        fired.add(room)
+        self._stamp_room(device, room)
+        self.hass.bus.async_fire(
+            f"{DOMAIN}_room_done",
+            {
+                "vacuum": device.name, "duid": duid, "room": room, "reason": reason,
+                "kind": self._kind_of(kinds), "kinds": list(kinds),
+            },
+        )
 
     def _track_and_emit(self, device: AnyVacDevice) -> None:
-        """Fire the clean lifecycle events and drive the RUN's accumulators.
+        """Fire the clean lifecycle events and drive the per-task accumulators.
 
-        Three events, two lifetimes (docs/36):
+        A TASK is one command the robot runs to its end (docs/52 §9.3): in a
+        room-by-room job one room, in a clean started from the app or a batch
+        dispatch all its rooms. The robot chains tasks without ever dropping
+        ``in_cleaning`` (the next room is sent on its way home), so the end of
+        a task is the edge into ``returning_home`` (not the firmware's low
+        battery trip) or the fall of ``in_cleaning``, whichever comes first.
 
-        * ``anyvac_clean_finished`` — one per SORTIE, on every ``in_cleaning`` falling
-          edge. services.py's `_JobRunner` listens on it to free the robot and dispatch
-          the job's next batch, so it must never be deferred or coalesced.
-        * ``anyvac_clean_started`` / ``anyvac_run_finished`` — one per RUN. A job
-          dispatched in batches (docs/23) docks in between, and those dock trips are not
-          separate cleans: a notification automation should fire once per job, and the
-          calibration/coverage harvest must see the whole run's cells, not one batch's.
+        * ``anyvac_clean_finished`` — one per task, with what it cleaned
+          (``rooms_result``). The job runner reads its items' results from it.
+        * ``anyvac_clean_started`` — once per run (the first task of a job).
+        * ``anyvac_run_finished`` — without a job: when the robot is done (its
+          ``in_cleaning`` falls). In a job the runner fires it per vacuum once
+          its queue is done (docs/52 R6).
 
-        Notifications are built by the user from these events + the per-room timestamp
-        sensors; the integration never composes message text itself.
+        Learning (calibration, completion %) happens at every task end: one
+        task is one clean measurement, never a mix of two (docs/52 O3).
         """
         duid = device.duid
         cleaning = bool(device.data.get("in_cleaning"))
         was = self._was_cleaning.get(duid, False)
+        state = device.data.get("status_state")
+        prev_state = self._prev_state.get(duid)
+        self._prev_state[duid] = state
+        if cleaning and not was:
+            # RUN vs SORTIE (docs/36): a later sortie of the same job (the robot
+            # docked to wash, then got its next room) keeps the drawn trace;
+            # a new job or a manual start wipes it.
+            new_run = self._sortie_is_new_job(duid)
+            self._path_seen[duid] = {"dry": 0, "wet": 0}
+            run = self._runs.get(duid)
+            if run is not None:
+                run.break_path("dry")
+                run.break_path("wet")
+            self._task_last.pop(duid, None)
+            if new_run:
+                self._session_clean_type.pop(duid, None)
+                self._signal_candidate.pop(duid, None)
+                self._dry_path[duid] = []
+                self._wet_path[duid] = []
+                self._decim_cache.pop(duid, None)  # see `_decimate_segments` (1.1.0)
+                # Persist the wipe right away (2026-07-26) — a poll without the
+                # new session's first points must not leave the old trace on disk.
+                self._delay_save(self._paths_store,
+                    self._paths_for_save, _PATHS_WIPE_SAVE_DELAY_S
+                )
+                ct_start, ct_src = self.resolve_run_kind(duid)
+                if ct_start is None:
+                    ct_start = device.data.get("clean_type")
+                    ct_src = "signal" if ct_start else None
+                self.hass.bus.async_fire(
+                    f"{DOMAIN}_clean_started",
+                    {
+                        "vacuum": device.name, "duid": duid,
+                        "clean_type": ct_start, "clean_type_source": ct_src,
+                    },
+                )
+                if self.hass is not None and getattr(self.hass, "async_create_task", None):
+                    # The app's room order, for a multi-room clean started outside
+                    # AnyVac (`_next_room`, docs/52 O1). Best-effort.
+                    try:
+                        self.hass.async_create_task(self.async_refresh_app_sequence(duid))
+                    except Exception:  # noqa: BLE001 - test doubles without a loop
+                        pass
+            self._begin_task(duid)
+            self._dry_path_open[duid] = False
+            self._wet_path_open[duid] = False
+        elif cleaning and not self._task_open.get(duid) and state in ACTIVE_CLEAN_STATES:
+            # The next task, accepted on the way home (docs/52 §2.8): no
+            # `in_cleaning` edge, the robot just starts cleaning again.
+            self._begin_task(duid)
         if cleaning:
-            if not was:
-                # RUN vs SORTIE (docs/36). A job dispatched progressively (docs/23) or
-                # interrupted by a dock trip comes back as a fresh ``in_cleaning`` edge
-                # even though it is the SAME cleaning run. `_sortie_is_new_job` — the
-                # very verdict docs/27 already uses for the drawn trace — tells the two
-                # apart; everything that measures the RUN (coverage cells, per-room
-                # active time, confirmed/visited rooms, the run's start time) must
-                # survive a continuation. Wiping them per sortie was the 2026-09-02
-                # field bug: coverage restarted from zero mid-job and the resulting
-                # partial cell count dragged the learned baseline down with it.
-                new_run = self._sortie_is_new_job(duid)
-                self._path_seen[duid] = {"dry": 0, "wet": 0}
-                run = self._runs.get(duid)
-                if run is not None:
-                    run.break_path("dry")
-                    run.break_path("wet")
-                if new_run:
-                    # A previous run whose harvest never got its closing poll (job scope
-                    # stuck, HA restarted mid-job) must still be written out before its
-                    # accumulators are wiped — see `_run_still_open`.
-                    if self._run_pending.pop(duid, None) is not None:
-                        self._harvest_run(device)
-                    self._session_clean_type.pop(duid, None)
-                    self._signal_candidate.pop(duid, None)
-                    self._session_rooms[duid] = set()
-                    self._session_confirmed[duid] = set()
-                    self._room_elapsed[duid] = {}
-                    self._runs[duid] = covmod.RunTracker()
-                    self._run_targets_seen.pop(duid, None)
-                    self._dry_path[duid] = []
-                    self._wet_path[duid] = []
-                    self._decim_cache.pop(duid, None)  # see `_decimate_segments` (1.1.0)
-                    # Persist the wipe itself right away (2026-07-26) — `_attribute_points`
-                    # runs right after this in the same poll and usually also triggers a
-                    # save once the new session's first points land, but a poll where the
-                    # robot hasn't produced any points yet must not leave the stale
-                    # pre-wipe trace sitting on disk in the meantime.
-                    self._delay_save(self._paths_store,
-                        self._paths_for_save, _PATHS_WIPE_SAVE_DELAY_S
-                    )
-                    self._session_start[duid] = dt_util.utcnow()
-                    # ``clean_started`` is a RUN-level signal (docs/36): a notification
-                    # automation must not fire again for every batch of the same job.
-                    # The plan knows what the job ordered; with no job the knob is the
-                    # only hint (docs/49) — flagged as such in `clean_type_source`.
-                    ct_start, ct_src = self.resolve_run_kind(duid)
-                    if ct_start is None:
-                        ct_start = device.data.get("clean_type")
-                        ct_src = "signal" if ct_start else None
-                    self.hass.bus.async_fire(
-                        f"{DOMAIN}_clean_started",
-                        {
-                            "vacuum": device.name, "duid": duid,
-                            "clean_type": ct_start, "clean_type_source": ct_src,
-                        },
-                    )
-                self._dry_path_open[duid] = False
-                self._wet_path_open[duid] = False
             room = device.data.get("vacuum_room_name")
-            if room:
+            if room and self._task_open.get(duid):
                 self._session_rooms.setdefault(duid, set()).add(room)
             self._capture_signal(device)
+            battery = device.data.get("battery")
+            if (
+                self._task_open.get(duid)
+                and state == "returning_home"
+                and prev_state != "returning_home"
+                and not (isinstance(battery, (int, float)) and battery <= LOW_BATTERY_RETURN_PCT)
+            ):
+                self._close_task(device)
         elif was:
-            # The last seconds of cleaning arrive with this very poll (the firmware
-            # refreshes the map on the state change) — attribute them BEFORE any
-            # harvest reads the run (docs/45 §1.2). The main loop's own call later
-            # this poll then finds no new points.
-            self._attribute_points(device, tail_only=True)
-            event = self._run_event(device)
-            # The SORTIE-level event keeps firing exactly as before, on every
-            # ``in_cleaning`` falling edge: services.py's `_JobRunner` listens on it to
-            # free the robot and dispatch its next batch (docs/23), so deferring it
-            # would wedge every progressively dispatched job. What IS deferred while
-            # the job still holds this vacuum's scope is the HARVEST — learning,
-            # coverage %, accumulator reset — which needs the whole run, not one batch
-            # of it (docs/36).
-            if self._run_still_open(duid):
-                self._run_pending[duid] = dt_util.utcnow()
-                self.hass.bus.async_fire(f"{DOMAIN}_clean_finished", event)
-            else:
-                # Pop FIRST: this sortie may be closing a run that an earlier sortie
-                # already marked pending (the job released the vacuum while it was on
-                # its way home), and a leftover entry would swallow `run_finished`.
-                self._run_pending.pop(duid, None)
-                calibrated = self._harvest_run(device)
-                if calibrated:
-                    event["calibrated"] = calibrated
-                self.hass.bus.async_fire(f"{DOMAIN}_clean_finished", event)
-                self.hass.bus.async_fire(f"{DOMAIN}_run_finished", event)
-        elif self._run_pending.get(duid) is not None and not self._run_still_open(duid):
-            # The job that held this run open has cleared its scope (or the safety cap
-            # expired): close the run now — one poll after the last sortie's event
-            # (docs/36). ``clean_finished`` already fired per sortie; the run-level
-            # result lands on ``anyvac_run_finished``.
-            self._run_pending.pop(duid, None)
-            event = self._run_event(device)
-            calibrated = self._harvest_run(device)
-            if calibrated:
-                event["calibrated"] = calibrated
-            self.hass.bus.async_fire(f"{DOMAIN}_run_finished", event)
+            if self._task_open.get(duid):
+                self._close_task(device)
+            if duid not in self._job_rooms:
+                event = self._task_last.pop(duid, None)
+                if event is not None:
+                    self.hass.bus.async_fire(f"{DOMAIN}_run_finished", event)
         self._was_cleaning[duid] = cleaning
 
-    def _run_still_open(self, duid: str) -> bool:
-        """Is a docked vacuum only between two sorties of the SAME run (docs/36)?
+    def _begin_task(self, duid: str) -> None:
+        self._task_open[duid] = True
+        self._task_rooms_done[duid] = set()
+        self._session_start[duid] = dt_util.utcnow()
+        self._session_rooms[duid] = set()
+        self._session_confirmed[duid] = set()
+        self._room_elapsed[duid] = {}
+        self._runs[duid] = covmod.RunTracker()
+        self._run_targets_seen.pop(duid, None)
 
-        True while an orchestrated job still holds this vacuum's plan scope — the job
-        runner clears it (`set_job_rooms(duid, None)`) on every path that ends a job,
-        so the very next poll closes the run. The elapsed cap is a safety net for a
-        scope that never clears (a job runner torn down without its cleanup path):
-        without it a stuck scope would keep a run open forever and no coverage % would
-        ever be written. Without any job scope at all — a manual start from the app or
-        the card — every sortie is its own run, exactly as before docs/36."""
+    def _close_task(self, device: AnyVacDevice) -> None:
+        """End of one task: last seconds of cleaning, the last room's
+        ``room_done``, the task's room results, learning, ``clean_finished``."""
+        duid = device.duid
+        # The last seconds of cleaning arrive with this very poll (the firmware
+        # refreshes the map on the state change) — attribute them BEFORE the
+        # harvest reads the run (docs/45 §1.2).
+        self._attribute_points(device, tail_only=True)
+        # The room the robot was in is finished now. Reported here because
+        # `_detect_room_done` only sees the robot leave it once `in_cleaning`
+        # falls, which a chained task never does.
+        # A short room may never get confirmed (two snapshots): the room the
+        # job sent counts too.
+        for room in [self._confirmed_room.get(duid), *sorted(self._task_item.get(duid) or ())]:
+            if room:
+                self._emit_room_done(device, room, "task_end")
+        self._confirmed_room[duid] = None
+        self._raw_room[duid] = None
+        self._raw_count[duid] = 0
+        event = self._run_event(device)
+        event["rooms_result"] = self._task_result(device)
+        event["battery"] = device.data.get("battery")
+        event["water_shortage"] = bool((device.data.get("dock_status") or {}).get("water_shortage_status"))
+        calibrated = self._harvest_run(device)
+        if calibrated:
+            event["calibrated"] = calibrated
+        self._task_open[duid] = False
+        self._task_item.pop(duid, None)
+        self.hass.bus.async_fire(f"{DOMAIN}_clean_finished", event)
         if duid not in self._job_rooms:
-            return False
-        since = self._run_pending.get(duid)
-        if since is not None and (dt_util.utcnow() - since).total_seconds() > _RUN_DEFER_MAX_S:
-            return False
-        return True
+            if device.data.get("in_cleaning"):
+                self._task_last[duid] = event  # `run_finished` once it docks
+            else:
+                self.hass.bus.async_fire(f"{DOMAIN}_run_finished", event)
+
+    def _task_result(self, device: AnyVacDevice) -> list[dict[str, Any]]:
+        """What the task did per room (docs/52 §5b): read before the harvest
+        resets the run. ``cleaned`` = really cleaned, not driven through."""
+        duid = device.duid
+        run = self._runs.get(duid) or covmod.RunTracker()
+        geo = (self._geo.get(duid) or (None, None, None))[2]
+        elapsed = self._room_elapsed.get(duid) or {}
+        rooms = set(self._task_item.get(duid) or ()) | set(run.activated)
+        out: list[dict[str, Any]] = []
+        for nm in sorted(rooms):
+            row: dict[str, Any] = {
+                "room": nm,
+                "cleaned": nm in run.activated,
+                "active_min": round((elapsed.get(nm) or 0.0) / 60, 1),
+                "passes": run.passes,
+            }
+            for kind in covmod.KINDS:
+                res = run.kind_result(geo, nm, kind) if geo is not None else None
+                if res is not None and res["floor"] >= 5:
+                    row[kind] = 100 if res["pct"] >= 90 else res["pct"]
+            out.append(row)
+        return out
 
     # -- docs/49: what KIND of run was it? ----------------------------------------
     # One rule: EVIDENCE decides (the run's real dry/wet footprint); until evidence
@@ -2957,8 +3096,10 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         st = self._job_state
         if not st:
             return set()
-        rows = [r for r in st["passes"] if r.get("duid") == duid and r.get("kind") in covmod.KINDS]
-        open_rows = [r for r in rows if r.get("done_at") is None]
+        q = (st.get("queues") or {}).get(duid) or {}
+        rows = [r for r in q.get("items") or [] if r.get("kind") in covmod.KINDS]
+        cur = [r for r in rows if r.get("state") in ("sent", "active")]
+        open_rows = cur or [r for r in rows if r.get("state") == "queued"]
         return {r["kind"] for r in (open_rows or rows)}
 
     def resolve_run_kind(self, duid: str) -> tuple[str | None, str | None]:
@@ -3190,11 +3331,6 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 if kinds:
                     migrated[str(k)] = kinds
             self._room_pins = migrated
-        seq = await self._seq_store.async_load()
-        if isinstance(seq, dict):
-            self._room_sequence = {
-                str(k): int(v) for k, v in seq.items() if isinstance(v, (int, float))
-            }
         lay = await self._layers_store.async_load()
         if isinstance(lay, dict):
             self._view_layers = {
@@ -3793,7 +3929,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 "session_before": session_before,
                 "session_after": self._session_clean_type.get(duid),
                 "event_clean_type": (session_before or signal) if edge else None,
-                "run_pending": duid in self._run_pending,
+                "task_open": bool(self._task_open.get(duid)),
                 "dry_points": sum(len(seg) for seg in self._dry_path.get(duid, [])),
                 "wet_points": sum(len(seg) for seg in self._wet_path.get(duid, [])),
             }
@@ -3941,7 +4077,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     # docs/49: `clean_type` is the verdict about the RUN (null when
                     # idle); the knob itself — the old meaning — moves to `mode_signal`.
                     device.data["mode_signal"] = device.data.get("clean_type")
-                    if device.data.get("in_cleaning") or device.duid in self._run_pending:
+                    if device.data.get("in_cleaning") or self._task_open.get(device.duid):
                         kind, kind_src = self.resolve_run_kind(device.duid)
                     else:
                         kind = kind_src = None
@@ -4395,6 +4531,8 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             return getattr(status, attr, None) if status is not None else None
 
         data["in_cleaning"] = bool(_s("in_cleaning"))
+        bat = _s("battery")
+        data["battery"] = int(bat) if isinstance(bat, (int, float)) else None
         # Passes of the running clean (docs/45 §2.3) — the status only carries
         # `repeat` while a clean runs (verified via diagnostics 2026-09-30).
         rep = _s("repeat")
@@ -4532,6 +4670,8 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # branch never ran. Unknown attachment (None) keeps the water-mode verdict.
         # This is only the knob: the verdict about a RUN is `resolve_run_kind`.
         water_active = bool(water_name) and not _mode_is_off(water_name)
+        # The robot says outright that no water flows (docs/52 O3).
+        data["water_off"] = water_name is not None and _mode_is_off(water_name)
         carriage = _s("water_box_carriage_status")
         attached = None if carriage is None else bool(carriage)
         data["clean_type"] = (

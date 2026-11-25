@@ -278,8 +278,8 @@ def test_build_tasks_dispatches_each_robots_own_segment_for_a_paired_room(
 
     dry_task = next(t for t in tasks if t["duid"] == "d1")
     wet_task = next(t for t in tasks if t["duid"] == "w1")
-    assert dry_task["service_data"]["params"][0]["segments"] == [1]
-    assert wet_task["service_data"]["params"][0]["segments"] == [7]
+    assert dry_task["segments"] == [1]
+    assert wet_task["segments"] == [7]
 
 
 def test_estimate_for_a_paired_room_uses_the_robots_own_learned_name() -> None:

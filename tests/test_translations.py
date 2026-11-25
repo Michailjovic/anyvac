@@ -49,3 +49,14 @@ def test_czech_services_exist_and_fields_match_services_yaml():
         assert body["name"] and body["description"]
         for f in body["fields"].values():
             assert f["name"] and f["description"]
+
+
+def test_services_yaml_parses_and_lists_every_public_service():
+    """A plain `data: URL` in a description broke the whole file (1.57.0):
+    Home Assistant then shows no service descriptions at all."""
+    import yaml
+
+    from custom_components.anyvac.services import ALL_SERVICES
+
+    doc = yaml.safe_load((ROOT / "services.yaml").read_text(encoding="utf-8"))
+    assert set(doc) == set(ALL_SERVICES)

@@ -40,7 +40,7 @@ or mm math on the card side:
 | `rooms_estimate` | learned per-room clean-time estimates in minutes: `{room: {dry, wet}}` (docs/16 continuous calibration) |
 | `rooms_progress` | per-room debug progress: `{room: {spatial_pct, visited_cells, total_cells, time_pct, elapsed_s, est_s}}` |
 | `rooms_last_cleaned` | per-room last-cleaned info by clean type (mirrors the timestamp sensors below) |
-| `room_sequence` / `room_pins` / `selected_rooms` / `view_layers` | orchestration/UI state the card reads and writes via services below |
+| `room_pins` / `selected_rooms` / `view_layers` | orchestration/UI state the card reads and writes via services below (`room_sequence` stays empty since 1.58.0) |
 | `floorplan_seats` | Visual editor manual seat + appearance + per-room + room-style override layer (docs/41 + docs/42), keyed by floorplan `image_base.src` — set/cleared via `anyvac.set_floorplan_seat`, merged over config by the card |
 | `reach` | docs/51: reach mask meta — `{entity_id, home_entity_id, home_frame_id, updated, home_ready, rooms: {room: {at, floor_pct, kinds, stale}}}`; the rasters themselves are the image entities below |
 | `pipeline_ok` / `pipeline_error` | integration self-diagnostic for the current poll |
@@ -200,7 +200,7 @@ closing) — the AnyVac card sends an *intent*, not a pre-built plan:
 
 | Service | What it does |
 | --- | --- |
-| `anyvac.clean` | Clean intent: `rooms` + `mode` (`dry`/`wet`/`both`) + optional `vacuums` restriction, per-room `pin`, and `settings`. The integration works out capability, room assignment (LPT-balanced), dry→wet gating and per-room pinning, then executes the resulting task list server-side — a wet-capable robot with 2+ rooms dispatches progressively as rooms become ready instead of waiting for all of them (docs/23). Once a home frame links two robots (above), a room name still resolves to whichever robot actually owns that physical room even if that robot calls it something else — no need to repeat the same `clean` call once per robot's own name for it. |
+| `anyvac.clean` | Clean intent: `rooms` + `mode` (`dry`/`wet`/`both`) + optional `vacuums` restriction, per-room `pin`, and `settings`. The integration works out capability, room assignment (LPT-balanced), dry→wet gating and per-room pinning, then runs it server-side as a queue per vacuum: each robot gets one room per command and the next one when it finishes (on its way home, or after the dock washed the mop), a wet room waits for the dry pass of the same room, and the settings are sent with every room (docs/52). Vacuums listed in `batch` get all their rooms in one command instead, in the order set in the Roborock app. Once a home frame links two robots (above), a room name still resolves to whichever robot actually owns that physical room even if that robot calls it something else — no need to repeat the same `clean` call once per robot's own name for it. |
 | `anyvac.plan` | Same planner as `anyvac.clean`, response-only — a preview of the assignment and estimated timeline without starting anything. |
 | `anyvac.goto` | Pin & go: `x_pct`/`y_pct` (percent of the rendered map image) → the integration converts to real coordinates and sends the robot. With `frame: "home"`, `x_home_px`/`y_home_px` (pixels in the shared home frame) instead. |
 | `anyvac.zone_clean` | Zone clean: two corners as percent of the map image, same conversion (or `frame: "home"` + `*_home_px` corners). |
@@ -211,15 +211,17 @@ closing) — the AnyVac card sends an *intent*, not a pre-built plan:
 | `anyvac.list_assets` / `anyvac.upload_asset` | docs/51: list / upload the furniture images in `config/www/anyvac/furniture/` for the card's Furniture tab (administrators only; upload takes base64, at most 2 MB, `.webp`/`.png`/`.svg`/`.jpg`). |
 | `anyvac.floorplan_scale` | docs/51: mm per floorplan unit (floorplan width = 100) from a floorplan's `crop_box` or `home_anchors` + `aspect` — response-only, used for furniture sizes in centimetres. |
 | `anyvac.reset_reach` | docs/51: forget stored reach masks (`duid`, `room` optional). |
+| `anyvac.edit_job` | Change the running job: `add` / `remove` rooms, `move` a room within its vacuum's queue, `pin` a room's pass to another vacuum. A room a vacuum is cleaning is left right away (pause, then the next room or home); rooms not sent yet just change in the queue. |
 | `anyvac.cancel` | Stops the running job and (by default) returns started robots to base. |
-| `anyvac.select_rooms` / `anyvac.pin_room` / `anyvac.set_layers` / `anyvac.set_room_sequence` / `anyvac.reset_learning` | UI/learning state — room selection, per-room robot pinning, dry/wet layer visibility, the Roborock app's room order (used for ETA), and clearing bad learned estimates. |
+| `anyvac.select_rooms` / `anyvac.pin_room` / `anyvac.set_layers` / `anyvac.reset_learning` | UI/learning state — room selection, per-room robot pinning, dry/wet layer visibility, and clearing bad learned estimates. |
 | `anyvac.set_floorplan_seat` | Save or clear a manual Visual editor floorplan override (docs/41 §4.6 + docs/42) — `vacuum` with `map`/`appearance`/`rooms` for one vacuum's seat geometry, style and/or per-room overrides (`map`/`appearance` each independently nullable; `rooms` merges per room_key instead, `null` on one room_key clearing just that room), or `vacuum` omitted for the card-level overrides instead (`image_base` the floorplan itself, `rooms` the shared merged-mode room list, `room_style` the global room border widths — each independently nullable); `null` clears the given part. Shared across every dashboard/browser showing that floorplan. |
 
-A task started by `anyvac.clean` runs once its gating conditions (`anyvac_room_done` per
-room, or `anyvac_clean_finished` per vacuum) are met, so a wet robot follows a dry robot per
-room without colliding — and a robot never receives a new command while mid-clean (that would
-discard the one in progress). Jobs start through `anyvac.clean` only (the old raw-task-list
-service `anyvac.run_job` was removed in 1.52.1).
+Events: `anyvac_clean_finished` after every task (one room in a room-by-room job, with
+`rooms_result`), `anyvac_room_done` per room, `anyvac_run_finished` once per vacuum when its
+part of the job is done (once per clean started outside AnyVac), `anyvac_job_finished` when the
+whole job is done. A running job survives a Home Assistant restart. Jobs start through
+`anyvac.clean` / `anyvac.edit_job` only (the old raw-task-list service `anyvac.run_job` was
+removed in 1.52.1).
 
 ## Status
 

@@ -99,7 +99,7 @@ async def test_remove_keeps_stores_while_another_entry_exists(monkeypatch: pytes
 
 async def test_unload_cancels_running_jobs(monkeypatch: pytest.MonkeyPatch) -> None:
     finished: list[str] = []
-    job = SimpleNamespace(started_vacuums={"vacuum.s8"}, finish=lambda: finished.append("job"))
+    job = SimpleNamespace(started_vacuums={"vacuum.s8"}, finish=lambda keep_saved=False: finished.append(("job", keep_saved)))
 
     async def _unload_platforms(_entry, _platforms):
         return True
@@ -110,4 +110,24 @@ async def test_unload_cancels_running_jobs(monkeypatch: pytest.MonkeyPatch) -> N
         services=SimpleNamespace(has_service=lambda d, s: False),
     )
     assert await integration.async_unload_entry(hass, SimpleNamespace()) is True
-    assert finished == ["job"]
+    # The saved job stays for the next start to resume (docs/52 §9.5).
+    assert finished == [("job", True)]
+
+
+def test_an_unedited_old_blueprint_is_updated_an_edited_one_is_kept(tmp_path) -> None:
+    import shutil
+
+    src = Path(integration.__file__).parent / "blueprints"
+    dst_dir = tmp_path / "blueprints" / "automation" / "anyvac"
+    dst_dir.mkdir(parents=True)
+    hass = SimpleNamespace(config=SimpleNamespace(path=lambda *p: str(tmp_path.joinpath(*p))))
+    old = (
+        Path(__file__).parent / "fixtures" / "anyvac_clean_finished_1.57.yaml"
+    )
+    shutil.copy(old, dst_dir / "anyvac_clean_finished.yaml")
+    integration._install_blueprints(hass)
+    assert (dst_dir / "anyvac_clean_finished.yaml").read_text() == (src / "anyvac_clean_finished.yaml").read_text()
+
+    (dst_dir / "anyvac_clean_finished.yaml").write_text("my own edit")
+    integration._install_blueprints(hass)
+    assert (dst_dir / "anyvac_clean_finished.yaml").read_text() == "my own edit"

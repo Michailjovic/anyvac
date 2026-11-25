@@ -2,15 +2,19 @@
 
 Public command interface for the card (and automations):
 
-- ``anyvac.clean``      — clean intent: rooms + mode (+ vacuums / pin / settings).
-                          The backend plans (capability, LPT, pinning), builds the
-                          gated task list and executes it server-side.
+- ``anyvac.clean``      — clean intent: rooms + mode (+ vacuums / pin / settings /
+                          batch). The backend plans (capability, LPT, pinning),
+                          builds a queue of rooms per vacuum and runs it
+                          server-side, one room per command (docs/52).
+- ``anyvac.edit_job``   — change the running job: add / remove / move / pin rooms.
 - ``anyvac.plan``       — the same planner, response-only (assignment preview).
 - ``anyvac.goto``       — pin & go; click as PERCENT of the map image, mm math here.
 - ``anyvac.zone_clean`` — zone clean; corners as percent, mm math here.
 - ``anyvac.cancel``     — tear down running jobs and send the started robots home.
 - ``anyvac.select_rooms`` / ``anyvac.pin_room`` / ``anyvac.set_layers`` /
-  ``anyvac.set_room_sequence`` / ``anyvac.reset_learning`` — state.
+  ``anyvac.reset_learning`` — state. (``anyvac.set_room_sequence`` was removed in
+  1.58.0: room-by-room jobs choose their own order; a batch dispatch reads the
+  app's order from the robot, docs/52 O1.)
   (``anyvac.run_job``, the old raw-task-list executor, was removed in 1.52.1: it
   called any service with any data and never carried the caller's context. Jobs
   start through ``anyvac.clean`` and the planner only.)
@@ -35,10 +39,11 @@ Public command interface for the card (and automations):
                           foreign-floorplan N-point calibration to remove
                           most click noise on the home-frame side of a pair.
 
-Execution model (proven in the field by the card-built v1 plans): a job is a list
-of tasks; a task with no ``after`` runs immediately, the rest run when all their
-``anyvac_room_done`` / ``anyvac_clean_finished`` conditions have fired. Starting a
-new job cancels the previous one (docs/13 C6 — no double-driving robots).
+Execution model (docs/52): a job is a queue of rooms per vacuum
+(`jobrunner.JobRunner`). Each robot gets one room per command, the next when the
+firmware reports the previous one finished; a wet room waits for the dry pass of
+the same room. Starting a new job cancels the previous one (docs/13 C6 — no
+double-driving robots).
 """
 
 from __future__ import annotations
@@ -72,20 +77,21 @@ from homeassistant.util import dt as dt_util
 from . import livediff, localprobe
 from . import reach as reachmod
 from .const import DOMAIN
-from .planner import DEFAULT_ROOM_MIN, CleanPlanner, duid_for_entity, vacuum_entity_for_duid
+from .jobrunner import JobRunner, _active_jobs as _runner_jobs
+from .planner import CleanPlanner, duid_for_entity, vacuum_entity_for_duid
 
 _LOGGER = logging.getLogger(__name__)
 
 SERVICE_SELECT_ROOMS = "select_rooms"
 SERVICE_PIN_ROOM = "pin_room"
 SERVICE_SET_LAYERS = "set_layers"
-SERVICE_SET_ROOM_SEQUENCE = "set_room_sequence"
 SERVICE_RESET_LEARNING = "reset_learning"
 SERVICE_CLEAN = "clean"
 SERVICE_PLAN = "plan"
 SERVICE_GOTO = "goto"
 SERVICE_ZONE_CLEAN = "zone_clean"
 SERVICE_CANCEL = "cancel"
+SERVICE_EDIT_JOB = "edit_job"
 SERVICE_DOCK_EMPTY = "dock_empty"
 SERVICE_DOCK_WASH = "dock_wash"
 SERVICE_DOCK_DRY = "dock_dry"
@@ -131,7 +137,7 @@ ALL_SERVICES = (
     SERVICE_SELECT_ROOMS,
     SERVICE_PIN_ROOM,
     SERVICE_SET_LAYERS,
-    SERVICE_SET_ROOM_SEQUENCE,
+    SERVICE_EDIT_JOB,
     SERVICE_RESET_LEARNING,
     SERVICE_CLEAN,
     SERVICE_PLAN,
@@ -156,20 +162,6 @@ ALL_SERVICES = (
     SERVICE_FLOORPLAN_SCALE,
     SERVICE_UPLOAD_ASSET,
 )
-
-JOB_TIMEOUT_SECONDS = 3 * 3600  # safety: tear down a stuck job after 3 h
-
-# docs/23: adaptive threshold batching for a pool task's progressive dispatch.
-# If another of the robot's rooms is estimated ready within this many minutes,
-# wait for it (one dock trip covers both) instead of dispatching immediately
-# with just what's ready now. Never learned/tuned from real data (unlike the
-# per-room time estimates, docs/16) — a fixed starting point, revisit from
-# field experience.
-BATCH_WAIT_THRESHOLD_MIN = 3.0
-# Hard cap on how long a ready batch can be held back waiting for a "soon"
-# room, measured from the moment it FIRST had something ready to send — a bad
-# estimate must never stall a batch indefinitely.
-BATCH_WAIT_CAP_MIN = 6.0
 
 SELECT_ROOMS_SCHEMA = vol.Schema(
     {
@@ -331,14 +323,6 @@ SET_FLOORPLAN_SEAT_SCHEMA = vol.Schema(
         vol.Optional("image_base"): vol.Any(dict, None),
     }
 )
-SET_ROOM_SEQUENCE_SCHEMA = vol.Schema(
-    {
-        # Full ordered room-name list (position = 1-based sequence number). The
-        # editor always sends its complete known room list on reorder — this
-        # replaces the whole stored sequence, it does not merge.
-        vol.Required("rooms"): [str],
-    }
-)
 RESET_REACH_SCHEMA = vol.Schema(
     {
         vol.Optional("duid"): str,
@@ -380,6 +364,33 @@ CLEAN_SCHEMA = vol.Schema(
         # {fan_speed, mop_mode, mop_intensity, repeat}}} (2026-07-26). Each
         # vacuum doing a pass keeps its own preset; a vacuum with no entry for
         # a pass it's assigned to just runs that pass with firmware defaults.
+        vol.Optional("settings"): vol.Schema(
+            {
+                vol.Optional("dry"): {str: _SETTINGS_KIND_SCHEMA},
+                vol.Optional("wet"): {str: _SETTINGS_KIND_SCHEMA},
+            }
+        ),
+        # Vacuums that get all their rooms in one command, in the order set in
+        # the Roborock app (docs/52 R7). Their part of the job cannot be
+        # changed once sent.
+        vol.Optional("batch"): [str],
+    }
+)
+_KIND = vol.In(["dry", "wet"])
+EDIT_JOB_SCHEMA = vol.Schema(
+    {
+        vol.Optional("add"): [str],
+        vol.Optional("remove"): [str],
+        # Pass of the rooms in `add` / `remove` (default: the job's mode / both).
+        vol.Optional("mode"): vol.In(["dry", "wet", "both"]),
+        vol.Optional("move"): vol.Schema(
+            {
+                vol.Required("room"): str,
+                vol.Optional("kind", default="dry"): _KIND,
+                vol.Required("index"): vol.All(vol.Coerce(int), vol.Range(min=0)),
+            }
+        ),
+        vol.Optional("pin"): {str: vol.Schema({vol.Optional("dry"): str, vol.Optional("wet"): str})},
         vol.Optional("settings"): vol.Schema(
             {
                 vol.Optional("dry"): {str: _SETTINGS_KIND_SCHEMA},
@@ -1597,479 +1608,58 @@ def _coordinators(hass: HomeAssistant) -> list[Any]:
     return out
 
 
-def _active_jobs(hass: HomeAssistant) -> list[_JobRunner]:
-    return hass.data.setdefault(DOMAIN, {}).setdefault("jobs", [])
+def _active_jobs(hass: HomeAssistant) -> list[JobRunner]:
+    return _runner_jobs(hass)
 
 
-def _cancel_jobs(hass: HomeAssistant) -> set[str]:
-    """Tear down all running jobs; returns the vacuums whose tasks were started."""
+def _cancel_jobs(hass: HomeAssistant, keep_saved: bool = False) -> set[str]:
+    """Tear down all running jobs; returns the vacuums that were sent a room.
+    ``keep_saved`` (unload / reload): the saved job resumes on the next start."""
     started: set[str] = set()
     for job in list(_active_jobs(hass)):
         started |= job.started_vacuums
-        job.finish()
+        job.finish(keep_saved=keep_saved)
     return started
 
 
-class _JobRunner:
-    """Executes a plan of gated vacuum tasks, server-side."""
-
-    def __init__(
-        self,
-        hass: HomeAssistant,
-        tasks: list[dict[str, Any]],
-        job_rooms: dict[str, set[str]] | None = None,
-        progress: dict[str, Any] | None = None,
-        context: Context | None = None,
-    ) -> None:
-        self.hass = hass
-        # 1.51.8 (plan po auditu, B4): the context of the service call that
-        # started the job, handed to every call the runner makes — including the
-        # later, event-driven pool dispatches — so the logbook attributes them to
-        # the user who pressed START and HA checks that user's permissions.
-        # Without it every call ran as a fresh system context.
-        self.context = context
-        # docs/44 F2: the plan's room passes + ETA, handed to the coordinator so
-        # the card can show "done around HH:MM" without estimating anything
-        # itself. None for raw `run_job` task lists (no plan to report).
-        self.progress = progress
-        # docs/23: a task carrying a "pool" key is a progressive-dispatch pool
-        # task (built by planner.py for a wet-capable robot with 2+ rooms in a
-        # "both" job) — it goes through `_dispatch_pools()`, not the plain
-        # static all-or-nothing `after`-gated path below.
-        self.tasks: dict[str, dict[str, Any]] = {}
-        self.pool_tasks: dict[str, dict[str, Any]] = {}
-        for i, t in enumerate(tasks):
-            tid = str(t.get("id", i))
-            if "pool" in t:
-                pt = dict(t)
-                pt["dispatched"] = set()
-                self.pool_tasks[tid] = pt
-            else:
-                self.tasks[tid] = t
-        self.pending: set[str] = set(self.tasks)
-        self.done: set[tuple[Any, Any]] = set()
-        # Vacuums whose clean command was actually dispatched — the set anyvac.cancel
-        # sends home (a never-started robot has nothing to return from).
-        self.started_vacuums: set[str] = set()
-        # Duids that have been dispatched and have NOT yet reported
-        # `anyvac_clean_finished` (2026-08-08 fix). `pending` only tracks tasks
-        # not yet DISPATCHED, so a job whose tasks are all ungated — i.e. every
-        # `mode: dry` job, and every `mode: wet` job, since only `both` builds
-        # `after` gates or pool tasks — emptied `pending` inside `start()` and
-        # immediately called `finish()`, before the robot had even begun. Three
-        # things silently broke as a result:
-        #   1. `anyvac.cancel` found no registered job, so the CANCEL button
-        #      never sent `return_to_base` during a dry clean;
-        #   2. plan-scope transit labeling (docs/17 §1.3) was cleared before the
-        #      first poll, so it never applied to dry/wet jobs at all;
-        #   3. `_sortie_is_new_job` saw no active scope, so cross-sortie path
-        #      stitching (docs/27) wiped the trace on every sortie.
-        # Only populated when a task carries a resolvable `duid` — a raw
-        # `run_job` task list without one keeps the old dispatch-and-forget
-        # behaviour rather than hanging until JOB_TIMEOUT_SECONDS.
-        self.awaiting_finish: set[str] = set()
-        # Plan-scope transit labeling (docs/17 §1.3): {duid: room-name scope}, applied
-        # to every known coordinator on start() and cleared on finish() — only
-        # anyvac.clean's planned jobs carry this (run_job's raw task lists don't know
-        # room scope, and docs/17 explicitly says not to bolt it on there separately).
-        self.job_rooms: dict[str, set[str]] = job_rooms or {}
-        self._unsub: list = []
-        self._cancel_timeout = None
-        # docs/23: progressive pool-task dispatch state. `pool_busy` maps a duid
-        # to the pool task id it's currently running a batch for (absent = free).
-        # `_pool_first_ready` marks when a task's ready-set first became
-        # non-empty, so the wait-vs-go decision's cap (BATCH_WAIT_CAP_MIN) has a
-        # fixed reference point instead of restarting the clock on every event.
-        self.pool_busy: dict[str, str] = {}
-        self._pool_first_ready: dict[str, Any] = {}
-        self._pool_wait_cancel: dict[str, Any] = {}
-        self._start_time: Any = None
-        # 1.51.7 (plan po auditu, B1): one job's event handlers run one at a time.
-        # HA runs every coroutine listener as its own task, so two
-        # `anyvac_room_done` from the same poll (two dry robots finishing) used to
-        # interleave at the first `await` of `_dispatch_pool_batch`: both saw the
-        # wet robot free (`pool_busy` is only set after `send_command` returns)
-        # and both sent it an `app_segment_clean` — the second overrode the first,
-        # whose room was marked dispatched and never mopped. Holding the lock
-        # across the whole handler is what makes "check free → dispatch → mark
-        # busy" one step; `_closed` stops a handler that queued behind the lock
-        # from dispatching for a job that ended meanwhile.
-        self._lock = asyncio.Lock()
-        self._closed = False
-
-    async def start(self) -> None:
-        async with self._lock:
-            await self._start()
-
-    async def _start(self) -> None:
-        _active_jobs(self.hass).append(self)
-        self._start_time = dt_util.utcnow()
-        for duid, rooms in self.job_rooms.items():
-            for coord in _coordinators(self.hass):
-                coord.set_job_rooms(duid, rooms)
-        if self.progress:
-            for coord in _coordinators(self.hass):
-                coord.set_job_plan(
-                    self.progress.get("passes") or [],
-                    self.progress.get("eta_min") or 0.0,
-                    self._start_time,
-                )
-        self._unsub.append(
-            self.hass.bus.async_listen(f"{DOMAIN}_room_done", self._on_room_done)
-        )
-        self._unsub.append(
-            self.hass.bus.async_listen(f"{DOMAIN}_clean_finished", self._on_finished)
-        )
-        self._cancel_timeout = async_call_later(
-            self.hass, JOB_TIMEOUT_SECONDS, self._on_timeout
-        )
-        await self._dispatch_ready()
-        await self._dispatch_pools()
-        self._maybe_finish()
-
-    def _met(self, task: dict[str, Any]) -> bool:
-        for cond in task.get("after") or []:
-            if (cond.get("duid"), cond.get("room")) not in self.done:
-                return False
-        return True
-
-    def _maybe_finish(self) -> None:
-        """A job is over only when there is nothing left to dispatch AND every
-        robot we did dispatch has reported in. `awaiting_finish` is what makes
-        the second half true — see its doc comment in `__init__` for the three
-        regressions its absence caused. `_on_timeout` remains the safety net for
-        a robot that never reports (offline, command silently dropped)."""
-        if not self.pending and not self.pool_tasks and not self.awaiting_finish:
-            self.finish()
-
-    async def _dispatch_ready(self) -> None:
-        for tid in list(self.pending):
-            if self._closed:
-                return
-            if self._met(self.tasks[tid]):
-                self.pending.discard(tid)  # discard before await: no double dispatch
-                try:
-                    await self._run_task(self.tasks[tid])
-                except Exception as err:  # noqa: BLE001 - one bad task must not wedge the job
-                    _LOGGER.warning("AnyVac run_job: task %s failed: %s", tid, err)
-
-    # -- docs/23: progressive pool-task dispatch ---------------------------------
-
-    async def _dispatch_pools(self) -> None:
-        """Advance every pool task by one step: dispatch a batch if one is due,
-        or (re-)schedule a short wait for a room that's estimated to be ready
-        soon (§3 adaptive threshold — see docs/23). Safe to call repeatedly;
-        each call re-evaluates from scratch (any previously scheduled recheck
-        for a task is cancelled and replaced or resolved into a dispatch)."""
-        for tid, pt in list(self.pool_tasks.items()):
-            if self._closed:
-                return
-            dispatched: set[str] = pt["dispatched"]
-            remaining = {r: m for r, m in pt["pool"].items() if r not in dispatched}
-            if not remaining:
-                continue  # fully dispatched; closes out via _on_finished
-            duid = pt["duid"]
-            if self.pool_busy.get(duid):
-                continue  # robot mid-batch (this task or another pool task)
-            own_gate = pt.get("own_gate")
-            if own_gate and (own_gate.get("duid"), own_gate.get("room")) not in self.done:
-                continue  # both-capable robot: own dry session not done yet
-            ready = [
-                r for r, m in remaining.items()
-                if (m["gate"].get("duid"), m["gate"].get("room")) in self.done
-            ]
-            cancel = self._pool_wait_cancel.pop(tid, None)
-            if cancel is not None:
-                cancel()  # re-deciding fresh below, whatever it was waiting for is moot
-            if not ready:
-                continue  # nothing ready yet; the next event re-enters this method
-            if tid not in self._pool_first_ready:
-                self._pool_first_ready[tid] = dt_util.utcnow()
-            not_ready = [r for r in remaining if r not in ready]
-            elapsed_min = (dt_util.utcnow() - self._pool_first_ready[tid]).total_seconds() / 60
-            if not_ready and elapsed_min < BATCH_WAIT_CAP_MIN:
-                soonest = min(remaining[r]["eta_min"] for r in not_ready)
-                now_min = (dt_util.utcnow() - self._start_time).total_seconds() / 60
-                wait_needed = soonest - now_min
-                if 0 < wait_needed <= BATCH_WAIT_THRESHOLD_MIN:
-                    # docs/23 field test observability (2026-07-25): the wait-vs-go
-                    # decision itself had no log trail — worth seeing which room(s)
-                    # a batch waited for and for how long, not just the eventual
-                    # send_command.
-                    _LOGGER.info(
-                        "AnyVac pool %s (%s): %s ready, waiting ~%.1f min for %s "
-                        "(elapsed %.1f/%s min cap)",
-                        tid, pt["vacuum"], sorted(ready), wait_needed,
-                        sorted(not_ready), elapsed_min, BATCH_WAIT_CAP_MIN,
-                    )
-                    self._pool_wait_cancel[tid] = async_call_later(
-                        self.hass, wait_needed * 60, self._make_pool_recheck(tid)
-                    )
-                    continue
-            if not_ready:
-                _LOGGER.info(
-                    "AnyVac pool %s (%s): dispatching %s now, not waiting for %s "
-                    "(elapsed %.1f min%s)",
-                    tid, pt["vacuum"], sorted(ready), sorted(not_ready), elapsed_min,
-                    " >= cap" if elapsed_min >= BATCH_WAIT_CAP_MIN else " — nothing due soon",
-                )
-            await self._dispatch_pool_batch(tid, pt, ready)
-
-    def _make_pool_recheck(self, tid: str):
-        async def _cb(_now: Any) -> None:
-            async with self._lock:
-                if self._closed:
-                    return
-                self._pool_wait_cancel.pop(tid, None)
-                await self._dispatch_pools()
-                self._maybe_finish()
-        return _cb
-
-    async def _dispatch_pool_batch(self, tid: str, pt: dict[str, Any], rooms: list[str]) -> None:
-        pt["dispatched"].update(rooms)
-        self._pool_first_ready.pop(tid, None)  # reset for this pool's NEXT batch, if any
-        entity = pt["vacuum"]
-        await self._apply_selects(pt.get("selects"))
-        if pt.get("fan_speed"):
-            try:
-                await self.hass.services.async_call(
-                    "vacuum",
-                    "set_fan_speed",
-                    {"entity_id": entity, "fan_speed": pt["fan_speed"]},
-                    blocking=True,
-                    context=self.context,
-                )
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.warning("AnyVac run_job: set_fan_speed failed: %s", err)
-        segs = [pt["pool"][r]["segment"] for r in rooms]
-        try:
-            await self.hass.services.async_call(
-                "vacuum",
-                "send_command",
-                {
-                    "entity_id": entity,
-                    "command": "app_segment_clean",
-                    "params": [{"segments": segs, "repeat": pt.get("repeat", 1)}],
-                },
-                blocking=True,
-                    context=self.context,
-            )
-            _LOGGER.info(
-                "AnyVac pool %s (%s): dispatched %s, repeat=%s", tid, entity, sorted(rooms), pt.get("repeat", 1)
-            )
-            self.hass.async_create_task(self._verify_repeat(pt.get("duid"), entity, int(pt.get("repeat", 1) or 1)))
-        except Exception as err:  # noqa: BLE001 - one bad batch must not wedge the job
-            _LOGGER.warning(
-                "AnyVac run_job: pool task %s batch %s failed: %s", tid, rooms, err
-            )
-            return  # dispatch itself failed — don't mark the robot busy/started
-        self.started_vacuums.add(entity)
-        self.awaiting_finish.add(pt["duid"])
-        self.pool_busy[pt["duid"]] = tid
-
-    async def _verify_repeat(self, duid: str | None, entity: str, expected: int) -> None:
-        """Did the robot take the requested number of passes? (docs/49 A5 follow-up)
-
-        `app_segment_clean` carries `repeat`, but a firmware can silently ignore it
-        (or a per-room custom mode can override it). The robot reports the passes of
-        a RUNNING clean in its status, so look at it a couple of polls after the
-        dispatch. A different value is a warning on the job; a robot that reports
-        nothing is only logged — absence is not proof of a problem."""
-        if not duid or expected <= 1:
-            return
-        seen: Any = None
-        for _ in range(8):
-            await asyncio.sleep(10)
-            if self._closed:
-                return
-            for coord in _coordinators(self.hass):
-                device = (getattr(coord, "data", None) or {}).get(duid)
-                rep = getattr(device, "data", {}).get("repeat") if device is not None else None
-                if rep is not None:
-                    seen = rep
-            if seen is not None:
-                break
-        if seen is None:
-            _LOGGER.info("AnyVac %s: asked for %s passes, the robot does not report them", entity, expected)
-        elif int(seen) != int(expected):
-            problem = f"{entity}: asked for {expected} passes, the robot reports {seen}"
-            _LOGGER.warning("AnyVac run_job: %s", problem)
-            for coord in _coordinators(self.hass):
-                coord.add_job_warning(problem)
-        else:
-            _LOGGER.info("AnyVac %s: robot confirms %s passes", entity, seen)
-
-    async def _apply_selects(self, selects: list[dict[str, Any]] | None) -> None:
-        """Apply the pre-clean selects and CHECK that they took (docs/49 A5).
-
-        Best-effort on purpose — an unknown option must not abort the clean command
-        itself — but never silent: if `mop_intensity: off` is not in place the "dry"
-        robot mops. A failure or a state that did not follow is logged as a warning
-        and recorded in `job_progress.warnings`; the clean is not blocked."""
-        for sel in selects or []:
-            entity, option = sel.get("entity_id"), sel.get("option")
-            problem: str | None = None
-            states = getattr(self.hass, "states", None)
-            before = states.get(entity) if states is not None else None
-            # A select that has no value at all (a robot with no mop, like an S6, still
-            # gets a `mop_intensity` select from the integration, always "unknown")
-            # cannot matter for the run — its failure is not a job warning.
-            inert = before is not None and before.state in ("unknown", "unavailable")
-            try:
-                await self.hass.services.async_call(
-                    "select",
-                    "select_option",
-                    {"entity_id": entity, "option": option},
-                    blocking=True,
-                    context=self.context,
-                )
-            except Exception as err:  # noqa: BLE001
-                if inert:
-                    _LOGGER.debug("AnyVac: %s has no value, %s -> %s skipped: %s", entity, entity, option, err)
-                    continue
-                problem = f"{entity} -> {option} failed: {err}"
-            else:
-                states = getattr(self.hass, "states", None)
-                if states is not None:
-                    # The integration may publish the new value a moment later.
-                    for attempt in range(6):
-                        state = states.get(entity)
-                        if state is None or state.state == option:
-                            break
-                        if attempt < 5:
-                            await asyncio.sleep(0.5)
-                    else:
-                        problem = f"{entity} is '{state.state}', expected '{option}'"
-            if problem:
-                _LOGGER.warning("AnyVac run_job: pre-clean setting did not take: %s", problem)
-                for coord in _coordinators(self.hass):
-                    coord.add_job_warning(problem)
-
-    async def _run_task(self, task: dict[str, Any]) -> None:
-        await self._apply_selects(task.get("selects"))
-        if task.get("fan_speed") and task.get("vacuum"):
-            try:
-                await self.hass.services.async_call(
-                    "vacuum",
-                    "set_fan_speed",
-                    {"entity_id": task["vacuum"], "fan_speed": task["fan_speed"]},
-                    blocking=True,
-                    context=self.context,
-                )
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.warning("AnyVac run_job: set_fan_speed failed: %s", err)
-        service = task.get("service")
-        if service and "." in service:
-            domain, name = service.split(".", 1)
-            await self.hass.services.async_call(
-                domain,
-                name,
-                dict(task.get("service_data") or {}),
-                blocking=True,
-                context=self.context,
-            )
-            _LOGGER.info("AnyVac task %s: %s %s", task.get("id"), service, task.get("service_data"))
-            params = (task.get("service_data") or {}).get("params") or []
-            wanted = params[0].get("repeat", 1) if params and isinstance(params[0], dict) else 1
-            if task.get("duid") and task.get("vacuum") and isinstance(wanted, int):
-                self.hass.async_create_task(self._verify_repeat(task["duid"], task["vacuum"], wanted))
-            if task.get("vacuum"):
-                self.started_vacuums.add(task["vacuum"])
-            # Keep the job alive until this robot reports `anyvac_clean_finished`
-            # (see `awaiting_finish` in __init__). Only when the task actually
-            # names a duid — planner-built tasks always do now, hand-written
-            # `run_job` payloads may not, and those keep the old behaviour.
-            if task.get("duid"):
-                self.awaiting_finish.add(task["duid"])
-
-    async def _on_room_done(self, event) -> None:
-        async with self._lock:
-            if not self._closed:
-                await self._handle_room_done(event)
-
-    async def _handle_room_done(self, event) -> None:
-        self.done.add((event.data.get("duid"), event.data.get("room")))
-        if self.progress:
-            for coord in _coordinators(self.hass):
-                coord.mark_job_room_done(event.data.get("duid"), event.data.get("room"))
-        await self._dispatch_ready()
-        await self._dispatch_pools()
-        self._maybe_finish()
-
-    async def _on_finished(self, event) -> None:
-        async with self._lock:
-            if not self._closed:
-                await self._handle_finished(event)
-
-    async def _handle_finished(self, event) -> None:
-        # Whole-session completion satisfies a condition with the room omitted.
-        duid = event.data.get("duid")
-        self.done.add((duid, None))
-        # This robot has reported in; it no longer holds the job open. If it has
-        # another pool batch queued, `_dispatch_pools()` below re-adds it before
-        # `_maybe_finish()` runs, so a multi-batch pool task can't close early.
-        self.awaiting_finish.discard(duid)
-        # docs/23: if this was a pool task's batch finishing, the robot is free
-        # again — clear it and close out the task if that was its last batch.
-        tid = self.pool_busy.pop(duid, None)
-        if tid is not None:
-            pt = self.pool_tasks.get(tid)
-            if pt is not None and not (set(pt["pool"]) - pt["dispatched"]):
-                self.pool_tasks.pop(tid, None)
-        await self._dispatch_ready()
-        await self._dispatch_pools()
-        self._maybe_finish()
-
-    def _on_timeout(self, _now) -> None:
-        if self.pending or self.pool_tasks or self.awaiting_finish:
-            _LOGGER.warning(
-                "AnyVac run_job: %d static + %d pool task(s) never became ready, "
-                "%d vacuum(s) never reported finished (%s); cleaning up.",
-                len(self.pending), len(self.pool_tasks),
-                len(self.awaiting_finish), sorted(self.awaiting_finish),
-            )
-        self.finish()
-
-    def finish(self) -> None:
-        """Stop listening and deregister (idempotent)."""
-        self._closed = True
-        for unsub in self._unsub:
-            unsub()
-        self._unsub = []
-        if self._cancel_timeout is not None:
-            self._cancel_timeout()
-            self._cancel_timeout = None
-        for cancel in self._pool_wait_cancel.values():
-            cancel()
-        self._pool_wait_cancel = {}
-        # Nothing can re-open a finished job, so stop holding duids open —
-        # keeps `finish()` idempotent even if a late `clean_finished` lands
-        # after the listeners are already unsubscribed.
-        self.awaiting_finish.clear()
-        # Clear this job's plan-scope (docs/17 §1.3) on every path that ends a job —
-        # completion, cancellation, and the timeout safety net all funnel through here.
-        for duid in self.job_rooms:
-            for coord in _coordinators(self.hass):
-                coord.set_job_rooms(duid, None)
-        if self.progress:
-            for coord in _coordinators(self.hass):
-                coord.clear_job_plan()
-        jobs = _active_jobs(self.hass)
-        if self in jobs:
-            jobs.remove(self)
+# Kept under the old name for imports elsewhere (tests, __init__).
+_JobRunner = JobRunner
 
 
 async def _start_job(
     hass: HomeAssistant,
-    tasks: list[dict[str, Any]],
-    job_rooms: dict[str, set[str]] | None = None,
-    progress: dict[str, Any] | None = None,
-    context: Context | None = None,
-) -> None:
+    items: list[dict[str, Any]],
+    *,
+    mode: str,
+    settings: dict[str, Any] | None,
+    wash: dict[str, dict[str, Any]],
+    context: Context | None,
+) -> JobRunner:
     """Cancel any previous job (docs/13 C6: no parallel double-driving) and run."""
     _cancel_jobs(hass)
-    runner = _JobRunner(hass, tasks, job_rooms, progress, context)
+    runner = JobRunner(hass, items, mode=mode, settings=settings, context=context, wash=wash)
     await runner.start()
+    return runner
+
+
+async def async_restore_job(hass: HomeAssistant, coordinator: Any) -> None:
+    """Resume a job saved before a restart (docs/52 §9.5, R3)."""
+    if _active_jobs(hass):
+        return
+    try:
+        snap = await coordinator.async_load_job()
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.debug("AnyVac: no saved job to resume: %s", err)
+        return
+    if not snap:
+        return
+    runner = JobRunner.from_snapshot(hass, snap)
+    if runner is None:
+        _LOGGER.info("AnyVac: saved job %s is too old to resume; dropped", snap.get("job_id"))
+        coordinator.save_job(None)
+        return
+    _LOGGER.info("AnyVac: resuming job %s after a restart", runner.job_id)
+    await runner.start(restored=True)
 
 
 def _resolve_target_duid(hass: HomeAssistant, call: ServiceCall) -> str:
@@ -2208,11 +1798,6 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
                 room_style=call.data.get("room_style"),
             )
 
-    async def _handle_set_room_sequence(call: ServiceCall) -> None:
-        rooms = [str(r) for r in call.data.get("rooms", [])]
-        for coord in _coordinators(hass):
-            coord.set_room_sequence(rooms)
-
     async def _handle_reset_reach(call: ServiceCall) -> None:
         # docs/51 §2.5 — forget stored reach records; the next complete clean of
         # a room records it again.
@@ -2229,78 +1814,113 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
                 baselines=call.data.get("baselines", True),
             )
 
-    def _job_rooms_from_plan(plan: dict[str, Any]) -> dict[str, set[str]]:
-        """Plan-scope transit labeling (docs/17 §1.3): per-duid room scope for the
-        job about to run — the union of a vacuum's dry + wet assignment, so a
-        both-capable robot's wet-only rooms aren't flagged transit during its dry
-        pass and vice versa. `plan["dry"]`/`plan["wet"]` are keyed by entity_id
-        (the planner's own output shape); resolved to duid here since that's what
-        the coordinator's per-poll pipeline keys everything by."""
-        by_entity: dict[str, set[str]] = {}
-        for kind in ("dry", "wet"):
-            for entity, rooms in (plan.get(kind) or {}).items():
-                by_entity.setdefault(entity, set()).update(rooms)
-        out: dict[str, set[str]] = {}
-        for entity, rooms in by_entity.items():
-            duid = duid_for_entity(hass, entity)
-            if duid:
-                out[duid] = rooms
-        return out
-
-    def _job_progress_from_plan(planner: CleanPlanner, plan: dict[str, Any]) -> dict[str, Any]:
-        """docs/44 F2: one row per planned room pass, with the planner's own
-        per-room estimate (``est_min``) and sequence-aware finish time
-        (``finish_min``) — the coordinator orders and tracks them."""
-        timeline = plan.get("timeline") or {}
-        passes: list[dict[str, Any]] = []
-        for kind in ("dry", "wet"):
-            for entity, rooms in (plan.get(kind) or {}).items():
-                duid = planner._resolve_duid(entity)
-                for room in rooms:
-                    passes.append({
-                        "room": room,
-                        "kind": kind,
-                        "vacuum": entity,
-                        "duid": duid,
-                        "est_min": (planner._estimate(duid, room, kind) if duid else None) or DEFAULT_ROOM_MIN,
-                        "finish_min": (timeline.get(kind) or {}).get(room),
-                    })
-        return {"passes": passes, "eta_min": plan.get("eta_min") or 0.0}
-
-    def _build(call: ServiceCall) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    def _planner() -> tuple[CleanPlanner, Any]:
         coords = _coordinators(hass)
         if not coords:
             raise HomeAssistantError("anyvac: integration is not set up")
-        planner = CleanPlanner(hass, coords[0])
+        return CleanPlanner(hass, coords[0]), coords[0]
+
+    async def _read_app_sequences(planner: CleanPlanner, coord: Any, batch: list[str] | None) -> None:
+        """A batch robot runs its rooms in the app's order: read it first."""
+        for ref in batch or []:
+            duid = planner._resolve_duid(str(ref))
+            if duid:
+                await coord.async_refresh_app_sequence(duid)
+
+    async def _build(call: ServiceCall) -> tuple[list[dict[str, Any]], dict[str, Any], CleanPlanner]:
+        planner, coord = _planner()
+        await _read_app_sequences(planner, coord, call.data.get("batch"))
         # Stored per-room pins (anyvac.pin_room, docs/18 §7e) are the default;
         # an explicit `pin` parameter on the call wins outright.
-        pin = call.data.get("pin")
-        if not pin:
-            pin = coords[0].room_pins or None
-        tasks, plan = planner.build_tasks(
+        pin = call.data.get("pin") or coord.room_pins or None
+        items, plan = planner.build_tasks(
             rooms=[str(r) for r in call.data["rooms"]],
             mode=call.data.get("mode", "dry"),
             vacuums=call.data.get("vacuums"),
             pin=pin,
             settings=call.data.get("settings"),
+            batch=call.data.get("batch"),
         )
-        return tasks, plan
+        return items, plan, planner
 
     async def _handle_clean(call: ServiceCall) -> None:
-        tasks, plan = _build(call)
-        if not tasks:
+        items, plan, planner = await _build(call)
+        if not items:
             raise HomeAssistantError(
                 "anyvac.clean: no capable vacuum found for the requested rooms/mode "
                 f"(plan: {plan})"
             )
-        _LOGGER.info("AnyVac clean: %s", plan)
-        coords = _coordinators(hass)
-        progress = _job_progress_from_plan(CleanPlanner(hass, coords[0]), plan) if coords else None
-        await _start_job(hass, tasks, _job_rooms_from_plan(plan), progress, call.context)
+        _LOGGER.info("AnyVac clean: %s", {k: plan.get(k) for k in ("dry", "wet", "unassigned", "eta_min", "batch")})
+        wash = {it["duid"]: planner.wash_info(it["duid"]) for it in items}
+        await _start_job(
+            hass, items, mode=call.data.get("mode", "dry"), settings=call.data.get("settings"),
+            wash=wash, context=call.context,
+        )
 
     async def _handle_plan(call: ServiceCall) -> dict[str, Any]:
-        tasks, plan = _build(call)
-        return {"plan": plan, "tasks": tasks}
+        items, plan, _ = await _build(call)
+        return {"plan": plan, "tasks": items}
+
+    async def _handle_edit_job(call: ServiceCall) -> dict[str, Any]:
+        """Change the running job (docs/52 §3.4, §9.1). Without a job, `add`
+        starts one like `anyvac.clean`."""
+        jobs = _active_jobs(hass)
+        job = jobs[-1] if jobs else None
+        add = [str(r) for r in call.data.get("add") or []]
+        remove = [str(r) for r in call.data.get("remove") or []]
+        if job is None:
+            if not add:
+                raise HomeAssistantError("anyvac.edit_job: no job is running")
+            planner, coord = _planner()
+            items, plan = planner.build_tasks(
+                rooms=add, mode=call.data.get("mode") or "dry", pin=call.data.get("pin") or coord.room_pins or None,
+                settings=call.data.get("settings"),
+            )
+            if not items:
+                raise HomeAssistantError(f"anyvac.edit_job: no capable vacuum for {add}")
+            wash = {it["duid"]: planner.wash_info(it["duid"]) for it in items}
+            runner = await _start_job(
+                hass, items, mode=call.data.get("mode") or "dry", settings=call.data.get("settings"),
+                wash=wash, context=call.context,
+            )
+            return {"job_id": runner.job_id, "added": [it["id"] for it in items]}
+        out: dict[str, Any] = {"job_id": job.job_id, "added": [], "removed": [], "moved": False, "reassigned": []}
+        settings = call.data.get("settings") or job.settings
+        mode = call.data.get("mode")
+        try:
+            for room in remove:
+                kinds = [None] if not mode or mode == "both" else [mode]
+                for kind in kinds:
+                    out["removed"] += job.remove_room(room, kind)
+            if add:
+                planner, coord = _planner()
+                busy = {(r, it["kind"]) for it in job.items() if it["state"] not in ("removed",) for r in it.get("rooms") or []}
+                # A new room joins the queue of the robot the planner picks,
+                # behind what it already has; the wet pass is gated as usual.
+                items, _plan = planner.build_tasks(
+                    rooms=add, mode=mode or job.mode, pin=call.data.get("pin") or coord.room_pins or None,
+                    settings=settings,
+                )
+                items = [it for it in items if not all((r, it["kind"]) in busy for r in it["rooms"])]
+                wash = {it["duid"]: planner.wash_info(it["duid"]) for it in items}
+                out["added"] = job.add_items(items, wash)
+            mv = call.data.get("move")
+            if mv:
+                out["moved"] = job.move(mv["room"], mv.get("kind", "dry"), mv["index"])
+            for room, kinds in (call.data.get("pin") or {}).items():
+                if add and room in add:
+                    continue  # already placed by the planner with this pin
+                planner, _ = _planner()
+                for kind, ref in kinds.items():
+                    duid = planner._resolve_duid(str(ref))
+                    if not duid or not planner._capable(duid, kind) or not planner._duid_owns_room(duid, room):
+                        raise HomeAssistantError(f"anyvac.edit_job: {ref} cannot do the {kind} pass of {room}")
+                    item = planner.make_item(duid, kind, [room], settings, item_id=None)  # type: ignore[arg-type]
+                    job.reassign(room, kind, item)
+                    out["reassigned"].append({"room": room, "kind": kind, "vacuum": item["vacuum"]})
+        except ValueError as err:
+            raise HomeAssistantError(f"anyvac.edit_job: {err}") from err
+        return out
 
     async def _handle_goto(call: ServiceCall) -> None:
         duid = _resolve_target_duid(hass, call)
@@ -3110,13 +2730,13 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
         (SERVICE_PIN_ROOM, _handle_pin_room, PIN_ROOM_SCHEMA, SupportsResponse.NONE),
         (SERVICE_SET_LAYERS, _handle_set_layers, SET_LAYERS_SCHEMA, SupportsResponse.NONE),
         (SERVICE_SET_FLOORPLAN_SEAT, _handle_set_floorplan_seat, SET_FLOORPLAN_SEAT_SCHEMA, SupportsResponse.NONE),
-        (SERVICE_SET_ROOM_SEQUENCE, _handle_set_room_sequence, SET_ROOM_SEQUENCE_SCHEMA, SupportsResponse.NONE),
         (SERVICE_RESET_LEARNING, _handle_reset_learning, RESET_LEARNING_SCHEMA, SupportsResponse.NONE),
         (SERVICE_CLEAN, _handle_clean, CLEAN_SCHEMA, SupportsResponse.NONE),
         (SERVICE_PLAN, _handle_plan, CLEAN_SCHEMA, SupportsResponse.ONLY),
         (SERVICE_GOTO, _handle_goto, GOTO_SCHEMA, SupportsResponse.NONE),
         (SERVICE_ZONE_CLEAN, _handle_zone_clean, ZONE_CLEAN_SCHEMA, SupportsResponse.NONE),
         (SERVICE_CANCEL, _handle_cancel, CANCEL_SCHEMA, SupportsResponse.NONE),
+        (SERVICE_EDIT_JOB, _handle_edit_job, EDIT_JOB_SCHEMA, SupportsResponse.OPTIONAL),
         (SERVICE_DOCK_EMPTY, _handle_dock_empty, DOCK_TOGGLE_SCHEMA, SupportsResponse.NONE),
         (SERVICE_DOCK_WASH, _handle_dock_wash, DOCK_TOGGLE_SCHEMA, SupportsResponse.NONE),
         (SERVICE_DOCK_DRY, _handle_dock_dry, DOCK_TOGGLE_SCHEMA, SupportsResponse.NONE),

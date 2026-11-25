@@ -1,15 +1,16 @@
-"""Tests for RUN vs SORTIE accumulation (docs/36, field bug 2026-09-02).
+"""Tests for the per-TASK lifecycle (docs/52 §9.3, 1.58.0).
 
-A job dispatched progressively (docs/23) docks between its batches, and a
-firmware path reset can happen mid-clean when the robot comes back for another
-pass through a room. Both look like a fresh ``in_cleaning`` edge / a fresh
-trajectory, but neither is a new CLEAN — and everything that measures the clean
-(the run's `RunTracker` with its footprint cells, per-room active time, the
-run's start time, the persisted completion %) has to span the whole run.
+One task = one command the robot runs to its end: one room in a room-by-room
+job. The firmware chains tasks without dropping ``in_cleaning`` — the robot
+gets its next room on its way home, and ``in_cleaning`` also stays on through
+the dock's mop wash at the end of a task (S8 field history 2026-11-25). So the
+end of a task is the edge into ``returning_home`` (unless the battery is low:
+that is a mid-task recharge trip), or the fall of ``in_cleaning``.
 
-Before docs/36 each sortie was harvested as if it were a complete clean, so a
-room cleaned across a dock trip persisted a partial %. (The learned "full
-clean" baseline this file originally also guarded is gone since docs/45.)
+Every task is harvested on its own — one clean measurement per room, never a
+mix of two (docs/52 O3). This replaces docs/36's deferred harvest, which
+spanned a progressive job's batches. The drawn trace still stitches across
+the whole job (docs/27).
 
 Harness copied from `test_room_coverage_pct.py` (established per-file
 duplication convention in this test suite).
@@ -83,7 +84,6 @@ def _new_coordinator(monkeypatch: pytest.MonkeyPatch, clock: _Clock) -> AnyVacCo
     coord._last_calib = {}
     coord._selected_rooms = set()
     coord._room_pins = {}
-    coord._room_sequence = {}
     coord._room_elapsed = {}
     coord._last_poll = {}
     coord._runs = {}
@@ -91,7 +91,15 @@ def _new_coordinator(monkeypatch: pytest.MonkeyPatch, clock: _Clock) -> AnyVacCo
     coord._job_seq = 0
     coord._job_id = {}
     coord._path_job_id = {}
-    coord._run_pending = {}
+    coord._prev_state = {}
+    coord._task_open = {}
+    coord._task_item = {}
+    coord._task_last = {}
+    coord._task_rooms_done = {}
+    coord.app_sequence = {}
+    coord._app_sequence_at = {}
+    coord._job_store = _FakeStore() if "_FakeStore" in globals() else None
+    coord._job_saved = None
     coord._run_targets_seen = {}
     coord._path_seen = {}
     coord._cov_gate = {}
@@ -186,165 +194,113 @@ def clock() -> _Clock:
     return _Clock(datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC))
 
 
-def test_split_job_measures_the_whole_run_not_one_batch(
-    monkeypatch: pytest.MonkeyPatch, clock: _Clock
-) -> None:
-    """The regression this file exists for. One job, two batches with a dock trip
-    in between, together covering exactly what a single-outing clean covers: the
-    persisted % must read 100 %, and nothing may be persisted mid-job."""
+def _lawn_at(x0: float) -> list[dict[str, float]]:
+    return [{"x": p["x"] + x0, "y": p["y"]} for p in HALL]
+
+
+KITCHEN = _lawn_at(1000)
+
+
+def _clean(coord, clock, duid, points, room, seg, step=8, **kw):
+    i = 0
+    while i < len(points):
+        i = min(len(points), i + step)
+        _poll(coord, _device(duid, vacuum_room_name=room, target_segments=[seg],
+                             status_state="segment_cleaning", battery=80, _path_dry=points[:i], **kw))
+        clock.advance(minutes=1)
+
+
+def _return(coord, clock, duid, points, seg, battery=80):
+    _poll(coord, _device(duid, status_state="returning_home", transit=True, target_segments=[seg],
+                         battery=battery, _path_dry=points))
+    clock.advance(seconds=20)
+
+
+def test_return_edge_ends_the_task_and_harvests_it(monkeypatch, clock) -> None:
     coord = _new_coordinator(monkeypatch, clock)
-    duid = "d1"
-    coord.set_job_rooms(duid, {"Hall"})
-    _sortie(coord, clock, duid, HALL[:HALF])
-    # Mid-job: nothing harvested yet — no partial % written.
-    assert coord._room_coverage.get("Hall", {}).get("dry") is None
-    assert duid in coord._run_pending
-
-    clock.advance(minutes=5)
-    # The firmware restarts its trajectory for the second batch.
-    _sortie(coord, clock, duid, HALL[HALF:])
-    coord.set_job_rooms(duid, None)
-    clock.advance(minutes=5)
-    _poll(coord, _device(duid, in_cleaning=False))
-
-    assert coord._room_coverage["Hall"]["dry"] == 100  # both batches together
-    assert coord._room_coverage["Hall"]["dry_floor"] >= 95
-
-
-def test_run_events_fire_once_per_run(monkeypatch: pytest.MonkeyPatch, clock: _Clock) -> None:
-    """``clean_started``/``run_finished`` bracket the RUN; ``clean_finished``
-    still fires per sortie because services.py's `_JobRunner` listens on it to
-    dispatch the job's next batch — deferring it would wedge every pool task."""
-    coord = _new_coordinator(monkeypatch, clock)
-    duid = "d2"
-    coord.set_job_rooms(duid, {"Hall"})
-    _sortie(coord, clock, duid, HALL[:HALF])
-    clock.advance(minutes=5)
-    _sortie(coord, clock, duid, HALL[HALF:])
-    coord.set_job_rooms(duid, None)
-    clock.advance(minutes=5)
-    _poll(coord, _device(duid, in_cleaning=False))
-
-    names = coord.hass.bus.names()
-    assert names.count("anyvac_clean_started") == 1
-    assert names.count("anyvac_clean_finished") == 2  # one per batch, unchanged
-    assert names.count("anyvac_run_finished") == 1
-    run_done = [d for n, d in coord.hass.bus.events if n == "anyvac_run_finished"][-1]
-    assert run_done["rooms"] == ["Hall"]  # both batches' rooms, one payload
-
-
-def test_manual_sortie_without_job_scope_closes_immediately(
-    monkeypatch: pytest.MonkeyPatch, clock: _Clock
-) -> None:
-    """Regression guard for everything started outside `anyvac.clean` (Roborock
-    app, the card's native command, degraded mode): with no job scope there is
-    nothing to wait for, so the run closes on the docking poll exactly as it did
-    before docs/36 — same events, same accumulator reset."""
-    coord = _new_coordinator(monkeypatch, clock)
-    duid = "d3"
-    _sortie(coord, clock, duid, HALL)
-
-    assert coord._run_pending == {}
-    assert _hall_cells(coord, duid) == 0  # harvested and cleared on the dock poll
+    coord.set_job_rooms("s6", {"Hall", "Kitchen"})
+    coord.set_task_item("s6", {"Hall"})
+    _clean(coord, clock, "s6", HALL, "Hall", 1)
+    _return(coord, clock, "s6", HALL, 1)
+    finished = [d for n, d in coord.hass.bus.events if n == "anyvac_clean_finished"]
+    assert len(finished) == 1
+    (row,) = finished[0]["rooms_result"]
+    assert row["room"] == "Hall" and row["cleaned"] is True and row["dry"] == 100
     assert coord._room_coverage["Hall"]["dry"] == 100
-    assert coord.hass.bus.names() == [
-        "anyvac_clean_started", "anyvac_room_done",
-        "anyvac_clean_finished", "anyvac_run_finished",
-    ]
+    assert coord._last_calib["s6"]["rooms"]["Hall"]["dry"]["accepted"] is True
+    # Inside a job the runner reports the vacuum, not the coordinator.
+    assert "anyvac_run_finished" not in coord.hass.bus.names()
+    # The task's room is reported done even though `in_cleaning` never fell.
+    assert [d["room"] for n, d in coord.hass.bus.events if n == "anyvac_room_done"] == ["Hall"]
 
 
-def test_midrun_path_reset_keeps_the_coverage_cells(
-    monkeypatch: pytest.MonkeyPatch, clock: _Clock
-) -> None:
-    """A firmware path reset inside a run (the robot returning for another pass
-    through a room) is stitched for the drawn trace by docs/27 — the run's
-    coverage follows the same verdict instead of being wiped."""
+def test_chained_task_is_measured_on_its_own_and_the_trace_stitches(monkeypatch, clock) -> None:
+    """The next room is taken on the way home: no `in_cleaning` edge, a
+    fresh firmware trajectory, a fresh measurement — one trace."""
     coord = _new_coordinator(monkeypatch, clock)
-    duid = "d4"
-    coord.set_job_rooms(duid, {"Hall"})
-    _sortie(coord, clock, duid, HALL[:HALF], dock=False)
-    before = _hall_cells(coord, duid)
-    assert before > 0
+    coord.set_job_rooms("s6", {"Hall", "Kitchen"})
+    coord.set_task_item("s6", {"Hall"})
+    _clean(coord, clock, "s6", HALL, "Hall", 1)
+    _return(coord, clock, "s6", HALL, 1)
+    first_run = coord._runs["s6"]
+    coord.set_task_item("s6", {"Kitchen"})
+    _clean(coord, clock, "s6", KITCHEN, "Kitchen", 2)
+    assert coord._runs["s6"] is not first_run
+    assert "Hall" not in coord._runs["s6"].rooms
+    _return(coord, clock, "s6", KITCHEN, 2)
+    finished = [d for n, d in coord.hass.bus.events if n == "anyvac_clean_finished"]
+    assert [r["room"] for r in finished[1]["rooms_result"]] == ["Kitchen"]
+    assert coord._last_calib["s6"]["rooms"]["Kitchen"]["dry"]["accepted"] is True
+    # docs/27: both rooms stay drawn — the job did not change.
+    assert len(coord._dry_path["s6"]) == 2
 
-    # The robot's own array restarts (shorter than what we have already seen).
-    _poll(coord, _device(duid, vacuum_room_name="Hall", _path_dry=HALL[HALF:HALF + 1]))
-    clock.advance(minutes=1)
-    _poll(coord, _device(duid, vacuum_room_name="Hall", _path_dry=HALL[HALF:]))
 
-    assert _hall_cells(coord, duid) > before
-    # ...and the trace is stitched, not bridged: two segments, nothing lost.
-    assert sum(len(s) for s in coord._dry_path[duid]) == len(HALL)
-    assert len(coord._dry_path[duid]) == 2
-
-
-def test_path_reset_outside_a_job_still_wipes_the_cells(
-    monkeypatch: pytest.MonkeyPatch, clock: _Clock
-) -> None:
-    """Mirror of the docs/27 guard for the trace: with no job scope a restarted
-    trajectory IS an unrelated new clean, so its coverage must start over."""
+def test_low_battery_trip_home_is_not_the_end_of_the_task(monkeypatch, clock) -> None:
     coord = _new_coordinator(monkeypatch, clock)
-    duid = "d5"
-    _sortie(coord, clock, duid, HALL[:HALF], dock=False)
-    assert _hall_cells(coord, duid) > 0
-
-    _poll(coord, _device(duid, vacuum_room_name="Hall", _path_dry=HALL[HALF:HALF + 1]))
-    assert _hall_cells(coord, duid) == 0  # a fresh run: not even activated yet
-    assert coord._dry_path[duid] == [[HALL[HALF]]]
+    _clean(coord, clock, "s6", HALL[:HALF], "Hall", 1)
+    _return(coord, clock, "s6", HALL[:HALF], 1, battery=19)
+    assert "anyvac_clean_finished" not in coord.hass.bus.names()
+    assert coord._task_open["s6"] is True
 
 
-def test_drive_through_room_gets_no_live_gauge(
-    monkeypatch: pytest.MonkeyPatch, clock: _Clock
-) -> None:
-    """docs/36 → docs/45: a corridor crossed with the fan on is not a target of
-    the run, so it never becomes coverage and never gets a number."""
+def test_without_a_job_run_finished_waits_for_the_dock(monkeypatch, clock) -> None:
+    """A clean started from the app: the task ends on the way home (learning
+    happens then), `run_finished` once `in_cleaning` falls after the wash."""
     coord = _new_coordinator(monkeypatch, clock)
-    duid = "d6"
-    pts = HALL + [{"x": 1100 + 150 * i, "y": 500} for i in range(5)]
-    _sortie(coord, clock, duid, pts, dock=False)
-    progress = coord._build_progress(_device(duid, vacuum_room_name="Hall"))
-    assert set(progress) == {"Hall"}
-    assert coord._runs[duid].ignored.get("Kitchen", 0) > 0
-
-
-def test_stuck_job_scope_cannot_hold_a_run_open_forever(
-    monkeypatch: pytest.MonkeyPatch, clock: _Clock
-) -> None:
-    """Safety net: a job runner torn down without its cleanup path leaves the
-    scope set. The elapsed cap closes the run anyway, so the completion % is
-    never lost to a scope that will never clear."""
-    coord = _new_coordinator(monkeypatch, clock)
-    duid = "d7"
-    coord.set_job_rooms(duid, {"Hall"})
-    _sortie(coord, clock, duid, HALL)
-    assert duid in coord._run_pending  # deferred: the scope is still set
-    assert coord._room_coverage.get("Hall") is None
-
-    clock.advance(hours=4)  # past _RUN_DEFER_MAX_S
-    _poll(coord, _device(duid, in_cleaning=False))
-    assert coord._run_pending == {}
-    assert coord._room_coverage["Hall"]["dry"] == 100
-    assert _hall_cells(coord, duid) == 0
-
-
-def test_job_releasing_the_vacuum_mid_flight_still_closes_the_run(
-    monkeypatch: pytest.MonkeyPatch, clock: _Clock
-) -> None:
-    """The job can clear this vacuum's scope while it is still driving home from
-    an earlier batch, so a sortie can find a pending entry AND a cleared scope on
-    the same poll. The harvest must run there and the run-level event must not be
-    swallowed by the leftover pending marker."""
-    coord = _new_coordinator(monkeypatch, clock)
-    duid = "d8"
-    coord.set_job_rooms(duid, {"Hall"})
-    _sortie(coord, clock, duid, HALL[:HALF])
-    assert duid in coord._run_pending  # batch 1 deferred, job still holds the scope
-
-    clock.advance(minutes=5)
-    _sortie(coord, clock, duid, HALL[HALF:], dock=False)
-    coord.set_job_rooms(duid, None)  # job closes out while the robot drives home
-    clock.advance(minutes=1)
-    _poll(coord, _device(duid, in_cleaning=False))
-
-    assert coord._run_pending == {}
+    _clean(coord, clock, "s6", HALL, "Hall", 1)
+    _return(coord, clock, "s6", HALL, 1)
+    assert coord.hass.bus.names().count("anyvac_clean_finished") == 1
+    assert "anyvac_run_finished" not in coord.hass.bus.names()
+    _poll(coord, _device("s6", status_state="washing_the_mop", transit=True, _path_dry=HALL))
+    _poll(coord, _device("s6", in_cleaning=False, status_state="charging", _path_dry=HALL))
     assert coord.hass.bus.names().count("anyvac_run_finished") == 1
-    assert coord._room_coverage["Hall"]["dry"] == 100  # whole run, both batches
+    assert coord.hass.bus.names().count("anyvac_clean_finished") == 1
+
+
+def test_a_clean_that_just_stops_closes_on_the_fall(monkeypatch, clock) -> None:
+    """S8 out of water: `idle` mid-room, `in_cleaning` falls — no return edge."""
+    coord = _new_coordinator(monkeypatch, clock)
+    _clean(coord, clock, "s6", HALL[:HALF], "Hall", 1)
+    _poll(coord, _device("s6", in_cleaning=False, status_state="idle", _path_dry=HALL[:HALF]))
+    names = coord.hass.bus.names()
+    assert names.count("anyvac_clean_finished") == 1 and names.count("anyvac_run_finished") == 1
+    assert 20 <= coord._room_coverage["Hall"]["dry"] < 100
+
+
+def test_a_discarded_task_learns_nothing(monkeypatch, clock) -> None:
+    """docs/52 §3.4: a room removed mid-clean is never calibrated."""
+    coord = _new_coordinator(monkeypatch, clock)
+    coord.set_job_rooms("s6", {"Hall"})
+    _clean(coord, clock, "s6", HALL[:HALF], "Hall", 1)
+    coord.discard_task("s6")
+    assert coord._runs["s6"].rooms == {}
+    assert coord._room_elapsed["s6"] == {}
+
+
+def test_water_off_leaves_no_wet_evidence(monkeypatch, clock) -> None:
+    """docs/52 O3 (S7 MaxV): mop holder down, water off — mop points, no wet floor."""
+    coord = _new_coordinator(monkeypatch, clock)
+    _clean(coord, clock, "s7", HALL, "Hall", 1, _path_wet=HALL, water_off=True)
+    run = coord._runs["s7"]
+    assert run.floor_fraction(coord._geo["s7"][2], "Hall", "wet") == 0
+    assert run.floor_fraction(coord._geo["s7"][2], "Hall", "dry") > 0.9

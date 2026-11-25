@@ -13,6 +13,7 @@ no manual calibration.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import shutil
@@ -24,17 +25,35 @@ from homeassistant.helpers.storage import Store
 
 from .const import DOMAIN, STORE_KEYS
 from .coordinator import AnyVacCoordinator
-from .services import ALL_SERVICES, _cancel_jobs, async_register_services
+from .services import ALL_SERVICES, _cancel_jobs, async_register_services, async_restore_job
 
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS: list[Platform] = [Platform.IMAGE, Platform.SENSOR]
 
 
-def _install_blueprints(hass: HomeAssistant) -> None:
-    """Copy bundled notification blueprints into config/blueprints/automation/anyvac/ (once).
+# Earlier bundled blueprint versions (sha256 of the file as shipped). An
+# installed copy that still matches one was never edited and is replaced by the
+# current version. 1.58.0: the clean-finished blueprint moved from the per-room
+# `anyvac_clean_finished` to `anyvac_run_finished` (docs/52 R6) — the old one
+# would now notify after every single room.
+_OUTDATED_BLUEPRINTS: dict[str, frozenset[str]] = {
+    "anyvac_clean_finished.yaml": frozenset(
+        {"c5d3560abaae6cf6378e1cba4c20c048a75a93f76c44c50af70f4951570e17b3"}
+    ),
+}
 
-    Never overwrites a blueprint the user has already edited.
+
+def _sha256(path: str) -> str:
+    with open(path, "rb") as fh:
+        return hashlib.sha256(fh.read()).hexdigest()
+
+
+def _install_blueprints(hass: HomeAssistant) -> None:
+    """Copy bundled notification blueprints into config/blueprints/automation/anyvac/.
+
+    Never overwrites a blueprint the user has edited: an existing file is only
+    replaced when it is byte-for-byte an earlier bundled version.
     """
     src_dir = os.path.join(os.path.dirname(__file__), "blueprints")
     if not os.path.isdir(src_dir):
@@ -46,8 +65,13 @@ def _install_blueprints(hass: HomeAssistant) -> None:
             if not fn.endswith(".yaml"):
                 continue
             dst = os.path.join(dst_dir, fn)
+            src = os.path.join(src_dir, fn)
             if not os.path.exists(dst):
-                shutil.copy(os.path.join(src_dir, fn), dst)
+                shutil.copy(src, dst)
+            elif _sha256(dst) in _OUTDATED_BLUEPRINTS.get(fn, ()):
+                # An earlier bundled version nobody edited: replace it.
+                shutil.copy(src, dst)
+                _LOGGER.info("AnyVac: updated blueprint %s", fn)
     except OSError as err:
         _LOGGER.warning("AnyVac: could not install notification blueprints: %s", err)
 
@@ -72,6 +96,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     entry.async_on_unload(entry.add_update_listener(_async_options_updated))
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     async_register_services(hass)
+    # docs/52 §9.5 (R3): a job that ran when Home Assistant stopped goes on.
+    entry.async_create_background_task(
+        hass, async_restore_job(hass, coordinator), "anyvac_restore_job"
+    )
     return True
 
 
@@ -84,7 +112,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # entry — after a disable or removal they still sent `app_segment_clean`
         # on the next `anyvac_room_done`. The robots finish what they were
         # already doing; only the orchestration stops.
-        started = _cancel_jobs(hass)
+        # The saved job stays: a reload (or the next start) resumes it.
+        started = _cancel_jobs(hass, keep_saved=True)
         if started:
             _LOGGER.warning(
                 "AnyVac unloaded during a clean job; the remaining queued rooms "

@@ -4,7 +4,9 @@ clean:
     Send a clean intent (rooms + mode) to the AnyVac planner. The backend
     resolves capability, load-balances rooms across capable vacuums (LPT),
     resolves per-room pins, and runs the resulting job server-side
-    (dry -> wet gating, repeat, mop settings). This is the service the card's
+    one room per command, in a queue per vacuum (docs/52): a wet room waits
+    for the dry pass of the same room, settings are sent with every room.
+    Starting a job cancels the one before. This is the service the card's
     Start button calls.
   fields:
     rooms:
@@ -57,6 +59,15 @@ clean:
       example: '{"wet": {"vacuum.s8_maxv_ultra": {"mop_intensity": "high", "repeat": 2}}}'
       selector:
         object:
+    batch:
+      name: Batch vacuums
+      description: >-
+        Vacuums that get all their rooms in one command instead of one room
+        at a time. Their firmware then follows the room order set in the
+        Roborock app. Their part of the job cannot be changed once it is sent.
+      example: '["vacuum.s6_kitchen"]'
+      selector:
+        object:
 
 plan:
   name: Plan (preview)
@@ -101,6 +112,15 @@ plan:
       name: Settings
       description: >-
         Per-vacuum, per-pass mop/fan settings — same shape as `anyvac.clean`.
+      selector:
+        object:
+    batch:
+      name: Batch vacuums
+      description: >-
+        Vacuums that get all their rooms in one command instead of one room
+        at a time. Their firmware then follows the room order set in the
+        Roborock app. Their part of the job cannot be changed once it is sent.
+      example: '["vacuum.s6_kitchen"]'
       selector:
         object:
 
@@ -270,6 +290,57 @@ zone_clean:
           min: 1
           max: 3
           step: 1
+
+edit_job:
+  name: Edit job
+  description: >-
+    Change the running clean job. Rooms not sent yet just change in the
+    queue; the room a vacuum is cleaning is left right away (pause, then the
+    next room or home). Without a running job, `add` starts one.
+  fields:
+    add:
+      name: Add rooms
+      description: Room names to add to the job.
+      example: '["Kitchen"]'
+      selector:
+        object:
+    remove:
+      name: Remove rooms
+      description: Room names to take out of the job.
+      example: '["Bathroom"]'
+      selector:
+        object:
+    mode:
+      name: Mode
+      description: >-
+        Pass of the rooms in add/remove. Default for add: the job's mode;
+        for remove: both passes.
+      selector:
+        select:
+          options:
+            - dry
+            - wet
+            - both
+    move:
+      name: Move
+      description: >-
+        Put a room at a position of its vacuum's queue ({room, kind, index},
+        0 = next). The planner never moves it back.
+      example: '{"room": "Kitchen", "kind": "wet", "index": 0}'
+      selector:
+        object:
+    pin:
+      name: Reassign
+      description: >-
+        Hand a room's pass to another vacuum ({room: {dry/wet: vacuum}}).
+      example: '{"Kitchen": {"wet": "vacuum.s8_maxv_ultra"}}'
+      selector:
+        object:
+    settings:
+      name: Settings
+      description: Settings of added rooms — same shape as `anyvac.clean`.
+      selector:
+        object:
 
 cancel:
   name: Cancel
@@ -455,24 +526,6 @@ set_floorplan_seat:
         card-level call that only means to touch `rooms`/`image_base` must
         still resend `room_style` if it wants to keep an existing one.
       example: '{"border_normal": 2, "border_selected": 4}'
-      selector:
-        object:
-
-set_room_sequence:
-  name: Set room sequence
-  description: >-
-    Replace the stored room cleaning order (used for sequence-aware ETA).
-    Sends the complete ordered room list — position in the list is the
-    1-based sequence number; this replaces the whole stored sequence, it
-    does not merge.
-  fields:
-    rooms:
-      name: Rooms
-      description: >-
-        Full ordered list of room names, in the order the Roborock app is
-        configured to clean them.
-      required: true
-      example: '["Hall", "Kitchen", "Bedroom"]'
       selector:
         object:
 
@@ -1046,7 +1099,7 @@ upload_asset:
         text:
     data:
       name: Data
-      description: The file content, base64 (a data: URL prefix is accepted).
+      description: "The file content, base64 (a data: URL prefix is accepted)."
       required: true
       selector:
         text:

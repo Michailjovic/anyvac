@@ -113,7 +113,7 @@ def test_both_footprints_make_a_both_run(monkeypatch):
 
 def test_plan_decides_before_any_evidence(monkeypatch):
     coord, clock = _rig(monkeypatch)
-    coord._job_state = {"passes": [{"duid": "s7", "room": "Hall", "kind": "dry", "done_at": None}]}
+    coord._job_state = {"queues": {"s7": {"items": [{"id": "dry-s7-0", "room": "Hall", "rooms": ["Hall"], "kind": "dry", "state": "queued"}]}}}
     _step(coord, clock, in_cleaning=False, vacuuming=False, clean_type="wet")
     _step(coord, clock, clean_type="wet", **ACTIVE)  # stale/odd knob, no footprint yet
     assert coord.resolve_run_kind("s7") == ("dry", "plan")
@@ -164,50 +164,19 @@ def test_job_warning_is_exposed_in_job_progress(monkeypatch):
     coord, _clock = _rig(monkeypatch)
     coord.async_update_listeners = lambda: None
     coord.data = {}
-    coord.set_job_plan([{"room": "Hall", "kind": "dry", "duid": "s7", "est_min": 5, "finish_min": 5}], 5)
+    coord.set_job_state({
+        "job_id": "j1", "started_at": _clock.now, "mode": "dry",
+        "queues": {"s7": {"vacuum": "vacuum.s7", "items": [
+            {"id": "dry-s7-0", "room": "Hall", "rooms": ["Hall"], "kind": "dry", "state": "queued", "est_min": 5},
+        ]}},
+    })
     coord.add_job_warning("select.s7_maxv_mop_intensity is 'mild', expected 'off'")
     coord.add_job_warning("select.s7_maxv_mop_intensity is 'mild', expected 'off'")
     assert coord.job_progress["warnings"] == ["select.s7_maxv_mop_intensity is 'mild', expected 'off'"]
 
 
-@pytest.mark.asyncio
-async def test_select_that_did_not_take_is_reported_not_silent(monkeypatch):
-    """A5 (docs/49): `mop_intensity: off` that does not take makes the "dry" robot
-    mop. Never silent, never blocking."""
-    import custom_components.anyvac.services as services_mod
-    from types import SimpleNamespace
-
-    warned: list[str] = []
-
-    class _Coord:
-        def add_job_warning(self, text):
-            warned.append(text)
-
-    async def _call(domain, service, data, blocking=False, context=None):
-        return None
-
-    async def _no_sleep(_):
-        return None
-
-    hass = SimpleNamespace(
-        services=SimpleNamespace(async_call=_call),
-        states=SimpleNamespace(get=lambda eid: SimpleNamespace(state="mild")),
-    )
-    runner = object.__new__(services_mod._JobRunner)
-    runner.hass, runner.context = hass, None
-    monkeypatch.setattr(services_mod, "_coordinators", lambda h: [_Coord()])
-    monkeypatch.setattr(services_mod.asyncio, "sleep", _no_sleep)
-    await runner._apply_selects([{"entity_id": "select.s7_mop", "option": "off"}])
-    assert warned == ["select.s7_mop is 'mild', expected 'off'"]
-
-    warned.clear()
-    hass.states = SimpleNamespace(get=lambda eid: SimpleNamespace(state="off"))
-    await runner._apply_selects([{"entity_id": "select.s7_mop", "option": "off"}])
-    assert warned == []
-
-
 def _runner(monkeypatch, states_get, warned, call=None, data=None):
-    import custom_components.anyvac.services as services_mod
+    import custom_components.anyvac.jobrunner as jr
     from types import SimpleNamespace
 
     class _Coord:
@@ -227,11 +196,27 @@ def _runner(monkeypatch, states_get, warned, call=None, data=None):
         services=SimpleNamespace(async_call=call or _default_call),
         states=SimpleNamespace(get=states_get),
     )
-    runner = object.__new__(services_mod._JobRunner)
-    runner.hass, runner.context, runner._closed = hass, None, False
-    monkeypatch.setattr(services_mod, "_coordinators", lambda h: [_Coord()])
-    monkeypatch.setattr(services_mod.asyncio, "sleep", _no_sleep)
+    runner = jr.JobRunner(hass, [])
+    monkeypatch.setattr(jr, "_coordinators", lambda h: [_Coord()])
+    monkeypatch.setattr(jr.asyncio, "sleep", _no_sleep)
     return runner
+
+
+def test_select_that_did_not_take_is_reported_not_silent(monkeypatch):
+    """A5 (docs/49): `mop_intensity: off` that does not take makes the "dry" robot
+    mop. Never silent, never blocking."""
+    from types import SimpleNamespace
+
+    it = {"vacuum": "vacuum.s7", "selects": [{"entity_id": "select.s7_mop", "option": "off"}], "expect": {}}
+    runner = _runner(monkeypatch, lambda eid: SimpleNamespace(state="mild"), [])
+    assert runner._settings_mismatch(it, {}) == ["select.s7_mop is 'mild', expected 'off'"]
+    runner = _runner(monkeypatch, lambda eid: SimpleNamespace(state="off"), [])
+    assert runner._settings_mismatch(it, {}) == []
+    # The fan the robot reports (`mop_signal`) is checked too.
+    it = {"vacuum": "vacuum.s7", "selects": [], "expect": {"fan_speed": "max_plus"}}
+    assert runner._settings_mismatch(it, {"mop_signal": {"fan_speed_name": "balanced"}}) == [
+        "vacuum.s7 fan is 'balanced', expected 'max_plus'"
+    ]
 
 
 @pytest.mark.asyncio
@@ -240,48 +225,39 @@ async def test_select_of_a_robot_without_a_mop_is_not_a_job_warning(monkeypatch)
     `off` fails on every start. That is noise, not a problem of the run."""
     from types import SimpleNamespace
 
-    warned: list[str] = []
-
     async def _boom(domain, service, payload, blocking=False, context=None):
         raise RuntimeError("Error while calling SET_WATER_BOX_CUSTOM_MODE")
 
-    runner = _runner(monkeypatch, lambda eid: SimpleNamespace(state="unknown"), warned, call=_boom)
-    await runner._apply_selects([{"entity_id": "select.s6_mop_intensity", "option": "off"}])
-    assert warned == []
-
-    # ...but the same failure on a select that HAS a value is still reported.
-    runner = _runner(monkeypatch, lambda eid: SimpleNamespace(state="mild"), warned, call=_boom)
-    await runner._apply_selects([{"entity_id": "select.s7_mop_intensity", "option": "off"}])
-    assert len(warned) == 1
+    it = {"vacuum": "vacuum.s6", "selects": [{"entity_id": "select.s6_mop_intensity", "option": "off"}]}
+    runner = _runner(monkeypatch, lambda eid: SimpleNamespace(state="unknown"), [], call=_boom)
+    assert await runner._apply_settings(it) == []
+    runner = _runner(monkeypatch, lambda eid: SimpleNamespace(state="mild"), [], call=_boom)
+    assert len(await runner._apply_settings(it)) == 1
 
 
 @pytest.mark.asyncio
-async def test_requested_passes_are_checked_against_what_the_robot_reports(monkeypatch):
-    """The robot reports the passes of a running clean. A firmware that ignores
-    `repeat` shows 1 while 2 were asked for — a warning on the job."""
+async def test_requested_passes_are_checked_only_while_the_item_runs(monkeypatch):
+    """docs/52 O3: the passes the robot reports are only compared while THIS item
+    runs (active state, its own segments). Right after the command the status
+    still shows the previous task — that was the false "reports 1" warning."""
     from types import SimpleNamespace
 
-    def dev(rep):
-        return SimpleNamespace(data={"repeat": rep})
+    def dev(rep, state="segment_cleaning", segs=(17,)):
+        return SimpleNamespace(data={"repeat": rep, "status_state": state, "target_segments": list(segs)})
+
+    def item():
+        return {"id": "i", "vacuum": "vacuum.s6", "segments": [17], "repeat": 2, "state": "active",
+                "selects": [], "expect": {}}
 
     warned: list[str] = []
-    runner = _runner(monkeypatch, lambda eid: None, warned, data={"duid1": dev(1)})
-    await runner._verify_repeat("duid1", "vacuum.s6", 2)
+    runner = _runner(monkeypatch, lambda eid: None, warned, data={"d": dev(1)})
+    await runner._reapply_and_verify("d", item())
     assert warned == ["vacuum.s6: asked for 2 passes, the robot reports 1"]
 
     warned.clear()
-    runner = _runner(monkeypatch, lambda eid: None, warned, data={"duid1": dev(2)})
-    await runner._verify_repeat("duid1", "vacuum.s6", 2)
-    assert warned == []
-
-    # Nothing reported at all: only a log line, never a warning.
-    runner = _runner(monkeypatch, lambda eid: None, warned, data={"duid1": dev(None)})
-    await runner._verify_repeat("duid1", "vacuum.s6", 2)
-    assert warned == []
-
-    # One pass asked for: nothing to verify.
-    runner = _runner(monkeypatch, lambda eid: None, warned, data={"duid1": dev(1)})
-    await runner._verify_repeat("duid1", "vacuum.s6", 1)
+    for d in (dev(2), dev(1, state="returning_home"), dev(1, segs=(18,)), dev(None)):
+        runner = _runner(monkeypatch, lambda eid: None, warned, data={"d": d})
+        await runner._reapply_and_verify("d", item())
     assert warned == []
 
 
@@ -304,3 +280,12 @@ def test_legacy_path_is_only_decimated_when_it_is_exposed():
     assert len(lazy["path"]) == len(lazy["mop_path"]) == n
     assert full["path_points"] == lazy["path_points"] == n
     assert lazy["_path_dry"] == full["_path_dry"]  # the live trace is unaffected
+
+
+def test_dry_pass_with_water_still_running_is_reported(monkeypatch):
+    it = {"vacuum": "vacuum.s7", "selects": [], "expect": {"water_off": True}}
+    runner = _runner(monkeypatch, lambda eid: None, [])
+    assert runner._settings_mismatch(it, {"mop_signal": {"water_mode_name": "mild"}}) == [
+        "vacuum.s7 water is 'mild', expected 'off'"
+    ]
+    assert runner._settings_mismatch(it, {"mop_signal": {"water_mode_name": "off"}}) == []
