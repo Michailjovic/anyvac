@@ -1,7 +1,7 @@
 """Tests for CleanPlanner.build_tasks's queue items (docs/52 §9.1).
 
 The file keeps its name from the docs/23 pool tasks it replaced (a deleted
-test file would linger on the user's disk). Since 1.58.0 every robot gets a
+test file would linger on the user's disk). Since 1.60.0 every robot gets a
 QUEUE: one item per room and pass, in the order it will run. A batch robot
 (docs/52 R7) gets one item per pass with all its rooms in the app's order.
 

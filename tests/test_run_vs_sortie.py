@@ -1,4 +1,4 @@
-"""Tests for the per-TASK lifecycle (docs/52 §9.3, 1.58.0).
+"""Tests for the per-TASK lifecycle (docs/52 §9.3, 1.60.0).
 
 One task = one command the robot runs to its end: one room in a room-by-room
 job. The firmware chains tasks without dropping ``in_cleaning`` — the robot

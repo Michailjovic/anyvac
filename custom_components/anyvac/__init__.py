@@ -34,7 +34,7 @@ PLATFORMS: list[Platform] = [Platform.IMAGE, Platform.SENSOR]
 
 # Earlier bundled blueprint versions (sha256 of the file as shipped). An
 # installed copy that still matches one was never edited and is replaced by the
-# current version. 1.58.0: the clean-finished blueprint moved from the per-room
+# current version. 1.60.0: the clean-finished blueprint moved from the per-room
 # `anyvac_clean_finished` to `anyvac_run_finished` (docs/52 R6) — the old one
 # would now notify after every single room.
 _OUTDATED_BLUEPRINTS: dict[str, frozenset[str]] = {

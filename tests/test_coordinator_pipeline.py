@@ -467,7 +467,7 @@ def test_path_stitches_across_job_sorties(monkeypatch: pytest.MonkeyPatch, clock
     assert coord._dry_path[duid] == [[{"x": 100, "y": 100}], [{"x": 200, "y": 100}]]
     assert coord._wet_path[duid] == [[{"x": 100, "y": 100}], [{"x": 200, "y": 100}]]
 
-    # docs/52 §9.3 (1.58.0): the trace stitches across the job, but what is
+    # docs/52 §9.3 (1.60.0): the trace stitches across the job, but what is
     # MEASURED is per task — every task is one room's clean measurement, so the
     # new sortie starts a fresh run tracker and its own start time.
     assert coord._session_start[duid] == clock.now

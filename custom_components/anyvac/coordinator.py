@@ -1324,7 +1324,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # for the same reason as room_pins: it's a physical fact, not a per-dashboard
         # preference, and multiple cards/browsers would otherwise duplicate it.
         # Persisted across restarts.
-        # Legacy store of the hand-edited room order (docs/19, removed in 1.58.0,
+        # Legacy store of the hand-edited room order (docs/19, removed in 1.60.0,
         # docs/52 O1). Never read again; kept so uninstall removes the file.
         self._seq_store: Store = Store(hass, 1, f"{DOMAIN}_room_sequence")
         # The running room-by-room job (docs/52 §9.5), saved on every change of an

@@ -13,7 +13,7 @@ Public command interface for the card (and automations):
 - ``anyvac.cancel``     — tear down running jobs and send the started robots home.
 - ``anyvac.select_rooms`` / ``anyvac.pin_room`` / ``anyvac.set_layers`` /
   ``anyvac.reset_learning`` — state. (``anyvac.set_room_sequence`` was removed in
-  1.58.0: room-by-room jobs choose their own order; a batch dispatch reads the
+  1.60.0: room-by-room jobs choose their own order; a batch dispatch reads the
   app's order from the robot, docs/52 O1.)
   (``anyvac.run_job``, the old raw-task-list executor, was removed in 1.52.1: it
   called any service with any data and never carried the caller's context. Jobs

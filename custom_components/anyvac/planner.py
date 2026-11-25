@@ -405,7 +405,7 @@ class CleanPlanner:
         Batch robots run in the app's order (the firmware decides, docs/19).
         Room-by-room robots: dry shortest first, so the slow mopping can start
         as early as possible; wet in the order their dry pass finishes. The
-        full planner (docs/53, 1.59.0) replaces this ordering."""
+        full planner (docs/53) replaces this ordering."""
         if batch:
             seq = self._app_sequence(duid)
             return sorted(rooms, key=lambda r: (seq.get(r, 10_000), r))

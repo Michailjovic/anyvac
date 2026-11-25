@@ -40,7 +40,7 @@ or mm math on the card side:
 | `rooms_estimate` | learned per-room clean-time estimates in minutes: `{room: {dry, wet}}` (docs/16 continuous calibration) |
 | `rooms_progress` | per-room debug progress: `{room: {spatial_pct, visited_cells, total_cells, time_pct, elapsed_s, est_s}}` |
 | `rooms_last_cleaned` | per-room last-cleaned info by clean type (mirrors the timestamp sensors below) |
-| `room_pins` / `selected_rooms` / `view_layers` | orchestration/UI state the card reads and writes via services below (`room_sequence` stays empty since 1.58.0) |
+| `room_pins` / `selected_rooms` / `view_layers` | orchestration/UI state the card reads and writes via services below (`room_sequence` stays empty since 1.60.0) |
 | `floorplan_seats` | Visual editor manual seat + appearance + per-room + room-style override layer (docs/41 + docs/42), keyed by floorplan `image_base.src` — set/cleared via `anyvac.set_floorplan_seat`, merged over config by the card |
 | `reach` | docs/51: reach mask meta — `{entity_id, home_entity_id, home_frame_id, updated, home_ready, rooms: {room: {at, floor_pct, kinds, stale}}}`; the rasters themselves are the image entities below |
 | `pipeline_ok` / `pipeline_error` | integration self-diagnostic for the current poll |

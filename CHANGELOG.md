@@ -6,9 +6,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.58.0] - 2026-11-25
+## [1.60.0] - 2026-11-25
 
-Pairs with card 1.58.0. First part of 2.0.0: the clean queue is held by AnyVac,
+Pairs with card 1.60.0. Published as 1.60.0 (1.58.0 was prepared but never reached Home Assistant). First part of 2.0.0: the clean queue is held by AnyVac,
 one room per command (docs/52). Based on three hardware tests on S6, S7 MaxV and
 S8 MaxV Ultra on 2026-11-25 (docs/52 §6–§8).
 
@@ -22,7 +22,7 @@ learned time could mix two rooms.
   runner (`jobrunner.py`) sends one room at a time: the next room as soon as the
   robot turns home (measured gap ~20 s), a wet room only after the dry pass of the
   same room. Each item goes `queued → sent → active → done | blocked | removed`.
-  Interim order until the planner of 1.59.0: dry rooms shortest first, wet rooms
+  Interim order until the planner (docs/53): dry rooms shortest first, wet rooms
   in the order their dry pass ends.
 - **The command is checked.** A robot must start the sent room within 45 s
   (`target_segments` or an active state); otherwise it is sent once more, then the
@@ -39,7 +39,7 @@ learned time could mix two rooms.
   it dock once the interval is reached. Read from `dock_status.smart_wash_enabled` /
   `wash_interval_min`.
 - **Battery:** a docked robot below 30 % is not sent (the firmware refuses a forced
-  start); it goes when charged. Full battery model in 1.60.0.
+  start); it goes when charged. The full battery model comes later (docs/53 §5).
 - **Rooms the robot could not clean are `blocked` with a reason** (`water_shortage`,
   `error`, `could not reach the room`) and listed in the vacuum's report.
 - **`anyvac.edit_job`** (new): `add` / `remove` rooms, `move` a room in its vacuum's
