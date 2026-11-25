@@ -96,6 +96,7 @@ def _new_coordinator(monkeypatch: pytest.MonkeyPatch, clock: _Clock) -> AnyVacCo
     coord._task_item = {}
     coord._task_last = {}
     coord._task_rooms_done = {}
+    coord._harvest_pending = {}
     coord.app_sequence = {}
     coord._app_sequence_at = {}
     coord._job_store = _FakeStore() if "_FakeStore" in globals() else None
@@ -165,6 +166,7 @@ def _poll(coord: AnyVacCoordinator, device: AnyVacDevice) -> None:
     coord._detect_room_done(device)
     coord._track_and_emit(device)
     coord._attribute_points(device)
+    coord._maybe_harvest_pending(device)
 
 
 def _sortie(
@@ -210,10 +212,15 @@ def _clean(coord, clock, duid, points, room, seg, step=8, **kw):
         clock.advance(minutes=1)
 
 
-def _return(coord, clock, duid, points, seg, battery=80):
+def _return(coord, clock, duid, points, seg, battery=80, then=True):
+    """The return edge, and (`then`) the next map snapshot on the way home."""
     _poll(coord, _device(duid, status_state="returning_home", transit=True, target_segments=[seg],
                          battery=battery, _path_dry=points))
     clock.advance(seconds=20)
+    if then:
+        _poll(coord, _device(duid, status_state="returning_home", transit=True, target_segments=[seg],
+                             battery=battery, _path_dry=points))
+        clock.advance(seconds=20)
 
 
 def test_return_edge_ends_the_task_and_harvests_it(monkeypatch, clock) -> None:
@@ -241,7 +248,7 @@ def test_chained_task_is_measured_on_its_own_and_the_trace_stitches(monkeypatch,
     coord.set_job_rooms("s6", {"Hall", "Kitchen"})
     coord.set_task_item("s6", {"Hall"})
     _clean(coord, clock, "s6", HALL, "Hall", 1)
-    _return(coord, clock, "s6", HALL, 1)
+    _return(coord, clock, "s6", HALL, 1, then=False)  # next room before the next map
     first_run = coord._runs["s6"]
     coord.set_task_item("s6", {"Kitchen"})
     _clean(coord, clock, "s6", KITCHEN, "Kitchen", 2)
@@ -304,3 +311,21 @@ def test_water_off_leaves_no_wet_evidence(monkeypatch, clock) -> None:
     run = coord._runs["s7"]
     assert run.floor_fraction(coord._geo["s7"][2], "Hall", "wet") == 0
     assert run.floor_fraction(coord._geo["s7"][2], "Hall", "dry") > 0.9
+
+
+def test_the_last_seconds_arriving_after_the_return_edge_are_counted(monkeypatch, clock) -> None:
+    """Field 2026-11-25 (S7 MaxV Bathroom read 71 %): the map with a room's
+    last seconds came after the robot turned home. The task is reported at
+    the edge, learned with the next snapshot."""
+    coord = _new_coordinator(monkeypatch, clock)
+    cut = int(len(HALL) * 0.7)
+    _clean(coord, clock, "s7", HALL[:cut], "Hall", 1)
+    _poll(coord, _device("s7", status_state="returning_home", transit=True, target_segments=[1],
+                         battery=80, _path_dry=HALL[:cut]))
+    assert coord.hass.bus.names().count("anyvac_clean_finished") == 1
+    assert "Hall" not in coord._room_coverage  # not learned yet
+    clock.advance(seconds=30)
+    _poll(coord, _device("s7", status_state="returning_home", transit=True, target_segments=[1],
+                         battery=80, _path_dry=HALL))
+    assert coord._room_coverage["Hall"]["dry"] == 100
+    assert coord._last_calib["s7"]["rooms"]["Hall"]["dry"]["accepted"] is True

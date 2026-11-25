@@ -6,6 +6,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.60.1] - 2026-11-25
+
+Pairs with card 1.60.0 (card unchanged). Fixes from the first field test of the
+room-by-room jobs (2026-11-25, S6 Kitchen + S7 Bathroom dry, S8 mopping).
+
+- **Fixed: two robots could be sent into one room.** Corridor's dry pass was
+  removed and added again with `anyvac.edit_job`; in between the wet gate
+  opened, S8 took Corridor, and the re-added dry pass would have sent S7 into
+  the room S8 was mopping. A robot now never gets a room another robot was
+  sent to or is cleaning (docs/53 P4); it takes it once that robot is out.
+- **Fixed: a room was learned before its last seconds arrived.** S7 MaxV's
+  Bathroom read 71 % and was not calibrated: the task closes when the robot
+  turns home, but S7's map with the room's last seconds came after that state
+  change. The task is still reported (`anyvac_clean_finished`) at once, so the
+  next room goes out without delay; calibration and completion % now wait for
+  the next map snapshot (or the next room, the dock, at most 60 s), and that
+  tail is still counted for the room. `calibrated` moved from
+  `anyvac_clean_finished` to the coordinator's `anyvac_run_finished`.
+- **Settings are applied again the moment the robot takes the room** (was 6 s
+  later). S8 vacuumed the start of Corridor at its default fan in the meantime.
+  The check after 20 s still catches the mop mode the firmware resets ~15 s in.
+- Tests: two robots in one room, the late tail after the return edge (both fail
+  without the fix); 555 in total.
+
 ## [1.60.0] - 2026-11-25
 
 Pairs with card 1.60.0. Published as 1.60.0 (1.58.0 was prepared but never reached Home Assistant). First part of 2.0.0: the clean queue is held by AnyVac,

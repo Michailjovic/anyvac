@@ -169,3 +169,28 @@ async def test_batch_robot_gets_all_rooms_in_one_command(monkeypatch) -> None:
     await rig.poll()
     await rig.finish_room(s6, ["A", "B"])
     assert rig.hass.bus.of("anyvac_run_finished")[0]["rooms"] == ["A", "B"]
+
+
+async def test_never_two_robots_in_one_room(monkeypatch) -> None:
+    """docs/53 P4, field 2026-11-25: Corridor's dry pass was removed and added
+    again; in between the wet gate opened and S8 took Corridor. The re-added
+    dry pass must wait until S8 is out of the room."""
+    rig = Rig(monkeypatch)
+    rig.add("s7", "vacuum.s7")
+    s8 = rig.add("s8", "vacuum.s8", wet=True)
+    runner = await _start(rig, [
+        item("s7", "vacuum.s7", "dry", "Corridor", 17),
+        item("s8", "vacuum.s8", "wet", "Corridor", 18),
+    ])
+    runner.remove_room("Corridor", "dry")  # S7 had it: pause, nothing left -> home
+    await rig.drain()
+    await rig.poll()
+    assert rig.hass.services.sent("vacuum.s8") == [[18]]  # gate open, S8 goes
+    runner.add_items([item("s7", "vacuum.s7", "dry", "Corridor", 17)])
+    rig.hass.robots["s7"].data.update(in_cleaning=False, status_state="charging", target_segments=[])
+    await rig.drain()
+    await rig.poll()
+    assert rig.hass.services.sent("vacuum.s7") == [[17]]  # only the first one
+    await rig.finish_room(s8, ["Corridor"])
+    await rig.poll()
+    assert rig.hass.services.sent("vacuum.s7") == [[17], [17]]

@@ -41,8 +41,11 @@ ACCEPT_TIMEOUT_S = 45
 # a fresh status) until it is taken.
 ACCEPT_CHECK_S = 12
 # The firmware resets settings when it takes a task; mop mode shows ~15 s later
-# (docs/52 §8.1). The second application waits for that.
-REAPPLY_DELAY_S = 6
+# (docs/52 §8.1). Applied again the moment the robot took the room (field
+# 2026-11-25: with a 6 s wait S8 vacuumed the start of Corridor at the default
+# fan), then checked after VERIFY_DELAY_S and applied once more if the late
+# mop mode reset landed.
+REAPPLY_DELAY_S = 0
 VERIFY_DELAY_S = 20
 # Below this the firmware refuses a forced start (docs/52 R2).
 MIN_START_BATTERY = 30
@@ -200,9 +203,25 @@ class JobRunner:
                     return False
         return True
 
+    def _occupied(self, q: dict[str, Any]) -> set[str]:
+        """Rooms another robot was sent to or is cleaning (docs/53 P4: two
+        robots in one room run into each other). Field 2026-11-25: a dry pass
+        removed and added again released the wet gate in between, the mop
+        robot took the room, and the re-added dry pass would have sent a
+        second robot into it."""
+        return {
+            r
+            for other in self.queues.values()
+            if other is not q
+            for it in other["items"]
+            if it["state"] in ("sent", "active")
+            for r in it.get("rooms") or []
+        }
+
     def _next_ready(self, q: dict[str, Any]) -> dict[str, Any] | None:
+        busy = self._occupied(q)
         for it in q["items"]:
-            if it["state"] == "queued" and self._gate_open(it):
+            if it["state"] == "queued" and self._gate_open(it) and not busy & set(it.get("rooms") or []):
                 return it
         return None
 

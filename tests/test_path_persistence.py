@@ -101,6 +101,7 @@ def _poll(coord: AnyVacCoordinator, device: AnyVacDevice) -> None:
     coord._detect_room_done(device)
     coord._track_and_emit(device)
     coord._attribute_points(device)
+    coord._maybe_harvest_pending(device)
 
 
 def _new_coordinator(
@@ -145,6 +146,7 @@ def _new_coordinator(
     coord._task_item = {}
     coord._task_last = {}
     coord._task_rooms_done = {}
+    coord._harvest_pending = {}
     coord.app_sequence = {}
     coord._app_sequence_at = {}
     coord._job_store = _FakeStore() if "_FakeStore" in globals() else None

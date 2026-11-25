@@ -1347,6 +1347,8 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         self._task_last: dict[str, dict[str, Any]] = {}
         self._prev_state: dict[str, str | None] = {}
         self._task_rooms_done: dict[str, set[str]] = {}
+        # Tasks closed but not learned yet: {duid: {"at": closed, "polls": n}}.
+        self._harvest_pending: dict[str, dict[str, Any]] = {}
         # Live per-room elapsed cleaning seconds this session (for the debug progress
         # gauge's time-ratio) + last poll timestamp to measure the per-poll delta.
         self._room_elapsed: dict[str, dict[str, float]] = {}
@@ -2768,7 +2770,10 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # poll right after it closed is attributed once more, restricted to the
         # active room (see docstring).
         cleaning_gate = cleaning and not transit
-        was_gate = self._cov_gate.get(duid, False)
+        # A task closed on its return edge is learned only once the next map
+        # snapshot brought its last seconds (`_maybe_harvest_pending`) — keep
+        # attributing that tail, restricted to the room, until then.
+        was_gate = self._cov_gate.get(duid, False) or duid in self._harvest_pending
         self._cov_gate[duid] = cleaning_gate
         if not cleaning_gate and not was_gate:
             for layer in ("dry", "wet"):
@@ -2959,13 +2964,13 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                         self.hass.async_create_task(self.async_refresh_app_sequence(duid))
                     except Exception:  # noqa: BLE001 - test doubles without a loop
                         pass
-            self._begin_task(duid)
+            self._begin_task(device)
             self._dry_path_open[duid] = False
             self._wet_path_open[duid] = False
         elif cleaning and not self._task_open.get(duid) and state in ACTIVE_CLEAN_STATES:
             # The next task, accepted on the way home (docs/52 §2.8): no
             # `in_cleaning` edge, the robot just starts cleaning again.
-            self._begin_task(duid)
+            self._begin_task(device)
         if cleaning:
             room = device.data.get("vacuum_room_name")
             if room and self._task_open.get(duid):
@@ -2988,7 +2993,12 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     self.hass.bus.async_fire(f"{DOMAIN}_run_finished", event)
         self._was_cleaning[duid] = cleaning
 
-    def _begin_task(self, duid: str) -> None:
+    def _begin_task(self, device: AnyVacDevice) -> None:
+        duid = device.duid
+        if duid in self._harvest_pending:
+            # The next room came before the next map: learn the last one now,
+            # before its measurement is reset.
+            self._harvest_now(device)
         self._task_open[duid] = True
         self._task_rooms_done[duid] = set()
         self._session_start[duid] = dt_util.utcnow()
@@ -3021,12 +3031,39 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         event["rooms_result"] = self._task_result(device)
         event["battery"] = device.data.get("battery")
         event["water_shortage"] = bool((device.data.get("dock_status") or {}).get("water_shortage_status"))
-        calibrated = self._harvest_run(device)
-        if calibrated:
-            event["calibrated"] = calibrated
         self._task_open[duid] = False
         self._task_item.pop(duid, None)
         self.hass.bus.async_fire(f"{DOMAIN}_clean_finished", event)
+        # Learning waits for the next map snapshot when the robot only turned
+        # home: S7 MaxV's map with the room's last seconds came after the
+        # state change (field 2026-11-25, Bathroom read 71 %). A robot that
+        # already stopped (`in_cleaning` fell) is learned now.
+        self._harvest_pending[duid] = {"at": dt_util.utcnow(), "polls": 0, "event": event}
+        if not device.data.get("in_cleaning"):
+            self._harvest_now(device)
+
+    def _maybe_harvest_pending(self, device: AnyVacDevice) -> None:
+        """Learn a closed task once a later map snapshot arrived, the robot
+        stopped, or a minute passed — whichever is first."""
+        pend = self._harvest_pending.get(device.duid)
+        if pend is None:
+            return
+        pend["polls"] += 1
+        age = (dt_util.utcnow() - pend["at"]).total_seconds()
+        if (
+            (pend["polls"] >= 2 and self._is_map_fresh(device.duid))
+            or not device.data.get("in_cleaning")
+            or age >= 60
+        ):
+            self._harvest_now(device)
+
+    def _harvest_now(self, device: AnyVacDevice) -> None:
+        duid = device.duid
+        pend = self._harvest_pending.pop(duid, None) or {}
+        event = pend.get("event") or self._run_event(device)
+        calibrated = self._harvest_run(device)
+        if calibrated:
+            event["calibrated"] = calibrated
         if duid not in self._job_rooms:
             if device.data.get("in_cleaning"):
                 self._task_last[duid] = event  # `run_finished` once it docks
@@ -4023,6 +4060,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     self._detect_room_done(device)
                     self._track_and_emit(device)
                     self._attribute_points(device)
+                    self._maybe_harvest_pending(device)
                     self._record_clean_type_trace(device, ct_session_before)
                     progress = self._build_progress(device)
                     for room in device.data.get("rooms", []):

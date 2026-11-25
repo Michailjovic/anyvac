@@ -225,6 +225,7 @@ def _pin_lifecycle_coordinator(clock_now: datetime) -> AnyVacCoordinator:
     coord._task_item = {}
     coord._task_last = {}
     coord._task_rooms_done = {}
+    coord._harvest_pending = {}
     coord.app_sequence = {}
     coord._app_sequence_at = {}
     coord._job_store = _FakeStore() if "_FakeStore" in globals() else None

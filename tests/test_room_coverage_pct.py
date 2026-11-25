@@ -95,6 +95,7 @@ def _new_coordinator(monkeypatch: pytest.MonkeyPatch, clock: _Clock) -> AnyVacCo
     coord._task_item = {}
     coord._task_last = {}
     coord._task_rooms_done = {}
+    coord._harvest_pending = {}
     coord.app_sequence = {}
     coord._app_sequence_at = {}
     coord._job_store = _FakeStore() if "_FakeStore" in globals() else None
@@ -173,6 +174,7 @@ def _poll(coord: AnyVacCoordinator, device: AnyVacDevice) -> None:
     coord._detect_room_done(device)
     coord._track_and_emit(device)
     coord._attribute_points(device)
+    coord._maybe_harvest_pending(device)
 
 
 def _run(coord, clock, duid, path, *, targets, repeat=None, step=20, until=None, wet=False,
@@ -292,6 +294,9 @@ def test_the_tail_delivered_with_the_return_poll_is_counted(monkeypatch, clock) 
     clock.advance(seconds=30)
     # docs/52 §9.3: the return poll ENDS the task — the tail is attributed
     # first, then the task is harvested on that same poll.
+    _poll(coord, _device("d1", transit=True, status_state="returning_home",
+                         _path_dry=path, target_segments=[1]))
+    clock.advance(seconds=30)  # the next snapshot on the way home: learned now
     _poll(coord, _device("d1", transit=True, status_state="returning_home",
                          _path_dry=path, target_segments=[1]))
     assert coord._room_coverage["Hall"]["dry"] == 100
