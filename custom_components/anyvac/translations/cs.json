@@ -186,6 +186,10 @@
           "name": "Odebrat místnosti",
           "description": "Názvy místností, které se odeberou."
         },
+        "retry": {
+          "name": "Zkusit znovu",
+          "description": "Zablokované místnosti vrátit do fronty vysavače (např. po doplnění vody)."
+        },
         "mode": {
           "name": "Režim",
           "description": "Průchod přidávaných/odebíraných místností. Výchozí pro přidání: režim úklidu; pro odebrání: oba."
@@ -401,6 +405,10 @@
         "here": {
           "name": "Současná poloha",
           "description": "Použít aktuální polohu robota místo x/y."
+        },
+        "from_name": {
+          "name": "Stávající bod",
+          "description": "Název bodu ke změně. Bez x/y a here se jen přejmenuje na name, s nimi se přesune (a přejmenuje)."
         },
         "frame": {
           "name": "Souřadnicový rámec",

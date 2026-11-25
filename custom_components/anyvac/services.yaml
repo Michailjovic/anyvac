@@ -222,6 +222,13 @@ set_service_point:
       default: false
       selector:
         boolean:
+    from_name:
+      name: Existing point
+      description: >-
+        Name of a point to change. Without x/y or here it is only renamed to
+        `name`; with them it is moved (and renamed).
+      selector:
+        text:
     frame:
       name: Coordinate frame
       description: >-
@@ -438,11 +445,19 @@ edit_job:
       example: '["Bathroom"]'
       selector:
         object:
+    retry:
+      name: Retry rooms
+      description: >-
+        Blocked rooms to put back into their vacuum's queue (e.g. after
+        filling the water tank).
+      example: '["Bathroom"]'
+      selector:
+        object:
     mode:
       name: Mode
       description: >-
-        Pass of the rooms in add/remove. Default for add: the job's mode;
-        for remove: both passes.
+        Pass of the rooms in add/remove/retry. Default for add: the job's
+        mode; for remove and retry: both passes.
       selector:
         select:
           options:

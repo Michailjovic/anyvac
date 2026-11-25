@@ -111,3 +111,22 @@ def test_job_progress_is_published_and_unrecorded() -> None:
     from custom_components.anyvac.sensor import AnyVacMapSensor
 
     assert "job_progress" in AnyVacMapSensor._unrecorded_attributes
+
+
+def test_a_waiting_wet_item_names_the_robots_it_waits_for(monkeypatch) -> None:
+    """The card's lock ("after S6", docs/52 §5 item 3): a queued wet item lists
+    the robots whose dry pass of the same room is not over yet."""
+    c = _coord(monkeypatch, _Clock(T0))
+    c.set_job_state(_state(_queues(
+        [_it("a", "Hall", "dry", "done", 6), _it("b", "Living", "dry", "active", 40),
+         _it("x", "Pantry", "dry", "blocked", 3, reason="error")],
+        [_it("c", "Hall", "wet", "queued", 8), _it("d", "Living", "wet", "queued", 20),
+         _it("e", "Pantry", "wet", "queued", 3), _it("f", "Living", "wet", "done", 2)],
+    )))
+    wet = {r["id"]: r for r in c.job_progress["queues"]["vacuum.s8"]["items"]}
+    assert wet["c"]["waits_for"] == []            # Hall's dry pass is done
+    assert wet["d"]["waits_for"] == ["vacuum.s6"]  # Living is still being vacuumed
+    assert wet["e"]["waits_for"] == []            # a blocked dry pass opens the gate
+    assert "waits_for" not in wet["f"]            # only queued wet items carry it
+    dry = c.job_progress["queues"]["vacuum.s6"]["items"]
+    assert all("waits_for" not in r for r in dry)

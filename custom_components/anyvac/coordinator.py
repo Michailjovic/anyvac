@@ -2422,6 +2422,15 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         def at(minutes: float) -> str:
             return (now + timedelta(minutes=minutes)).isoformat(timespec="seconds")
 
+        # Who a wet item still waits for (the gate, docs/52 §3.1.4): the robots
+        # whose dry pass of the same room is not over yet — the card's lock.
+        dry_open: dict[str, set[str]] = {}
+        for q in queues.values():
+            for it in q.get("items") or []:
+                if it.get("kind") == "dry" and it.get("state") not in ("done", "blocked", "removed"):
+                    for room in it.get("rooms") or []:
+                        dry_open.setdefault(room, set()).add(q.get("vacuum"))
+
         out_rows: list[dict[str, Any]] = []
         out_queues: dict[str, dict[str, Any]] = {}
         vacs: dict[str, dict[str, Any]] = {}
@@ -2444,6 +2453,10 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 }
                 if it.get("reason"):
                     row["reason"] = it["reason"]
+                if it.get("kind") == "wet" and state == "queued":
+                    row["waits_for"] = sorted(
+                        {v for room in it.get("rooms") or [] for v in dry_open.get(room, ())} - {entity, None}
+                    )
                 qitems.append(row)
                 # v1 rows: queued / active / done (blocked kept as its own word).
                 legacy = {"sent": "active", "queued": "queued"}.get(state, state)
@@ -2530,6 +2543,22 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             if len(points) >= SERVICE_POINTS_MAX:
                 raise ValueError(f"a vacuum can hold at most {SERVICE_POINTS_MAX} service points")
             points.append(point)
+        self._save_service_points()
+
+    def rename_service_point(self, duid: str, old: str, new: str) -> None:
+        """Keep the point, change its name (and its place in nothing else).
+        Raises ValueError for an unknown old name or a taken / bad new one."""
+        new = new.strip()
+        if not new or len(new) > SERVICE_POINT_NAME_MAX:
+            raise ValueError(f"name must be 1-{SERVICE_POINT_NAME_MAX} characters")
+        points = self._service_points.get(duid, [])
+        if not any(p["name"] == old for p in points):
+            raise ValueError(f"no service point '{old}'")
+        if new != old and any(p["name"] == new for p in points):
+            raise ValueError(f"a service point '{new}' already exists")
+        for p in points:
+            if p["name"] == old:
+                p["name"] = new
         self._save_service_points()
 
     def remove_service_point(self, duid: str, name: str | None = None) -> list[str]:

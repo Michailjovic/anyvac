@@ -190,3 +190,19 @@ def test_a_saved_point_is_published_without_waiting_for_a_poll() -> None:
     assert device.data["service_points"][0]["room"] == "Kitchen"
     c.remove_service_point("s6")
     assert device.data["service_points"] == []
+
+
+def test_rename_keeps_the_point() -> None:
+    c = _coord()
+    c.set_service_point("s6", "Bin", 10, 20)
+    c.set_service_point("s6", "Door", 30, 40)
+    c.rename_service_point("s6", "Bin", "Trash bin")
+    assert c.service_points("s6") == [
+        {"name": "Trash bin", "x": 10, "y": 20},
+        {"name": "Door", "x": 30, "y": 40},
+    ]
+    with pytest.raises(ValueError, match="already exists"):
+        c.rename_service_point("s6", "Trash bin", "Door")
+    with pytest.raises(ValueError, match="no service point"):
+        c.rename_service_point("s6", "Bin", "X")
+    c.rename_service_point("s6", "Door", "Door")  # same name is fine

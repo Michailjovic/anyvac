@@ -839,6 +839,24 @@ class JobRunner:
         self._after_edit()
         return added
 
+    def retry(self, room: str, kind: str | None = None) -> list[str]:
+        """A blocked room goes back into its queue where it was (the card's
+        Retry, docs/52 §5 item 3) — e.g. after the user filled the tank."""
+        changed: list[str] = []
+        for q in self.queues.values():
+            for it in q["items"]:
+                if it["state"] == "blocked" and room in (it.get("rooms") or []) and (not kind or it.get("kind") == kind):
+                    it["state"] = "queued"
+                    it.pop("reason", None)
+                    it.pop("done_at", None)
+                    for k in ("sent_at", "accepted_at", "sent_from_dock", "baseline"):
+                        it.pop(k, None)
+                    it["attempts"] = 0
+                    changed.append(it["id"])
+        if changed:
+            self._after_edit()
+        return changed
+
     def move(self, room: str, kind: str, index: int) -> bool:
         """Manual order (docs/53 P2): the planner never moves it back."""
         for q in self.queues.values():

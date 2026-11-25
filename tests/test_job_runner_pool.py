@@ -257,3 +257,25 @@ async def test_edit_job_settings_change_the_queue_and_the_room_being_cleaned(mon
     await rig.drain()
     assert s6.data["mop_signal"]["fan_speed_name"] == "quiet"  # live, now
     assert runner.queues["s6"]["items"][1]["fan_speed"] == "quiet"
+
+
+async def test_retry_puts_a_blocked_room_back_into_its_queue(monkeypatch) -> None:
+    """The card's Retry (docs/52 §5 item 3): after the user filled the tank the
+    blocked room goes out again like any queued one."""
+    rig = Rig(monkeypatch)
+    s8 = rig.add("s8", "vacuum.s8", wet=True)
+    runner = await _start(rig, [
+        item("s8", "vacuum.s8", "wet", "Living", 16),
+        item("s8", "vacuum.s8", "wet", "Hall", 17),
+    ])
+    await rig.poll()
+    await rig.finish_room(s8, ["Living"], cleaned=False, water_shortage=True)
+    living = runner.queues["s8"]["items"][0]
+    assert living["state"] == "blocked"
+    assert runner.retry("Living", "wet") == [living["id"]]
+    assert living["state"] == "queued" and "reason" not in living and living["attempts"] == 0
+    assert runner.retry("Living", "wet") == []  # nothing blocked any more
+    assert rig.hass.services.sent("vacuum.s8") == [[16], [17]]  # S8 is on Hall now
+    await rig.poll()
+    await rig.finish_room(s8, ["Hall"])
+    assert rig.hass.services.sent("vacuum.s8") == [[16], [17], [16]]  # Living again

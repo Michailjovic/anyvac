@@ -6,6 +6,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.62.0] - 2026-11-26
+
+Pairs with card 1.62.0 (the queue while cleaning, service points in the robot sheet).
+
+- **`waits_for` on queued wet items** (`job_progress.queues.*.items[]`): the
+  vacuums whose dry pass of the same room is not over yet — the wet gate the
+  runner already applies (docs/52 §3.1.4), now visible so the card can show
+  "after S7". A blocked dry pass opens the gate, as before.
+- **`anyvac.edit_job` `retry`**: blocked rooms go back into their vacuum's
+  queue where they were (e.g. after filling the water tank) — the card's Retry.
+  `mode` picks the pass; without it both. Response lists them in `retried`.
+- **`anyvac.set_service_point` `from_name`**: rename a point without giving it
+  a new place (no x/y, no `here`), or move it with them. The card never
+  computes robot mm, so it could not resend the old point itself.
+- Tests: `waits_for`, retry against the fake fleet, rename; 571 in total.
+
 ## [1.61.0] - 2026-11-25
 
 Card unchanged (1.60.0); the card's buttons for it come after the mockups.

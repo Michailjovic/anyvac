@@ -387,7 +387,9 @@ EDIT_JOB_SCHEMA = vol.Schema(
     {
         vol.Optional("add"): [str],
         vol.Optional("remove"): [str],
-        # Pass of the rooms in `add` / `remove` (default: the job's mode / both).
+        # Blocked rooms to put back into their queue (the card's Retry).
+        vol.Optional("retry"): [str],
+        # Pass of the rooms in `add` / `remove` / `retry` (default: the job's mode / both).
         vol.Optional("mode"): vol.In(["dry", "wet", "both"]),
         vol.Optional("move"): vol.Schema(
             {
@@ -450,6 +452,8 @@ SET_SERVICE_POINT_SCHEMA = vol.Schema(
         vol.Optional("duid"): str,
         vol.Optional("name", default="Service point"): vol.All(str, vol.Length(min=1, max=40)),
         vol.Optional("here", default=False): bool,
+        # An existing point to rename (no coordinates) or move (with them).
+        vol.Optional("from_name"): vol.All(str, vol.Length(min=1, max=40)),
         vol.Optional("frame", default="robot"): vol.In(["robot", "home"]),
         vol.Optional("x_pct"): vol.All(vol.Coerce(float), vol.Range(min=0, max=100)),
         vol.Optional("y_pct"): vol.All(vol.Coerce(float), vol.Range(min=0, max=100)),
@@ -1954,6 +1958,7 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
             return {"job_id": runner.job_id, "added": [it["id"] for it in items]}
         out: dict[str, Any] = {
             "job_id": job.job_id, "added": [], "removed": [], "moved": False, "reassigned": [], "updated": [],
+            "retried": [],
         }
         settings = call.data.get("settings") or job.settings
         mode = call.data.get("mode")
@@ -1962,6 +1967,8 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
                 kinds = [None] if not mode or mode == "both" else [mode]
                 for kind in kinds:
                     out["removed"] += job.remove_room(room, kind)
+            for room in call.data.get("retry") or []:
+                out["retried"] += job.retry(str(room), None if not mode or mode == "both" else mode)
             if add:
                 planner, coord = _planner()
                 busy = {(r, it["kind"]) for it in job.items() if it["state"] not in ("removed",) for r in it.get("rooms") or []}
@@ -2022,11 +2029,20 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
     async def _handle_set_service_point(call: ServiceCall) -> None:
         duid = _resolve_target_duid(hass, call)
         coord = _coordinator_for(hass, duid)
-        if call.data.get("here"):
-            x, y = _current_position_mm(coord, duid)
-        else:
-            x, y = _target_mm_for(hass, duid, call)
+        old = call.data.get("from_name")
+        has_point = call.data.get("here") or any(
+            k in call.data for k in ("x_pct", "y_pct", "x_home_px", "y_home_px")
+        )
         try:
+            if old and not has_point:
+                coord.rename_service_point(duid, old, call.data["name"])
+                return
+            if call.data.get("here"):
+                x, y = _current_position_mm(coord, duid)
+            else:
+                x, y = _target_mm_for(hass, duid, call)
+            if old and old != call.data["name"].strip():
+                coord.rename_service_point(duid, old, call.data["name"])
             coord.set_service_point(duid, call.data["name"], x, y)
         except ValueError as err:
             raise HomeAssistantError(f"anyvac.set_service_point: {err}") from err
