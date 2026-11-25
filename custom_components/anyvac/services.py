@@ -109,6 +109,9 @@ SERVICE_LIST_ASSETS = "list_assets"
 SERVICE_RESET_REACH = "reset_reach"
 SERVICE_FLOORPLAN_SCALE = "floorplan_scale"
 SERVICE_UPLOAD_ASSET = "upload_asset"
+SERVICE_SET_SERVICE_POINT = "set_service_point"
+SERVICE_REMOVE_SERVICE_POINT = "remove_service_point"
+SERVICE_GO_TO_SERVICE_POINT = "go_to_service_point"
 
 # docs/51 §1.4: config/www-relative folder the studio's Furniture tool lists.
 FURNITURE_DIR = ("anyvac", "furniture")
@@ -135,6 +138,9 @@ ADMIN_SERVICES: frozenset[str] = frozenset(
 
 ALL_SERVICES = (
     SERVICE_SELECT_ROOMS,
+    SERVICE_SET_SERVICE_POINT,
+    SERVICE_REMOVE_SERVICE_POINT,
+    SERVICE_GO_TO_SERVICE_POINT,
     SERVICE_PIN_ROOM,
     SERVICE_SET_LAYERS,
     SERVICE_EDIT_JOB,
@@ -436,6 +442,28 @@ ZONE_CLEAN_SCHEMA = vol.Schema(
     }
 )
 CANCEL_SCHEMA = vol.Schema({vol.Optional("return_to_base", default=True): bool})
+# docs/52 §5 item 7: named service points. The point comes like a goto target
+# (robot-map % or home-frame px) or, with `here: true`, from where the robot is.
+SET_SERVICE_POINT_SCHEMA = vol.Schema(
+    {
+        vol.Optional("entity_id"): str,
+        vol.Optional("duid"): str,
+        vol.Optional("name", default="Service point"): vol.All(str, vol.Length(min=1, max=40)),
+        vol.Optional("here", default=False): bool,
+        vol.Optional("frame", default="robot"): vol.In(["robot", "home"]),
+        vol.Optional("x_pct"): vol.All(vol.Coerce(float), vol.Range(min=0, max=100)),
+        vol.Optional("y_pct"): vol.All(vol.Coerce(float), vol.Range(min=0, max=100)),
+        vol.Optional("x_home_px"): vol.Coerce(float),
+        vol.Optional("y_home_px"): vol.Coerce(float),
+    }
+)
+SERVICE_POINT_TARGET_SCHEMA = vol.Schema(
+    {
+        vol.Optional("entity_id"): str,
+        vol.Optional("duid"): str,
+        vol.Optional("name"): vol.All(str, vol.Length(min=1, max=40)),
+    }
+)
 # docs/25 §7 field follow-up (2026-07-24): dock sheet actions (empty/wash/dry).
 # All three are dock-only self-maintenance commands — no coordinates, same target
 # resolution as goto/zone_clean (entity_id or duid).
@@ -1721,6 +1749,46 @@ def _target_mm_for(hass: HomeAssistant, duid: str, call: ServiceCall) -> tuple[i
     return _mm_for(hass, duid, call.data["x_pct"], call.data["y_pct"])
 
 
+def _coordinator_for(hass: HomeAssistant, duid: str) -> Any:
+    """The AnyVac coordinator that has this vacuum in its data."""
+    for coord in _coordinators(hass):
+        if duid in (coord.data or {}):
+            return coord
+    raise HomeAssistantError(f"anyvac: vacuum '{duid}' is not known to AnyVac (no map data yet)")
+
+
+def _job_rooms_for(jobs: list[Any], duid: str) -> list[str]:
+    """Rooms this vacuum still has queued, sent or being cleaned in any running job."""
+    return sorted({
+        r for job in jobs for it in job.items()
+        if it.get("duid") == duid and it.get("state") in ("queued", "sent", "active")
+        for r in it.get("rooms") or []
+    })
+
+
+def _current_position_mm(coord: Any, duid: str) -> tuple[float, float]:
+    """The robot's own mm position from the last map snapshot."""
+    pos = coord.data[duid].data.get("vacuum_position") or {}
+    if pos.get("x") is None or pos.get("y") is None:
+        raise HomeAssistantError(f"anyvac.set_service_point: position of '{duid}' is not known yet")
+    return pos["x"], pos["y"]
+
+
+def _pick_service_point(points: list[dict[str, Any]], name: str | None, duid: str) -> dict[str, Any]:
+    """The named point, or the only one when no name is given."""
+    if not points:
+        raise HomeAssistantError(f"anyvac: vacuum '{duid}' has no service point")
+    if name is None:
+        if len(points) > 1:
+            names = ", ".join(p["name"] for p in points)
+            raise HomeAssistantError(f"anyvac: vacuum '{duid}' has several service points ({names}) — give 'name'")
+        return points[0]
+    for p in points:
+        if p["name"] == name:
+            return p
+    raise HomeAssistantError(f"anyvac: vacuum '{duid}' has no service point '{name}'")
+
+
 def _target_zone_mm_for(
     hass: HomeAssistant, duid: str, call: ServiceCall
 ) -> tuple[tuple[int, int], tuple[int, int]]:
@@ -1884,7 +1952,9 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
                 wash=wash, context=call.context,
             )
             return {"job_id": runner.job_id, "added": [it["id"] for it in items]}
-        out: dict[str, Any] = {"job_id": job.job_id, "added": [], "removed": [], "moved": False, "reassigned": []}
+        out: dict[str, Any] = {
+            "job_id": job.job_id, "added": [], "removed": [], "moved": False, "reassigned": [], "updated": [],
+        }
         settings = call.data.get("settings") or job.settings
         mode = call.data.get("mode")
         try:
@@ -1904,6 +1974,19 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
                 items = [it for it in items if not all((r, it["kind"]) in busy for r in it["rooms"])]
                 wash = {it["duid"]: planner.wash_info(it["duid"]) for it in items}
                 out["added"] = job.add_items(items, wash)
+            if call.data.get("settings") and not add:
+                # New settings for the vacuums' rooms still to come and the room
+                # each one cleans right now (applied live).
+                planner, _ = _planner()
+                for kind, per_vac in call.data["settings"].items():
+                    for ref in per_vac:
+                        duid = planner._resolve_duid(str(ref))
+                        if duid is None:
+                            raise HomeAssistantError(f"anyvac.edit_job: unknown vacuum {ref}")
+                        fields = planner.settings_fields(duid, kind, call.data["settings"])
+                        out["updated"] += job.update_settings(duid, kind, fields)
+                if any(it["id"] in out["updated"] for it in job.items()):
+                    job.settings = {**(job.settings or {}), **call.data["settings"]}
             mv = call.data.get("move")
             if mv:
                 out["moved"] = job.move(mv["room"], mv.get("kind", "dry"), mv["index"])
@@ -1932,6 +2015,47 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
             "vacuum",
             "send_command",
             {"entity_id": entity, "command": "app_goto_target", "params": [x, y]},
+            blocking=True,
+            context=call.context,
+        )
+
+    async def _handle_set_service_point(call: ServiceCall) -> None:
+        duid = _resolve_target_duid(hass, call)
+        coord = _coordinator_for(hass, duid)
+        if call.data.get("here"):
+            x, y = _current_position_mm(coord, duid)
+        else:
+            x, y = _target_mm_for(hass, duid, call)
+        try:
+            coord.set_service_point(duid, call.data["name"], x, y)
+        except ValueError as err:
+            raise HomeAssistantError(f"anyvac.set_service_point: {err}") from err
+
+    async def _handle_remove_service_point(call: ServiceCall) -> None:
+        duid = _resolve_target_duid(hass, call)
+        removed = _coordinator_for(hass, duid).remove_service_point(duid, call.data.get("name"))
+        if call.data.get("name") and not removed:
+            raise HomeAssistantError(f"anyvac.remove_service_point: no point '{call.data['name']}' for '{duid}'")
+
+    async def _handle_go_to_service_point(call: ServiceCall) -> None:
+        duid = _resolve_target_duid(hass, call)
+        coord = _coordinator_for(hass, duid)
+        point = _pick_service_point(coord.service_points(duid), call.data.get("name"), duid)
+        # A goto would stop the room being cleaned and the queue would send the
+        # robot on right away — the job must let go of it first.
+        busy = _job_rooms_for(_active_jobs(hass), duid)
+        if busy:
+            raise HomeAssistantError(
+                f"anyvac.go_to_service_point: '{duid}' still has rooms in the running job "
+                f"({', '.join(busy)}) — cancel the job or remove them first"
+            )
+        entity = call.data.get("entity_id") or vacuum_entity_for_duid(hass, duid)
+        if not entity:
+            raise HomeAssistantError(f"anyvac.go_to_service_point: no vacuum entity for duid '{duid}'")
+        await hass.services.async_call(
+            "vacuum",
+            "send_command",
+            {"entity_id": entity, "command": "app_goto_target", "params": [point["x"], point["y"]]},
             blocking=True,
             context=call.context,
         )
@@ -2735,6 +2859,9 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
         (SERVICE_PLAN, _handle_plan, CLEAN_SCHEMA, SupportsResponse.ONLY),
         (SERVICE_GOTO, _handle_goto, GOTO_SCHEMA, SupportsResponse.NONE),
         (SERVICE_ZONE_CLEAN, _handle_zone_clean, ZONE_CLEAN_SCHEMA, SupportsResponse.NONE),
+        (SERVICE_SET_SERVICE_POINT, _handle_set_service_point, SET_SERVICE_POINT_SCHEMA, SupportsResponse.NONE),
+        (SERVICE_REMOVE_SERVICE_POINT, _handle_remove_service_point, SERVICE_POINT_TARGET_SCHEMA, SupportsResponse.NONE),
+        (SERVICE_GO_TO_SERVICE_POINT, _handle_go_to_service_point, SERVICE_POINT_TARGET_SCHEMA, SupportsResponse.NONE),
         (SERVICE_CANCEL, _handle_cancel, CANCEL_SCHEMA, SupportsResponse.NONE),
         (SERVICE_EDIT_JOB, _handle_edit_job, EDIT_JOB_SCHEMA, SupportsResponse.OPTIONAL),
         (SERVICE_DOCK_EMPTY, _handle_dock_empty, DOCK_TOGGLE_SCHEMA, SupportsResponse.NONE),

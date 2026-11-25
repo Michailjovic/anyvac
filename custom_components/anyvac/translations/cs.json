@@ -200,7 +200,7 @@
         },
         "settings": {
           "name": "Nastavení",
-          "description": "Nastavení přidaných místností — stejný tvar jako u anyvac.clean."
+          "description": "Stejný tvar jako u anyvac.clean. S „add“: nastavení přidaných místností. Samotné: nové nastavení uvedených vysavačů pro místnosti ve frontě i pro tu, kterou právě uklízí (hned)."
         }
       }
     },
@@ -379,6 +379,84 @@
         "duid": {
           "name": "Vysavač (duid)",
           "description": "Alternativa k entitě – duid vysavače."
+        }
+      }
+    },
+    "set_service_point": {
+      "name": "Nastavit servisní bod",
+      "description": "Uloží pojmenovaný bod vysavače (např. u koše) – kliknutím do mapy jako u Špendlíku, nebo s here: true z místa, kde robot právě stojí. Stejný název bod přepíše; max. 8 bodů na vysavač.",
+      "fields": {
+        "entity_id": {
+          "name": "Vysavač",
+          "description": "Entita vysavače."
+        },
+        "duid": {
+          "name": "Vysavač (duid)",
+          "description": "Alternativa k entitě – duid vysavače."
+        },
+        "name": {
+          "name": "Název",
+          "description": "Název bodu, jedinečný pro vysavač (max. 40 znaků)."
+        },
+        "here": {
+          "name": "Současná poloha",
+          "description": "Použít aktuální polohu robota místo x/y."
+        },
+        "frame": {
+          "name": "Souřadnicový rámec",
+          "description": "Percenta mapy (výchozí), nebo „home“ pro pixely rámce bytu."
+        },
+        "x_pct": {
+          "name": "X (%)",
+          "description": "Vodorovná poloha v procentech mapy."
+        },
+        "y_pct": {
+          "name": "Y (%)",
+          "description": "Svislá poloha v procentech mapy."
+        },
+        "x_home_px": {
+          "name": "X (px rámce bytu)",
+          "description": "Vodorovná poloha v pixelech rámce bytu."
+        },
+        "y_home_px": {
+          "name": "Y (px rámce bytu)",
+          "description": "Svislá poloha v pixelech rámce bytu."
+        }
+      }
+    },
+    "remove_service_point": {
+      "name": "Smazat servisní bod",
+      "description": "Smaže pojmenovaný servisní bod vysavače, bez názvu všechny jeho body.",
+      "fields": {
+        "entity_id": {
+          "name": "Vysavač",
+          "description": "Entita vysavače."
+        },
+        "duid": {
+          "name": "Vysavač (duid)",
+          "description": "Alternativa k entitě – duid vysavače."
+        },
+        "name": {
+          "name": "Název",
+          "description": "Název bodu, jedinečný pro vysavač (max. 40 znaků)."
+        }
+      }
+    },
+    "go_to_service_point": {
+      "name": "Jet na servisní bod",
+      "description": "Pošle vysavač na jeho servisní bod. Název je potřeba jen při víc bodech. Odmítne, dokud má vysavač místnosti v běžícím jobu. Domů pak vacuum.return_to_base.",
+      "fields": {
+        "entity_id": {
+          "name": "Vysavač",
+          "description": "Entita vysavače."
+        },
+        "duid": {
+          "name": "Vysavač (duid)",
+          "description": "Alternativa k entitě – duid vysavače."
+        },
+        "name": {
+          "name": "Název",
+          "description": "Název bodu, jedinečný pro vysavač (max. 40 znaků)."
         }
       }
     }

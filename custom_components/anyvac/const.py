@@ -18,6 +18,9 @@ SCAN_INTERVAL_SECONDS = 30
 # coordinator.py, which now preserves shape via Douglas-Peucker instead of
 # naive every-Nth-point stride).
 PATH_MAX_POINTS = 2000
+# Named service points per vacuum (docs/52 §5 item 7).
+SERVICE_POINTS_MAX = 8
+SERVICE_POINT_NAME_MAX = 40
 
 # Config-entry option (1.1.0): republish the legacy mm-space path arrays
 # (`path`, `mop_path`, `path_dry`, `path_wet`) on the map sensor.
@@ -63,4 +66,5 @@ STORE_KEYS: tuple[str, ...] = (
     "last_run",
     "reach_masks",
     "job",
+    "service_points",
 )

@@ -54,6 +54,8 @@ from .const import (
     PATH_MAX_POINTS,
     ROBOROCK_DOMAIN,
     SCAN_INTERVAL_SECONDS,
+    SERVICE_POINT_NAME_MAX,
+    SERVICE_POINTS_MAX,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -624,6 +626,49 @@ def _home_px_point(
     if p.get("a") is not None:
         out["a"] = round(_home_px_heading(p["a"], rec, frame), 1)
     return out
+
+
+def _parse_service_points(stored: Any) -> dict[str, list[dict[str, Any]]]:
+    """Load `{duid: [{name, x, y}]}` defensively — a malformed entry is dropped,
+    never the whole store (same posture as the other stores)."""
+    out: dict[str, list[dict[str, Any]]] = {}
+    if not isinstance(stored, dict):
+        return out
+    for duid, points in stored.items():
+        if not isinstance(points, list):
+            continue
+        kept: list[dict[str, Any]] = []
+        for p in points:
+            try:
+                name = str(p["name"]).strip()
+                x, y = float(p["x"]), float(p["y"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not name or not (math.isfinite(x) and math.isfinite(y)):
+                continue
+            if any(k["name"] == name for k in kept) or len(kept) >= SERVICE_POINTS_MAX:
+                continue
+            kept.append({"name": name[:SERVICE_POINT_NAME_MAX], "x": int(round(x)), "y": int(round(y))})
+        if kept:
+            out[str(duid)] = kept
+    return out
+
+
+def _room_at(rooms: list[dict[str, Any]], x: float, y: float) -> str | None:
+    """Name of the room whose mm bbox holds (x, y); the smallest one when
+    bboxes overlap (a bbox is coarser than the room's real shape)."""
+    best: tuple[float, str] | None = None
+    for r in rooms:
+        try:
+            x0, x1 = sorted((float(r["x0"]), float(r["x1"])))
+            y0, y1 = sorted((float(r["y0"]), float(r["y1"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if x0 <= x <= x1 and y0 <= y <= y1 and r.get("name"):
+            area = (x1 - x0) * (y1 - y0)
+            if best is None or area < best[0]:
+                best = (area, r["name"])
+    return best[1] if best else None
 
 
 def _frame_mm_to_home_px(fx_mm: float, fy_mm: float, frame: dict[str, Any]) -> list[float]:
@@ -1331,6 +1376,11 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # item so a Home Assistant restart resumes it. Written by the job runner.
         self._job_store: Store = Store(hass, 1, f"{DOMAIN}_job")
         self._job_saved: dict[str, Any] | None = None
+        # Named service points (docs/52 §5 item 7): {duid: [{name, x, y}]} in
+        # the robot's OWN mm — what `app_goto_target` takes, so going there
+        # needs no conversion. Persisted across restarts.
+        self._sp_store: Store = Store(hass, 1, f"{DOMAIN}_service_points")
+        self._service_points: dict[str, list[dict[str, Any]]] = {}
         # The room order set in the Roborock app, read from the robot
         # (`get_clean_sequence`, docs/52 O1): {duid: {room: position}} + when.
         # Only a batch dispatch (or a multi-room clean started outside AnyVac)
@@ -2458,6 +2508,73 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         data = await self._job_store.async_load()
         return data if isinstance(data, dict) and data.get("job_id") else None
 
+    # -- service points (docs/52 §5 item 7) -----------------------------------
+
+    def service_points(self, duid: str) -> list[dict[str, Any]]:
+        """This vacuum's named points, robot mm, in the order they were made."""
+        return [dict(p) for p in self._service_points.get(duid, [])]
+
+    def set_service_point(self, duid: str, name: str, x: float, y: float) -> None:
+        """Add or replace (same name) a named point. Raises ValueError when the
+        name is empty/too long or the vacuum already has SERVICE_POINTS_MAX."""
+        name = name.strip()
+        if not name or len(name) > SERVICE_POINT_NAME_MAX:
+            raise ValueError(f"name must be 1-{SERVICE_POINT_NAME_MAX} characters")
+        points = self._service_points.setdefault(duid, [])
+        point = {"name": name, "x": int(round(x)), "y": int(round(y))}
+        for i, p in enumerate(points):
+            if p["name"] == name:
+                points[i] = point
+                break
+        else:
+            if len(points) >= SERVICE_POINTS_MAX:
+                raise ValueError(f"a vacuum can hold at most {SERVICE_POINTS_MAX} service points")
+            points.append(point)
+        self._save_service_points()
+
+    def remove_service_point(self, duid: str, name: str | None = None) -> list[str]:
+        """Remove one named point, or all of the vacuum's points (name None).
+        Returns the names removed."""
+        points = self._service_points.get(duid, [])
+        if name is None:
+            removed = [p["name"] for p in points]
+            self._service_points.pop(duid, None)
+        else:
+            removed = [p["name"] for p in points if p["name"] == name]
+            rest = [p for p in points if p["name"] != name]
+            if rest:
+                self._service_points[duid] = rest
+            else:
+                self._service_points.pop(duid, None)
+        if removed:
+            self._save_service_points()
+        return removed
+
+    def _save_service_points(self) -> None:
+        self._delay_save(self._sp_store, lambda: self._service_points, 1)
+        # Publish at once rather than on the next poll (up to 30 s away).
+        for device in (self.data or {}).values():
+            aff = _solve_affine(device.data.get("calibration_points"))
+            device.data["service_points"] = self._published_service_points(device, aff)
+        self.async_update_listeners()
+
+    def _published_service_points(
+        self, device: AnyVacDevice, aff: tuple[float, ...] | None
+    ) -> list[dict[str, Any]]:
+        """`service_points` attribute: robot mm plus the same point in the
+        robot's image px (v2), the home frame px (v3) and the room it lies in."""
+        out: list[dict[str, Any]] = []
+        for p in getattr(self, "_service_points", {}).get(device.duid, []):
+            mm = {"x": p["x"], "y": p["y"]}
+            home = self.mm_to_home_px(device.duid, p["x"], p["y"])
+            out.append({
+                **p,
+                "px": _px_point(mm, aff) if aff is not None else None,
+                "home_px": {"x": round(home[0], 1), "y": round(home[1], 1)} if home else None,
+                "room": _room_at(device.data.get("rooms") or [], p["x"], p["y"]),
+            })
+        return out
+
     def set_task_item(self, duid: str, rooms: set[str] | None) -> None:
         """The room(s) of the queue item a job just sent to this robot — the
         measurement targets of the task (docs/52 §9.3). None = not known."""
@@ -3350,6 +3467,8 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         sel = await self._sel_store.async_load()
         if isinstance(sel, list):
             self._selected_rooms = {str(r) for r in sel}
+        sp_store = getattr(self, "_sp_store", None)  # absent in __new__-built test doubles
+        self._service_points = _parse_service_points(await sp_store.async_load() if sp_store else None)
         pins = await self._pins_store.async_load()
         if isinstance(pins, dict):
             # Per-kind format (2026-07-25+): {room: {"dry"/"wet": vacuum}}. A
@@ -4168,6 +4287,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                         device, path_dry, path_wet,
                         self._home_frames, self._robot_frame, self._home_frame_room_masks,
                     )
+                    device.data["service_points"] = self._published_service_points(device, aff)
                     # Legacy mm-space attributes (1.1.0). The card has not read
                     # any of these since Fáze 3 of the canon (docs/14) moved it
                     # onto the px contract — verified by scanning every attribute

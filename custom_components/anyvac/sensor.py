@@ -97,6 +97,8 @@ class AnyVacMapSensor(CoordinatorEntity[AnyVacCoordinator], SensorEntity):
             "path_dry_home_px", "path_wet_home_px",
             # docs/51 §2.5 — reach mask meta (the raster itself is the image entity).
             "reach",
+            # docs/52 §5 item 7 — named service points per vacuum.
+            "service_points",
         }
     )
 

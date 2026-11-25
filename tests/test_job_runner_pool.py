@@ -194,3 +194,66 @@ async def test_never_two_robots_in_one_room(monkeypatch) -> None:
     await rig.finish_room(s8, ["Corridor"])
     await rig.poll()
     assert rig.hass.services.sent("vacuum.s7") == [[17], [17]]
+
+
+def _wet(room: str, seg: int) -> dict:
+    it = item("s8", "vacuum.s8", "wet", room, seg, fan_speed="off",
+              selects=[{"entity_id": "select.s8_mop_intensity", "option": "standard"}])
+    it["watch"] = ["select.s8_mop_intensity", "select.s8_mop_mode"]
+    return it
+
+
+async def test_a_setting_changed_on_the_robot_is_kept_for_the_rest_of_the_queue(monkeypatch) -> None:
+    """User 2026-11-25: presets set the start; what the user then changes on
+    the robot (fan, mop intensity, mop mode) holds for the next rooms too."""
+    rig = Rig(monkeypatch)
+    s8 = rig.add("s8", "vacuum.s8", wet=True)
+    rig.hass.services.states["select.s8_mop_mode"] = "deep_plus"
+    runner = await _start(rig, [_wet("A", 1), _wet("B", 2)])
+    await rig.poll()  # took it: settings again, checked, baseline
+    first, second = runner.queues["s8"]["items"]
+    assert first.get("baseline")
+    # The user turns the robot down in the app.
+    s8.data["mop_signal"] = {"fan_speed_name": "quiet"}
+    rig.hass.services.states["select.s8_mop_intensity"] = "mild"
+    rig.hass.services.states["select.s8_mop_mode"] = "standard"
+    await rig.poll()
+    assert second["fan_speed"] == "quiet"
+    assert {s["entity_id"]: s["option"] for s in second["selects"]} == {
+        "select.s8_mop_intensity": "mild", "select.s8_mop_mode": "standard",
+    }
+    calls_before = len(rig.hass.services.calls)
+    await rig.finish_room(s8, ["A"])
+    sent = rig.hass.services.calls[calls_before:]
+    assert ("vacuum", "set_fan_speed", {"entity_id": "vacuum.s8", "fan_speed": "quiet"}) in sent
+    assert ("select", "select_option", {"entity_id": "select.s8_mop_intensity", "option": "mild"}) in sent
+    assert rig.coord.warnings == []  # the next room checks against the new values
+
+
+async def test_a_firmware_reset_while_returning_is_not_taken_as_a_change(monkeypatch) -> None:
+    """S7 MaxV resets the water when a task ends (docs/52 §8.2) — not the user."""
+    rig = Rig(monkeypatch)
+    s8 = rig.add("s8", "vacuum.s8", wet=True)
+    runner = await _start(rig, [_wet("A", 1), _wet("B", 2)])
+    await rig.poll()
+    second = runner.queues["s8"]["items"][1]
+    s8.data["status_state"] = "returning_home"
+    rig.hass.services.states["select.s8_mop_intensity"] = "mild"
+    await rig.poll()
+    assert {s["entity_id"]: s["option"] for s in second["selects"]} == {"select.s8_mop_intensity": "standard"}
+
+
+async def test_edit_job_settings_change_the_queue_and_the_room_being_cleaned(monkeypatch) -> None:
+    rig = Rig(monkeypatch)
+    s6 = rig.add("s6", "vacuum.s6")
+    runner = await _start(rig, [
+        item("s6", "vacuum.s6", "dry", "A", 1, fan_speed="max"),
+        item("s6", "vacuum.s6", "dry", "B", 2, fan_speed="max"),
+    ])
+    await rig.poll()
+    fields = {"selects": [], "fan_speed": "quiet", "repeat": 1,
+              "expect": {"fan_speed": "quiet", "mop_mode": None, "water_off": False}}
+    assert len(runner.update_settings("s6", "dry", fields)) == 2
+    await rig.drain()
+    assert s6.data["mop_signal"]["fan_speed_name"] == "quiet"  # live, now
+    assert runner.queues["s6"]["items"][1]["fan_speed"] == "quiet"

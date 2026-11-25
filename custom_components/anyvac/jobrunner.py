@@ -310,6 +310,8 @@ class JobRunner:
             if cur is not None:
                 if cur["state"] == "sent":
                     await self._check_accepted(q, cur, dd, now)
+                else:
+                    self._adopt_user_changes(q, cur, dd)
                 continue
             if all(it["state"] in FINAL for it in q["items"]):
                 q["phase"] = "done"
@@ -521,6 +523,91 @@ class JobRunner:
         for p in problems:
             _LOGGER.warning("AnyVac job %s: %s", self.job_id, p)
             self._warn(p)
+        if not self._closed and it["state"] == "active":
+            # From now on a change on the robot is the user's (docs/52 §3.3).
+            it["baseline"] = self._observe(it, self._device(duid))
+
+    # -- settings the user changes on the robot ----------------------------------------
+
+    def _observe(self, it: dict[str, Any], dd: dict[str, Any]) -> dict[str, Any]:
+        """The robot's current fan and mop selects, as far as they are known."""
+        out: dict[str, Any] = {}
+        fan = (dd.get("mop_signal") or {}).get("fan_speed_name")
+        if fan:
+            out["fan"] = str(fan)
+        states = getattr(self.hass, "states", None)
+        ents = set(it.get("watch") or []) | {s.get("entity_id") for s in it.get("selects") or []}
+        for ent in sorted(e for e in ents if e):
+            st = states.get(ent) if states is not None else None
+            if st is not None and st.state not in ("unknown", "unavailable"):
+                out[ent] = st.state
+        return out
+
+    @staticmethod
+    def _set_setting(it: dict[str, Any], key: str, value: str) -> None:
+        if key == "fan":
+            it["fan_speed"] = value
+            it.setdefault("expect", {})["fan_speed"] = value
+            return
+        sels = it.setdefault("selects", [])
+        for sel in sels:
+            if sel.get("entity_id") == key:
+                sel["option"] = value
+                break
+        else:
+            sels.append({"entity_id": key, "option": value})
+        exp = it.setdefault("expect", {})
+        if "mop_mode" in key and it.get("kind") == "wet":
+            exp["mop_mode"] = value
+        if "mop_intensity" in key and it.get("kind") == "dry":
+            exp["water_off"] = value == "off"
+
+    def _adopt_user_changes(self, q: dict[str, Any], it: dict[str, Any], dd: dict[str, Any]) -> None:
+        """A setting the user changed on the robot while it cleans (the app,
+        the card, a button) is kept: for this room and for every room of the
+        same pass still in this vacuum's queue. Only while the robot really
+        cleans — the firmware's own resets come when a task closes."""
+        base = it.get("baseline")
+        if base is None or dd.get("status_state") not in ACTIVE_STATES:
+            return
+        now = self._observe(it, dd)
+        changed = {k: v for k, v in now.items() if k in base and base[k] != v}
+        if not changed:
+            return
+        base.update(changed)
+        targets = [it] + [x for x in q["items"] if x["state"] == "queued" and x.get("kind") == it.get("kind")]
+        for key, value in changed.items():
+            for x in targets:
+                self._set_setting(x, key, value)
+        _LOGGER.info(
+            "AnyVac job %s: %s changed on the robot %s — kept for %d room(s)",
+            self.job_id, q["vacuum"], changed, len(targets),
+        )
+        self._save()
+
+    def update_settings(self, duid: str, kind: str, fields: dict[str, Any]) -> list[str]:
+        """New settings for one vacuum's pass (`anyvac.edit_job` settings):
+        every queued room of it, and the room it cleans right now (applied
+        live). `fields` = what `CleanPlanner.make_item` built: selects,
+        fan_speed, repeat, expect."""
+        q = self.queues.get(duid)
+        if q is None:
+            return []
+        changed: list[str] = []
+        for it in q["items"]:
+            if it.get("kind") != kind or it["state"] not in ("queued", "sent", "active"):
+                continue
+            for key in ("selects", "fan_speed", "expect"):
+                if key in fields:
+                    it[key] = fields[key]
+            if it["state"] == "queued" and "repeat" in fields:
+                it["repeat"] = fields["repeat"]
+            if it["state"] == "active":
+                it.pop("baseline", None)
+                self.hass.async_create_task(self._reapply_and_verify(duid, it))
+            changed.append(it["id"])
+        self._save()
+        return changed
 
     def _warn(self, text: str) -> None:
         if text not in self.warnings:

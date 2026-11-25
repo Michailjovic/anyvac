@@ -6,6 +6,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.61.0] - 2026-11-25
+
+Card unchanged (1.60.0); the card's buttons for it come after the mockups.
+Contains 1.60.2 when both are published together.
+
+- **Service points** (user request 2026-11-25, docs/52 §5 item 7). A named
+  point per vacuum — say S6 parked by the trash bin so it can be emptied,
+  then sent home. `anyvac.set_service_point` saves it from a map click (robot
+  map % or home-frame px, like `goto`) or from where the robot stands now
+  (`here: true`); the same name replaces it, up to 8 points per vacuum.
+  `anyvac.go_to_service_point` sends the robot there (`app_goto_target`) and
+  is refused while the vacuum still has rooms queued, sent or being cleaned
+  in a running job. `anyvac.remove_service_point` deletes one or all. Kept
+  in the robot's own mm (`.storage/anyvac_service_points`), so going there
+  needs no conversion; valid until the robot re-maps.
+- Sensor attribute `service_points`: `[{name, x, y, px, home_px, room}]` —
+  the point in the robot's image px (v2) and the home frame (v3), and the
+  room whose bbox holds it. Updated as soon as a point is saved. Not
+  recorded.
+- Tests: 10 for points, parsing, the room lookup, the job check; 568 in total.
+
+## [1.60.2] - 2026-11-25
+
+Pairs with card 1.60.0 (card unchanged). Settings changed during a job.
+
+- **Settings changed on the robot are kept for the rest of the queue** (user
+  request 2026-11-25). The presets set each room's start; once the robot took
+  a room and its settings were checked, a change of fan, mop intensity or mop
+  mode made on the robot (Roborock app, the card, a button) is taken over by
+  that room and by every room of the same pass still in the vacuum's queue.
+  Only while the robot really cleans — the firmware's own resets come when a
+  task closes (S7 MaxV's water on the way home) and are ignored. Items carry
+  `watch` (the robot's mop selects) and `baseline` (what was checked).
+- **`anyvac.edit_job` `settings` alone** (without `add`) changes the settings of
+  the listed vacuums' rooms still to come and of the room each one cleans now,
+  applied right away — no remove and add needed.
+- Tests: a setting changed on the robot (fails without the fix), a firmware
+  reset while returning, `edit_job` settings; 558 in total.
+
 ## [1.60.1] - 2026-11-25
 
 Pairs with card 1.60.0 (card unchanged). Fixes from the first field test of the
@@ -27,8 +66,8 @@ room-by-room jobs (2026-11-25, S6 Kitchen + S7 Bathroom dry, S8 mopping).
 - **Settings are applied again the moment the robot takes the room** (was 6 s
   later). S8 vacuumed the start of Corridor at its default fan in the meantime.
   The check after 20 s still catches the mop mode the firmware resets ~15 s in.
-- Tests: two robots in one room, the late tail after the return edge (both fail
-  without the fix); 555 in total.
+- Tests: two robots in one room, the late tail after the return edge (both
+  fail without the fix).
 
 ## [1.60.0] - 2026-11-25
 

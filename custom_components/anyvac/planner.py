@@ -579,6 +579,27 @@ class CleanPlanner:
         plan.update(timeline)
         return items, plan
 
+    def settings_fields(self, duid: str, kind: str, settings: dict[str, Any] | None) -> dict[str, Any]:
+        """The settings part of a queue item: what to send, what the robot
+        must then report (`expect`), and which mop selects to watch for a
+        change the user makes on the robot (docs/52 §3.3)."""
+        kind_settings = self._settings_for_duid(settings, kind, duid)
+        selects, fan = self._settings_calls(duid, kind, kind_settings)
+        mop_mode = kind_settings.get("mop_mode") if kind == "wet" else None
+        return {
+            "watch": sorted(set(selects_for_duid(self.hass, duid).values())),
+            "selects": selects,
+            "fan_speed": fan,
+            "repeat": max(1, int(kind_settings.get("repeat") or 1)),
+            "expect": {
+                "fan_speed": fan,
+                "mop_mode": mop_mode,
+                "water_off": kind == "dry" and any(
+                    s.get("option") == "off" for s in selects
+                ),
+            },
+        }
+
     def make_item(
         self,
         duid: str,
@@ -591,9 +612,6 @@ class CleanPlanner:
         """One queue item: everything the job runner needs to send it, check
         it was taken and re-apply the settings after the firmware reset them
         (docs/52 §3.3)."""
-        kind_settings = self._settings_for_duid(settings, kind, duid)
-        selects, fan = self._settings_calls(duid, kind, kind_settings)
-        mop_mode = kind_settings.get("mop_mode") if kind == "wet" else None
         return {
             "id": item_id,
             "vacuum": self.entity_of.get(duid),
@@ -603,17 +621,7 @@ class CleanPlanner:
             "room": rooms[0] if len(rooms) == 1 else None,
             "rooms": list(rooms),
             "segments": [self._segment_for(duid, r) for r in rooms],
-            "selects": selects,
-            "fan_speed": fan,
-            "repeat": max(1, int(kind_settings.get("repeat") or 1)),
-            # What the robot must report once it runs (`mop_signal`).
-            "expect": {
-                "fan_speed": fan,
-                "mop_mode": mop_mode,
-                "water_off": kind == "dry" and any(
-                    s.get("option") == "off" for s in selects
-                ),
-            },
+            **self.settings_fields(duid, kind, settings),
             "est_min": round(sum(
                 self._estimate(duid, r, kind) or DEFAULT_ROOM_MIN for r in rooms
             ), 1),
