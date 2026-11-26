@@ -48,7 +48,39 @@ def _dev(**d):
     return SimpleNamespace(duid="s6", data=base)
 
 
+def _push(co, level):
+    co._note_battery_push("s6", SimpleNamespace(properties_api=SimpleNamespace(status=SimpleNamespace(battery=level))))
+
+
+def test_drain_is_measured_between_level_changes(monkeypatch) -> None:
+    """1 % every 100 s (0.6 %/min). Map snapshots come every 45 s at their own
+    phase; the level changes are pushed when they happen. Edge to edge gives
+    the true rate; snapshot ends inside a 1 % step would not."""
+    t0 = c.dt_util.utcnow()
+    now = [t0]
+    co = _co(monkeypatch, now)
+    events = []
+    for k in range(8):                       # level 80 -> 72, a change every 100 s from t=30 s
+        events.append((30 + 100 * k, "push", 79 - k))
+    for k in range(20):                      # snapshots every 45 s
+        events.append((5 + 45 * k, "snap", None))
+    events.append((900, "dock", None))
+    level = 80
+    for sec, kind, val in sorted(events, key=lambda e: e[0]):
+        now[0] = t0 + timedelta(seconds=sec)
+        if kind == "push":
+            level = val
+            _push(co, level)
+        elif kind == "snap":
+            co._note_battery(_dev(battery=level))
+        else:
+            co._note_battery(_dev(battery=level, in_cleaning=False, status_state="charging"))
+            break
+    assert co._battery_learned["s6"]["drain"]["dry"] == pytest.approx(0.6, abs=0.005)
+
+
 def test_coordinator_learns_drain_and_charging(monkeypatch) -> None:
+    """Without pushes (snapshots only) it still learns, from the snapshot edges."""
     t0 = c.dt_util.utcnow()
     now = [t0]
     co = _co(monkeypatch, now)
@@ -57,16 +89,16 @@ def test_coordinator_learns_drain_and_charging(monkeypatch) -> None:
         now[0] = t0 + timedelta(minutes=minute)
         co._note_battery(_dev(**d))
 
-    for m in range(11):  # snapshots every minute, 0.6 %/min
-        at(m, battery=80 - round(0.6 * m))
-    at(11, battery=74, in_cleaning=False, status_state="charging")  # docked: closes
-    assert co._battery_learned["s6"]["drain"] == {"dry": 0.6, "dry@max": 0.6}
-    for m in range(12, 22):
-        at(m, battery=74 + round(0.5 * (m - 11)), in_cleaning=False, status_state="charging")
-    at(22, battery=80, in_cleaning=False, status_state="charging")  # now in "hi"
-    assert co._battery_learned["s6"]["charge"]["lo"] == pytest.approx(0.5, abs=0.06)
+    for m in range(11):
+        at(m, battery=80 - m // 2)            # a change every 2 min = 0.5 %/min
+    at(11, battery=75, in_cleaning=False, status_state="charging")
+    assert co._battery_learned["s6"]["drain"] == {"dry": 0.5, "dry@max": 0.5}
+    for m in range(12, 32):
+        at(m, battery=75 + (m - 11) // 4, in_cleaning=False, status_state="charging")
+    at(32, battery=80, in_cleaning=False, status_state="charging")  # now in "hi"
+    assert co._battery_learned["s6"]["charge"]["lo"] == pytest.approx(0.25, abs=0.01)
     assert len(co._battery_learned["s6"]["samples"]) == 2
-    assert co.battery_model("s6").drain_rate("dry", "max") == 0.6
+    assert co.battery_model("s6").drain_rate("dry", "max") == 0.5
 
 
 def test_short_segments_teach_nothing(monkeypatch) -> None:

@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.65.1] - 2026-11-26
+
+- **Battery rates are measured between level changes**, not between the ends
+  of a segment. The level is a whole number, so a segment starts and ends
+  anywhere inside a 1 % step — up to ~1.7 min of error at each end at 0.6 %/min
+  (~30 % on a 10-minute segment). Now: the time of each level change, the rate
+  from the first change to the last. The change is timed on the Roborock push
+  that carried it (the listener runs on every push), with the map snapshot as
+  the fallback. Test: 1 % every 100 s with snapshots at their own 45 s phase
+  reads 0.600 %/min (the old way: 0.561).
+- Tests: 602.
+
 ## [1.65.0] - 2026-11-26
 
 Card unchanged (1.62.1). The battery part of docs/53 (§5).

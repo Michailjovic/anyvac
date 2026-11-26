@@ -5,10 +5,14 @@ Learned from ordinary cleans, per robot:
   ("dry@max", "wet@balanced") when it is known;
 - charging speed in %/min below 80 % ("lo") and from 80 % up ("hi", slower).
 
-Segments of the same activity are read from the map snapshots (battery is a
-whole number, so a segment needs a few minutes and a few % to count). Each
-accepted segment is also kept as a sample (date, kind, setting, rate) — the
-later battery-health estimate (docs/53 §5 "později") needs that history.
+The rate is measured between EDGES — the moments the whole-number battery
+level changes — not between the ends of a segment: a segment starts and ends
+anywhere inside a 1 % step, which is up to ~1.7 min of error at each end at
+0.6 %/min; edge to edge leaves only the delay with which the change reached us
+(the coordinator records the level on every Roborock push, not only on map
+snapshots). Each accepted segment is also kept as a sample (date, kind,
+setting, rate) — the later battery-health estimate (docs/53 §5 "později")
+needs that history.
 
 Pure functions and a small tracker: no Home Assistant here.
 """
@@ -43,6 +47,15 @@ class Segment:
     b0: float
     t_last: datetime
     b_last: float
+    # (time, new level) of every level change seen inside the segment.
+    edges: list[tuple[datetime, float]] = field(default_factory=list)
+
+    def edge(self, at: datetime, level: float) -> None:
+        if self.edges and self.edges[-1][1] == level:
+            return
+        if not self.edges and level == self.b0:
+            return
+        self.edges.append((at, level))
 
 
 @dataclass
@@ -98,9 +111,13 @@ def activity(data: dict[str, Any], cleaning_states: set[str]) -> tuple[str | Non
 
 
 def close(seg: Segment) -> tuple[str, float] | None:
-    """(key, %/min) of a finished segment, or None when it is too short."""
-    minutes = (seg.t_last - seg.t0).total_seconds() / 60
-    delta = seg.b_last - seg.b0
+    """(key, %/min) of a finished segment from its first to its last level
+    change, or None when that span is too short."""
+    if len(seg.edges) < 2:
+        return None
+    (ta, ba), (tb, bb) = seg.edges[0], seg.edges[-1]
+    minutes = (tb - ta).total_seconds() / 60
+    delta = bb - ba
     if minutes < MIN_SEGMENT_MIN:
         return None
     if seg.mode.startswith("charge"):

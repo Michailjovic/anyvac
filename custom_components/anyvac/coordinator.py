@@ -2668,6 +2668,12 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         now = dt_util.utcnow()
         mode, setting = batterymod.activity(device.data, ACTIVE_CLEAN_STATES)
         seg = segs.get(device.duid)
+        if seg is not None and mode == seg.mode and setting == seg.setting:
+            # The level as of the last Roborock push, timed at the push.
+            pushed = getattr(self, "_bat_push", {}).get(device.duid)
+            if pushed is not None and pushed[0] > seg.t0:
+                seg.edge(pushed[0], pushed[1])
+            seg.edge(now, float(b))
         if seg is not None:
             gap = (now - seg.t_last).total_seconds() > batterymod.MAX_GAP_S
             if gap or seg.mode != mode or seg.setting != setting:
@@ -2685,6 +2691,24 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             segs[device.duid] = batterymod.Segment(mode, setting, now, float(b), now, float(b))
         else:
             seg.t_last, seg.b_last = now, float(b)
+
+    def _note_battery_push(self, duid: str | None, coord: Any) -> None:
+        """Time of each battery level change as Roborock pushes it — far closer
+        to the real moment than the next map snapshot (docs/53 §5)."""
+        if duid is None or not hasattr(self, "_bat_seg"):
+            return
+        status = getattr(getattr(coord, "properties_api", None), "status", None)
+        level = getattr(status, "battery", None)
+        if not isinstance(level, (int, float)):
+            return
+        pushes = self.__dict__.setdefault("_bat_push", {})
+        last = pushes.get(duid)
+        if last is None or last[1] != float(level):
+            now = dt_util.utcnow()
+            pushes[duid] = (now, float(level))
+            seg = self._bat_seg.get(duid)
+            if seg is not None and last is not None:
+                seg.edge(now, float(level))
 
     def _watch_transit(self, duid: str, rooms: set[str]) -> None:
         if not hasattr(self, "_transit_watch"):
@@ -4605,6 +4629,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         state change reaches us together with that map.
         """
         duid = getattr(coord, "duid", None)
+        self._note_battery_push(duid, coord)
         raw = _raw_map_bytes(coord)
         if duid is None or raw is None:
             return
