@@ -173,6 +173,46 @@ def simulate_queues(robots: dict[str, dict[str, Any]]) -> dict[str, tuple[float,
     return times
 
 
+def item_pct(dd: dict[str, Any], it: dict[str, Any]) -> int:
+    """Live % of an active queue item from the room-completion tracker."""
+    prog = dd.get("rooms_progress") or {}
+    vals = []
+    for room in it.get("rooms") or []:
+        raw = (prog.get(room) or {}).get(f"{it.get('kind')}_pct")
+        vals.append(int(raw) if isinstance(raw, (int, float)) else 0)
+    return round(sum(vals) / len(vals)) if vals else 0
+
+
+def live_robot_model(q: dict[str, Any], dd: dict[str, Any]) -> dict[str, Any]:
+    """`simulate_queues` input for one robot of the running job: the items
+    still to run, the active one reduced to what is left of it. Shared by the
+    coordinator (`job_progress`) and the runner (when to pre-wash)."""
+    items: list[dict[str, Any]] = []
+    prev_kind: str | None = None
+    for it in q.get("items") or []:
+        st = it.get("state")
+        if st in ("done", "blocked", "removed"):
+            prev_kind = it.get("kind")
+            continue
+        est = float(it.get("est_min") or 0.0)
+        if st == "active":
+            est *= 1 - min(item_pct(dd, it), 100) / 100
+        items.append({"id": it["id"], "kind": it.get("kind"), "rooms": it.get("rooms") or [], "est_min": est})
+    wash = q.get("wash") or {}
+    since = wash.get("mop_min_since_wash") or 0.0
+    return {
+        "items": items,
+        "wash_mode": wash.get("mode"),
+        "interval": wash.get("interval_min"),
+        "batch": bool(q.get("batch")),
+        "since_wash": since,
+        "prev_kind": prev_kind,
+        # The dock washed the mop during this job and it has not mopped since:
+        # the first wet room starts without the wash before it.
+        "pre_wash": not (wash.get("washed_at") and not since) and dd.get("mop_dirty") is not False,
+    }
+
+
 class CleanPlanner:
     """Builds an executable task plan from a clean intent."""
 
@@ -261,14 +301,26 @@ class CleanPlanner:
             return room
         return next((n for n, s in own.items() if s == seg), room)
 
-    def _estimate(self, duid: str, room: str, kind: str) -> float | None:
+    def _estimate(
+        self, duid: str, room: str, kind: str, repeat: int = 1, route: str | None = None
+    ) -> float | None:
+        """Learned minutes for `repeat` passes (estimates are per pass,
+        docs/52 §5a); a wet pass prefers the estimate of its mop route."""
         ests = (self.coord.rooms_estimate.get(duid)) or {}
         rec = ests.get(room)
         if not rec and self._paired_names():
             rec = ests.get(self._own_room_name(duid, room))
         rec = rec or {}
-        val = rec.get(kind) or rec.get("dry") or rec.get("wet")
-        return float(val) if val else None
+        val = (rec.get(f"wet@{str(route).lower()}") if kind == "wet" and route else None) \
+            or rec.get(kind) or rec.get("dry") or rec.get("wet")
+        return float(val) * max(1, int(repeat or 1)) if val else None
+
+    def _item_estimate(self, duid: str, room: str, kind: str, settings: dict[str, Any] | None) -> float:
+        ks = self._settings_for_duid(settings, kind, duid)
+        repeat = max(1, int(ks.get("repeat") or 1))
+        route = ks.get("mop_mode") if kind == "wet" else None
+        val = self._estimate(duid, room, kind, repeat, route)
+        return val if val is not None else DEFAULT_ROOM_MIN * repeat
 
     def _resolve_duid(self, ref: str) -> str | None:
         """Accept either a duid or any entity id of the vacuum."""
@@ -420,13 +472,18 @@ class CleanPlanner:
     def robot_model(self, duid: str, batch: bool = False) -> dict[str, Any]:
         """What `simulate_queues` needs to know about one robot."""
         mode, interval = self.wash_mode(duid)
-        return {"wash_mode": mode, "interval": interval, "batch": batch}
+        dev = (getattr(self.coord, "data", None) or {}).get(duid)
+        dd = getattr(dev, "data", None) or {}
+        # A mop the dock already washed needs no wash before the first wet room.
+        return {"wash_mode": mode, "interval": interval, "batch": batch,
+                "pre_wash": dd.get("mop_dirty") is not False}
 
     def _estimate_timeline(
         self,
         dry_assign: dict[str, list[str]],
         wet_assign: dict[str, list[str]],
         batch: set[str] | None = None,
+        settings: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Finish-time estimate of a job whose queues are already in order
         (``{duid: [room, ...]}`` per pass). Thin wrapper over `simulate_queues`,
@@ -439,13 +496,13 @@ class CleanPlanner:
                 if duid in batch:
                     r["items"].append({
                         "id": f"{kind}-{duid}-batch", "kind": kind, "rooms": list(rooms),
-                        "est_min": sum(self._estimate(duid, x, kind) or DEFAULT_ROOM_MIN for x in rooms),
+                        "est_min": sum(self._item_estimate(duid, x, kind, settings) for x in rooms),
                     })
                     continue
                 for i, room in enumerate(rooms):
                     r["items"].append({
                         "id": f"{kind}-{duid}-{i}", "kind": kind, "rooms": [room],
-                        "est_min": self._estimate(duid, room, kind) or DEFAULT_ROOM_MIN,
+                        "est_min": self._item_estimate(duid, room, kind, settings),
                     })
         times = simulate_queues(robots)
         room_finish: dict[str, dict[str, float]] = {"dry": {}, "wet": {}}
@@ -546,7 +603,7 @@ class CleanPlanner:
                 for d, rms in dry_assign.items()
                 if self.entity_of.get(d)
             }
-        dry_finish = self._estimate_timeline(dry_assign, {}, batch_duids)["timeline"]["dry"]
+        dry_finish = self._estimate_timeline(dry_assign, {}, batch_duids, settings)["timeline"]["dry"]
         if mode in ("wet", "both"):
             wet_assign, wet_un = self.assign(rooms, "wet", vacuums, self._pin_for_kind(pin, "wet"))
             if wet_un:
@@ -571,7 +628,7 @@ class CleanPlanner:
                         )
                     )
 
-        timeline = self._estimate_timeline(dry_assign, wet_assign, batch_duids)
+        timeline = self._estimate_timeline(dry_assign, wet_assign, batch_duids, settings)
         if not plan["unassigned"]:
             plan.pop("unassigned")
         if batch_duids:
@@ -622,7 +679,5 @@ class CleanPlanner:
             "rooms": list(rooms),
             "segments": [self._segment_for(duid, r) for r in rooms],
             **self.settings_fields(duid, kind, settings),
-            "est_min": round(sum(
-                self._estimate(duid, r, kind) or DEFAULT_ROOM_MIN for r in rooms
-            ), 1),
+            "est_min": round(sum(self._item_estimate(duid, r, kind, settings) for r in rooms), 1),
         }

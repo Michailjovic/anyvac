@@ -321,3 +321,68 @@ async def test_timer_callbacks_run_in_the_event_loop() -> None:
 
     assert is_callback(jr.JobRunner._on_timeout)
     assert is_callback(jr.JobRunner._on_coordinator_update)
+
+
+def _washes(rig, entity: str) -> int:
+    return sum(
+        1 for dom, svc, d in rig.hass.services.calls
+        if dom == "vacuum" and svc == "send_command" and d.get("command") == "app_start_wash" and d["entity_id"] == entity
+    )
+
+
+async def test_wet_robot_washes_its_mop_before_the_dry_pass_ends(monkeypatch) -> None:
+    """Field idea 2026-11-26: S8 waits in the dock for Kitchen's dry pass; it
+    washes a few minutes before the room is ready, not after it."""
+    rig = Rig(monkeypatch)
+    s6 = rig.add("s6", "vacuum.s6")
+    s8 = rig.add("s8", "vacuum.s8", wet=True)
+    runner = await _start(rig, [
+        item("s6", "vacuum.s6", "dry", "Kitchen", 3, est=10.0),
+        item("s8", "vacuum.s8", "wet", "Kitchen", 3, est=10.0),
+    ], wash={"s8": {"mode": "room", "interval_min": 15}})
+    await rig.poll()
+    assert _washes(rig, "vacuum.s8") == 0  # ~10 min to go: too early
+    s6.data["rooms_progress"] = {"Kitchen": {"dry_pct": 70}}  # ~3 min left
+    await rig.poll()
+    assert _washes(rig, "vacuum.s8") == 1
+    assert runner.queues["s8"]["prewash_for"] == "wet-s8-Kitchen"
+    await rig.poll()
+    assert _washes(rig, "vacuum.s8") == 1  # once
+    assert runner.queues["s8"]["wash"].get("washed_at")
+    # Washed and not mopped since: the room starts without a wash first.
+    from custom_components.anyvac.planner import live_robot_model
+    assert live_robot_model(runner.queues["s8"], s8.data)["pre_wash"] is False
+    # The dry pass ends while it still washes: it waits, then goes.
+    await rig.finish_room(s6, ["Kitchen"])
+    assert rig.hass.services.sent("vacuum.s8") == []
+    s8.data["status_state"] = "charging"
+    await rig.poll()
+    assert rig.hass.services.sent("vacuum.s8") == [[3]]
+
+
+async def test_no_pre_wash_without_a_washing_dock_or_when_the_mop_is_clean(monkeypatch) -> None:
+    rig = Rig(monkeypatch)
+    s6 = rig.add("s6", "vacuum.s6")
+    rig.add("s7", "vacuum.s7", wet=True)
+    rig.add("s8", "vacuum.s8", wet=True)
+    runner = await _start(rig, [
+        item("s6", "vacuum.s6", "dry", "Kitchen", 3, est=2.0),
+        item("s7", "vacuum.s7", "wet", "Kitchen", 3, est=10.0),
+        item("s8", "vacuum.s8", "wet", "Kitchen", 3, est=10.0),
+    ], wash={"s7": {"mode": None}, "s8": {"mode": "room", "interval_min": 15, "washed_at": "2026-11-25T17:59:00+00:00"}})
+    await rig.poll()
+    assert _washes(rig, "vacuum.s7") == 0
+    assert _washes(rig, "vacuum.s8") == 0
+
+
+async def test_no_pre_wash_when_the_dock_washed_the_mop_after_its_last_mopping(monkeypatch) -> None:
+    rig = Rig(monkeypatch)
+    rig.add("s6", "vacuum.s6")
+    s8 = rig.add("s8", "vacuum.s8", wet=True)
+    s8.data["mop_dirty"] = False
+    await _start(rig, [
+        item("s6", "vacuum.s6", "dry", "Kitchen", 3, est=2.0),
+        item("s8", "vacuum.s8", "wet", "Kitchen", 3, est=10.0),
+    ], wash={"s8": {"mode": "room", "interval_min": 15}})
+    await rig.poll()
+    assert _washes(rig, "vacuum.s8") == 0

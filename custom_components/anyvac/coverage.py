@@ -272,6 +272,9 @@ class RunTracker:
         self.done: list[str] = []
         self.activated: list[str] = []
         self.passes: int = 1
+        # Mop route of a wet run (`mop_route_name`, e.g. "deep_plus"), read while
+        # the robot mops — the firmware resets it when the task closes.
+        self.route: str | None = None
         self.ignored: dict[str, float] = {}
         self._cand: str | None = None
         self._cand_len = 0.0

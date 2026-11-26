@@ -82,6 +82,11 @@ FREE_STATES = {
 }
 DOCKED_STATES = {"charging", "charging_complete"}
 FINAL = {"done", "blocked", "removed"}
+# Pre-wash (field idea 2026-11-26): a wet robot waiting in the dock for the dry
+# pass of its next room starts the mop wash this long before that room is
+# expected to be ready, so it can leave the moment the dry robot does instead
+# of washing first (~3 min, `planner.PRE_WASH_MIN`).
+PREWASH_LEAD_MIN = 4.0
 
 
 def _active_jobs(hass: HomeAssistant) -> list[JobRunner]:
@@ -327,6 +332,7 @@ class JobRunner:
             nxt = self._next_ready(q)
             if nxt is None:
                 q["phase"] = "waiting_gate"
+                await self._maybe_prewash(q, dd)
                 continue
             if not self._robot_free(dd):
                 continue
@@ -738,7 +744,62 @@ class JobRunner:
     def note_washed(self, duid: str) -> None:
         q = self.queues.get(duid)
         if q is not None:
-            q.setdefault("wash", {})["mop_min_since_wash"] = 0.0
+            wash = q.setdefault("wash", {})
+            wash["mop_min_since_wash"] = 0.0
+            wash["washed_at"] = _iso(dt_util.utcnow())
+
+    def _gate_eta_min(self, it: dict[str, Any]) -> float | None:
+        """Minutes until the dry pass of `it`'s room(s) is expected to end —
+        the same timing model as the plan and `job_progress`."""
+        from .planner import live_robot_model, simulate_queues  # local, as in the coordinator
+
+        robots = {duid: live_robot_model(q, self._device(duid)) for duid, q in self.queues.items()}
+        times = simulate_queues(robots)
+        rooms = set(it.get("rooms") or [])
+        ends = [
+            times[o["id"]][1]
+            for o in self.items()
+            if o.get("kind") == "dry" and o["state"] not in FINAL and rooms & set(o.get("rooms") or []) and o["id"] in times
+        ]
+        return max(ends) if ends else None
+
+    async def _maybe_prewash(self, q: dict[str, Any], dd: dict[str, Any]) -> None:
+        """Wash the mop while the wet robot waits for its next room, timed to be
+        done when the room is ready. Only when the robot sits in the dock, the
+        dock washes (a wash mode is known), the mop is not clean already, and
+        the room is expected within `PREWASH_LEAD_MIN`."""
+        nxt = next((it for it in q["items"] if it["state"] == "queued"), None)
+        if nxt is None or nxt.get("kind") != "wet" or q.get("batch") or q.get("prewash_for") == nxt["id"]:
+            return
+        wash = q.get("wash") or {}
+        if not wash.get("mode"):
+            return
+        if wash.get("washed_at") and not wash.get("mop_min_since_wash"):
+            return  # washed in this job and has not mopped since
+        if dd.get("mop_dirty") is False:
+            return  # the dock washed it after its last mopping
+        state = dd.get("status_state")
+        if not self._docked(dd) or state in WASH_STATES or state == "error":
+            return
+        eta = self._gate_eta_min(nxt)
+        if eta is None or eta > PREWASH_LEAD_MIN:
+            if eta is not None:
+                self._schedule(f"prewash-{q['duid']}", max(30.0, (eta - PREWASH_LEAD_MIN) * 60))
+            return
+        q["prewash_for"] = nxt["id"]
+        try:
+            await self.hass.services.async_call(
+                "vacuum", "send_command",
+                {"entity_id": q["vacuum"], "command": "app_start_wash"},
+                blocking=True, context=self.context,
+            )
+        except Exception as err:  # noqa: BLE001 - a missed wash only costs the old ~3 min
+            _LOGGER.warning("AnyVac job %s: pre-wash for %s failed: %s", self.job_id, q["vacuum"], err)
+            return
+        q["phase"] = "washing"
+        _LOGGER.info("AnyVac job %s: %s washes its mop now, %s ready in ~%.1f min",
+                     self.job_id, q["vacuum"], nxt.get("rooms"), eta)
+        self._save()
 
     # -- reports ---------------------------------------------------------------------------
 

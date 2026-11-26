@@ -38,7 +38,8 @@ or mm math on the card side:
 | `path_dry_px` | dry-clean trajectory, as **segments** (list of point-lists — one contiguous run per segment, so gaps from transit/mop-wash aren't bridged with a straight line) |
 | `path_wet_px` | mop trajectory, flat list of `{x, y}` pixels |
 | `rooms` | `[{segment_id, name, bbox_px:{x0,y0,x1,y1}, pos_x, pos_y, estimate_dry, estimate_wet, progress_pct}, …]` |
-| `rooms_estimate` | learned per-room clean-time estimates in minutes: `{room: {dry, wet}}` (docs/16 continuous calibration) |
+| `rooms_estimate` | learned per-room clean-time estimates in minutes **per pass**: `{room: {dry, wet, "wet@<mop route>"}}` (docs/16, per pass and route since 1.63.0) |
+| `mop_dirty` | has the mop mopped since the dock last washed it (`null` until seen); drives the pre-wash while a wet robot waits for its room (1.63.0) |
 | `rooms_progress` | per-room debug progress: `{room: {spatial_pct, visited_cells, total_cells, time_pct, elapsed_s, est_s}}` |
 | `rooms_last_cleaned` | per-room last-cleaned info by clean type (mirrors the timestamp sensors below) |
 | `room_pins` / `selected_rooms` / `view_layers` | orchestration/UI state the card reads and writes via services below (`room_sequence` stays empty since 1.60.0) |

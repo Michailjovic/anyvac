@@ -108,6 +108,8 @@ class FakeServices:
             if service == "send_command" and data.get("command") == "app_segment_clean":
                 p = data["params"][0]
                 robot.command(p["segments"], p.get("repeat", 1))
+            elif service == "send_command" and data.get("command") == "app_start_wash":
+                robot.data["status_state"] = "washing_the_mop"
             elif service == "pause":
                 robot.data["status_state"] = "paused"
             elif service == "return_to_base":
@@ -121,7 +123,8 @@ class FakeServices:
         return [
             d["params"][0]["segments"]
             for dom, svc, d in self.calls
-            if dom == "vacuum" and svc == "send_command" and (entity is None or d["entity_id"] == entity)
+            if dom == "vacuum" and svc == "send_command" and d.get("command") == "app_segment_clean"
+            and (entity is None or d["entity_id"] == entity)
         ]
 
     def count(self, domain: str, service: str, entity: str | None = None) -> int:

@@ -1324,6 +1324,8 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # files, overwriting newer data with the old snapshot — or the pending
         # write was simply lost.
         self._pending_saves: dict[Store, Callable[[], Any]] = {}
+        # duid -> has the mop mopped since its last wash (None = not seen yet).
+        self._mop_dirty: dict[str, bool] = {}
         self._store: Store = Store(hass, 1, f"{DOMAIN}_room_history")
         # Read once at construction: `__init__.py` reloads the entry on an
         # options change (`async_update_listener`), so a new coordinator picks
@@ -1972,8 +1974,9 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 for rnm in list(rooms):
                     if room and rnm != room:
                         continue
-                    for k in kinds:
-                        rooms[rnm].pop(k, None)
+                    for k in list(rooms[rnm]):
+                        if k.split("@")[0] in kinds:  # "wet@deep_plus" is wet
+                            rooms[rnm].pop(k, None)
                     if not rooms[rnm]:
                         rooms.pop(rnm)
 
@@ -2384,40 +2387,17 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         self.async_update_listeners()
 
     def _live_robot_model(self, duid: str, q: dict[str, Any]) -> dict[str, Any]:
-        """`planner.simulate_queues` input for one robot of the running job:
-        the items still to run, the active one reduced to what is left of it."""
+        """`planner.live_robot_model` with this robot's device data."""
+        from .planner import live_robot_model  # local: planner imports nothing from here
+
         dev = (self.data or {}).get(duid)
-        dd = getattr(dev, "data", None) or {}
-        items: list[dict[str, Any]] = []
-        prev_kind: str | None = None
-        for it in q.get("items") or []:
-            st = it.get("state")
-            if st in ("done", "blocked", "removed"):
-                prev_kind = it.get("kind")
-                continue
-            est = float(it.get("est_min") or 0.0)
-            if st == "active":
-                est *= 1 - min(self._item_pct(dd, it), 100) / 100
-            items.append({"id": it["id"], "kind": it.get("kind"), "rooms": it.get("rooms") or [], "est_min": est})
-        wash = q.get("wash") or {}
-        return {
-            "items": items,
-            "wash_mode": wash.get("mode"),
-            "interval": wash.get("interval_min"),
-            "batch": bool(q.get("batch")),
-            "since_wash": wash.get("mop_min_since_wash") or 0.0,
-            "prev_kind": prev_kind,
-        }
+        return live_robot_model(q, getattr(dev, "data", None) or {})
 
     @staticmethod
     def _item_pct(dd: dict[str, Any], it: dict[str, Any]) -> int:
-        """Live % of an active item from the room-completion tracker."""
-        prog = dd.get("rooms_progress") or {}
-        vals = []
-        for room in it.get("rooms") or []:
-            raw = (prog.get(room) or {}).get(f"{it.get('kind')}_pct")
-            vals.append(int(raw) if isinstance(raw, (int, float)) else 0)
-        return round(sum(vals) / len(vals)) if vals else 0
+        from .planner import item_pct
+
+        return item_pct(dd, it)
 
     @property
     def job_progress(self) -> dict[str, Any]:
@@ -2709,7 +2689,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         single-room clean. Estimates are kept PER VACUUM because cleaning speeds differ
         between models — they are never shared across vacuums. Rolling average (first
         sample = the measured value, then weighted). Returns (before, after)."""
-        if kind not in ("dry", "wet") or not (1 <= minutes <= 180):
+        if not (kind in ("dry", "wet") or str(kind).startswith("wet@")) or not (1 <= minutes <= 180):
             return None, None
         rec = self._estimates.setdefault(duid, {}).setdefault(room, {})
         before = rec.get(kind)
@@ -2949,6 +2929,9 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             rep = device.data.get("repeat")
             if isinstance(rep, int) and 1 <= rep <= 3:
                 run.passes = rep
+            route = (device.data.get("mop_signal") or {}).get("mop_route_name")
+            if device.data.get("clean_type") == "wet" and route:
+                run.route = str(route).lower()
         geo = self._update_geometry(device)
         if geo is None or not geo.rooms:
             return
@@ -3411,8 +3394,13 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     rec[kind] = pct
                     rec[f"{kind}_floor"] = res["floor"]
                     coverage_changed = True
+        passes = max(1, int(run.passes or 1))
         for nm, sec in sorted((self._room_elapsed.get(duid) or {}).items()):
             active_min = round(sec / 60)
+            # Estimates are learned PER PASS (docs/52 §5a): a room cleaned twice
+            # takes about twice as long, and the planner multiplies by the
+            # item's `repeat` (field: S8 Living room on 2 passes read half).
+            per_pass = sec / 60 / passes
             room_rec: dict[str, Any] = {"active_min": active_min}
             for kind in covmod.KINDS:
                 res = run.kind_result(geo, nm, kind)
@@ -3431,7 +3419,10 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 elif not (1 <= active_min <= 180):
                     krec["accepted"], krec["reason"] = False, "active time out of 1-180 min range"
                 else:
-                    before, after = self._learn_estimate(duid, nm, kind, active_min)
+                    before, after = self._learn_estimate(duid, nm, kind, per_pass)
+                    if after is not None and kind == "wet" and run.route:
+                        # Per mop route too: deep+ is far slower than standard.
+                        self._learn_estimate(duid, nm, f"wet@{run.route}", per_pass)
                     if after is not None:
                         krec["accepted"], krec["reason"] = True, "ok"
                         krec["before"], krec["after"] = before, after
@@ -4906,6 +4897,18 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             data["vacuum_room_name"] = names.get(vr)
 
         duid = getattr(coord, "duid", None) or "unknown"
+        # Has the mop mopped since the dock last washed it? The firmware washes
+        # before a task from the dock when it has, and the runner pre-washes
+        # while the robot waits (jobrunner `_maybe_prewash`). Unknown (None)
+        # after a restart until one of the two is seen.
+        dirty = getattr(self, "_mop_dirty", None) if self is not None else None
+        if isinstance(dirty, dict):
+            if data.get("status_state") in ("washing_the_mop", "washing_the_mop_2"):
+                dirty[duid] = False
+            elif data.get("in_cleaning") and data["clean_type"] == "wet" and not data.get("water_off") \
+                    and data.get("status_state") not in ("returning_home", "docking", "charging", "charging_complete", "idle", "paused"):
+                dirty[duid] = True
+            data["mop_dirty"] = dirty.get(duid)
         slug = getattr(coord, "duid_slug", None) or duid
         name = getattr(getattr(coord, "device", None), "name", None) or slug
         return AnyVacDevice(duid=duid, slug=slug, name=name, data=data)

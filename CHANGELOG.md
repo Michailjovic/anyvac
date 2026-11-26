@@ -6,6 +6,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.63.0] - 2026-11-26
+
+Card unchanged (1.62.1). Two pieces of docs/52 §5a.
+
+- **Pre-wash while waiting.** A wet robot that waits in the dock for the dry
+  pass of its next room now washes its mop about 4 minutes before that room is
+  expected to be ready (`app_start_wash`), so it leaves as soon as the dry
+  robot is out instead of washing first (~3 min). Only when the dock washes
+  (a wash mode is known), the job is room by room, and the mop is not clean
+  already. The expected time comes from the same model as the plan and
+  `job_progress`. The ETA already counted the wait and the wash as
+  overlapping; now the robot does it that way.
+- **`mop_dirty`** on the sensor: has the mop mopped since the dock last
+  washed it (`null` until seen after a restart). A clean mop gets no pre-wash,
+  and the plan leaves out the wash before its first wet room.
+- **Estimates per pass and per mop route.** A room's learned time is now per
+  pass; the plan multiplies it by the item's `repeat`. A wet pass also learns
+  per mop route (`wet@deep_plus` next to `wet` in `rooms_estimate`) and the
+  plan uses it when the preset's mop mode has a sample. Field: S8 Living room
+  on 2 passes was estimated at about half. Values learned before this release
+  were whole cleans, mostly of one pass; they are reset with 2.0.0 (docs/52 R4).
+  `anyvac.reset_learning` with `kind: wet` also clears the route entries.
+- Moved the live robot model of `job_progress` to `planner.live_robot_model`
+  (shared with the runner), no change in output.
+- Tests: 582 (pre-wash timing / once / clean mop / no washing dock, per-pass
+  and per-route estimates and learning).
+
 ## [1.62.1] - 2026-11-26
 
 Pairs with card 1.62.1. Field fixes: on 2026-11-26 the queue vanished mid-clean
