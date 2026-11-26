@@ -40,6 +40,7 @@ from homeassistant.util import dt as dt_util
 from . import coverage as covmod
 from . import homeframe, livediff, localchannel
 from . import reach as reachmod
+from . import battery as batterymod
 from . import transit as transitmod
 from .const import (
     DEFAULT_EXPOSE_LEGACY_MM,
@@ -1413,6 +1414,11 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         self._transit_busy: set[str] = set()
         self._transit_watch: dict[str, dict[str, Any]] = {}
         self._last_task_room: dict[str, str] = {}
+        # docs/53 §5: learned drain / charging speed per robot (+ samples for
+        # the later battery-health estimate), and the open measuring segment.
+        self._battery_store: Store = Store(hass, 1, f"{DOMAIN}_battery")
+        self._battery_learned: dict[str, dict[str, Any]] = {}
+        self._bat_seg: dict[str, batterymod.Segment] = {}
         self._service_points: dict[str, list[dict[str, Any]]] = {}
         # The room order set in the Roborock app, read from the robot
         # (`get_clean_sequence`, docs/52 O1): {duid: {room: position}} + when.
@@ -2402,7 +2408,10 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         from .planner import live_robot_model  # local: planner imports nothing from here
 
         dev = (self.data or {}).get(duid)
-        return live_robot_model(q, getattr(dev, "data", None) or {}, self.transit_minutes(duid), self.robot_place(duid))
+        return live_robot_model(
+            q, getattr(dev, "data", None) or {}, self.transit_minutes(duid), self.robot_place(duid),
+            self.battery_model(duid),
+        )
 
     @staticmethod
     def _item_pct(dd: dict[str, Any], it: dict[str, Any]) -> int:
@@ -2642,6 +2651,40 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         if not dd.get("in_cleaning") or dd.get("status_state") in ("charging", "charging_complete"):
             return transitmod.DOCK
         return getattr(self, "_last_task_room", {}).get(duid) or transitmod.DOCK
+
+    def battery_model(self, duid: str) -> batterymod.Model:
+        """Learned drain / charging speed of one robot, defaults filled in."""
+        return batterymod.model_from(getattr(self, "_battery_learned", {}).get(duid))
+
+    def _note_battery(self, device: AnyVacDevice) -> None:
+        """Measure drain while cleaning and charging speed while charging, in
+        segments of one activity (docs/53 §5)."""
+        segs = getattr(self, "_bat_seg", None)
+        if segs is None:
+            return
+        b = device.data.get("battery")
+        if not isinstance(b, (int, float)):
+            return
+        now = dt_util.utcnow()
+        mode, setting = batterymod.activity(device.data, ACTIVE_CLEAN_STATES)
+        seg = segs.get(device.duid)
+        if seg is not None:
+            gap = (now - seg.t_last).total_seconds() > batterymod.MAX_GAP_S
+            if gap or seg.mode != mode or seg.setting != setting:
+                segs.pop(device.duid, None)
+                res = batterymod.close(seg)
+                if res is not None:
+                    batterymod.learn(
+                        self._battery_learned.setdefault(device.duid, {}), res[0], res[1], seg.setting, now
+                    )
+                    self._delay_save(self._battery_store, lambda: self._battery_learned, 30)
+                seg = None
+        if mode is None:
+            return
+        if seg is None:
+            segs[device.duid] = batterymod.Segment(mode, setting, now, float(b), now, float(b))
+        else:
+            seg.t_last, seg.b_last = now, float(b)
 
     def _watch_transit(self, duid: str, rooms: set[str]) -> None:
         if not hasattr(self, "_transit_watch"):
@@ -3604,6 +3647,10 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         sel = await self._sel_store.async_load()
         if isinstance(sel, list):
             self._selected_rooms = {str(r) for r in sel}
+        bat_store = getattr(self, "_battery_store", None)
+        bat = await bat_store.async_load() if bat_store else None
+        if isinstance(bat, dict):
+            self._battery_learned = {str(d): dict(v) for d, v in bat.items() if isinstance(v, dict)}
         tr_store = getattr(self, "_transit_store", None)
         tr = await tr_store.async_load() if tr_store else None
         if isinstance(tr, dict):
@@ -4325,6 +4372,12 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     self._track_and_emit(device)
                     self._attribute_points(device)
                     self._note_transit(device)
+                    self._note_battery(device)
+                    lb = self._battery_learned.get(device.duid) or {}
+                    device.data["battery_model"] = {
+                        "drain": lb.get("drain") or {}, "charge": lb.get("charge") or {},
+                        "samples": len(lb.get("samples") or []),
+                    }
                     self._maybe_update_transit(device)
                     device.data["travel_min"] = self.transit_minutes(device.duid) or None
                     self._maybe_harvest_pending(device)

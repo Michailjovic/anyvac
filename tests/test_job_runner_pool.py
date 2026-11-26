@@ -417,3 +417,35 @@ async def test_replanning_leaves_a_room_placed_by_hand(monkeypatch) -> None:
     ])
     assert rig.hass.services.sent("vacuum.s6")[0] == [1]
     assert [it["room"] for it in runner.queues["s6"]["items"]] == ["Big", "Small"]
+
+
+async def test_a_room_that_does_not_fit_the_battery_waits_for_a_charge(monkeypatch) -> None:
+    """docs/53 §5: 40 % and a 20-min room at 1 %/min would leave 20 % (< 25):
+    charge to 20 + 20 + 3 = 43... at least 25 + 20 + 1 = 46 %, then go."""
+    from custom_components.anyvac import battery as bm
+
+    rig = Rig(monkeypatch)
+    s6 = rig.add("s6", "vacuum.s6", battery=40)
+    rig.coord.battery_model = lambda duid: bm.Model(drain={"dry": 1.0})
+    runner = await _start(rig, [item("s6", "vacuum.s6", "dry", "A", 1, est=20.0)])
+    assert rig.hass.services.sent("vacuum.s6") == []
+    assert runner.queues["s6"]["phase"] == "charging"
+    assert runner.queues["s6"]["charging_to"] == 46.0
+    s6.data["battery"] = 45
+    await rig.poll()
+    assert rig.hass.services.sent("vacuum.s6") == []
+    s6.data["battery"] = 46
+    await rig.poll()
+    assert rig.hass.services.sent("vacuum.s6") == [[1]]
+
+
+async def test_a_robot_stopped_away_from_the_dock_is_sent_home_to_charge(monkeypatch) -> None:
+    from custom_components.anyvac import battery as bm
+
+    rig = Rig(monkeypatch)
+    s6 = rig.add("s6", "vacuum.s6", battery=30)
+    s6.data.update(in_cleaning=True, status_state="idle")
+    rig.coord.battery_model = lambda duid: bm.Model(drain={"dry": 1.0})
+    await _start(rig, [item("s6", "vacuum.s6", "dry", "A", 1, est=20.0)])
+    await rig.poll()
+    assert rig.hass.services.count("vacuum", "return_to_base", "vacuum.s6") == 1

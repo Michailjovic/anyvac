@@ -372,7 +372,42 @@ class JobRunner:
         battery = dd.get("battery")
         if docked and isinstance(battery, (int, float)) and battery < MIN_START_BATTERY:
             return "charging"
-        return None
+        return self._battery_wait(q, it, dd)
+
+    def _battery_wait(self, q: dict[str, Any], it: dict[str, Any], dd: dict[str, Any]) -> str | None:
+        """docs/53 §5: send a room only when the battery stays at or above the
+        reserve after it (travel included). Otherwise charge — to 20 % + what
+        the rest of this robot's queue needs + 3 % (P1) — and then go on."""
+        from .planner import battery_need, charge_goal, needs_charge
+
+        battery = dd.get("battery")
+        if not isinstance(battery, (int, float)):
+            return None
+        goal = q.get("charging_to")
+        if goal is not None:
+            if battery < goal and battery < 100 and dd.get("status_state") != "charging_complete":
+                return "charging"
+            q.pop("charging_to", None)
+            q.pop("sent_home", None)
+            return None
+        model = self._robot_model(q["duid"], q)
+        row = next((x for x in model["items"] if x["id"] == it["id"]), None)
+        if row is None or model.get("bat") is None:
+            return None
+        need = battery_need(model, row, model.get("place"))
+        if not needs_charge(battery, need):
+            return None
+        rest = sum(battery_need(model, x, None) for x in model["items"])
+        q["charging_to"] = round(charge_goal(rest, need), 1)
+        _LOGGER.info("AnyVac job %s: %s at %s %% charges to %s %% before %s (needs ~%.0f %%)",
+                     self.job_id, q["vacuum"], battery, q["charging_to"], it.get("rooms"), need)
+        if not self._docked(dd) and dd.get("status_state") not in ("returning_home", "docking") and not q.get("sent_home"):
+            q["sent_home"] = True
+            self.hass.async_create_task(self.hass.services.async_call(
+                "vacuum", "return_to_base", {"entity_id": q["vacuum"]}, blocking=False, context=self.context,
+            ))
+        self._save()
+        return "charging"
 
     async def _send(self, q: dict[str, Any], it: dict[str, Any], dd: dict[str, Any]) -> None:
         duid = q["duid"]
@@ -762,7 +797,12 @@ class JobRunner:
             if callable(rp):
                 place = rp(duid)
             break
-        return live_robot_model(q, self._device(duid), transit, place)
+        bat = None
+        for coord in _coordinators(self.hass):
+            bm = getattr(coord, "battery_model", None)
+            bat = bm(duid) if callable(bm) else None
+            break
+        return live_robot_model(q, self._device(duid), transit, place, bat)
 
     def _replan(self, q: dict[str, Any]) -> None:
         """docs/53 §4.4: when the robot is free, put the rest of its queue in

@@ -21,6 +21,7 @@ from typing import Any
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr, entity_registry as er
 
+from . import battery as batterymod
 from .const import ROBOROCK_DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
@@ -98,6 +99,36 @@ def selects_for_duid(hass: HomeAssistant, duid: str) -> dict[str, str]:
     return out
 
 
+def travel_minutes(transit: dict[str, dict[str, float]] | None, place: str | None, rooms: list[str]) -> float:
+    """Minutes from `place` to the first of `rooms` (0 without data)."""
+    if not rooms or not place or place == rooms[0]:
+        return 0.0
+    v = ((transit or {}).get(place) or {}).get(rooms[0])
+    return float(v) if isinstance(v, (int, float)) else 0.0
+
+
+def battery_need(r: dict[str, Any], it: dict[str, Any], place: str | None) -> float:
+    """% one queue item takes: travel there + the room, at the robot's drain
+    for that kind and fan speed (docs/53 §5). 0 without a battery model."""
+    bat = r.get("bat")
+    if bat is None:
+        return 0.0
+    trav = 0.0 if it.get("here") else travel_minutes(r.get("transit"), place, it.get("rooms") or [])
+    return (trav + max(float(it.get("est_min") or 0.0), 0.0)) * bat.drain_rate(it.get("kind"), it.get("fan"))
+
+
+def charge_goal(rest_need: float, need: float) -> float:
+    """Charge target before an item that does not fit (docs/53 P1), at least
+    enough for that item above the reserve, at most 100 %."""
+    return min(100.0, max(batterymod.charge_target(rest_need), batterymod.RESERVE + need + 1))
+
+
+def needs_charge(battery: float | None, need: float) -> bool:
+    """The item would leave less than the reserve — unless the robot is full
+    already (a room bigger than a charge: the firmware recharges on its own)."""
+    return battery is not None and battery < 99 and battery - need < batterymod.RESERVE
+
+
 def simulate_queues(robots: dict[str, dict[str, Any]]) -> dict[str, tuple[float, float]]:
     """Start/finish minute of every queue item (docs/52 §3, §5a).
 
@@ -129,15 +160,30 @@ def simulate_queues(robots: dict[str, dict[str, Any]]) -> dict[str, tuple[float,
         place = r.get("place") or "dock"
 
         def travel(to_rooms: list[str]) -> float:
-            if not to_rooms or place == to_rooms[0]:
-                return 0.0
-            v = (transit.get(place) or {}).get(to_rooms[0])
-            return float(v) if isinstance(v, (int, float)) else 0.0
+            return travel_minutes(transit, place, to_rooms)
 
+        # docs/53 §5: battery. `battery` = % now, `bat` = `battery.Model`.
+        battery = r.get("battery") if r.get("bat") is not None else None
+        battery = float(battery) if isinstance(battery, (int, float)) else None
+        items_all = r.get("items") or []
         first = True
-        for it in r.get("items") or []:
+        for idx, it in enumerate(items_all):
             kind = it.get("kind")
             rooms = it.get("rooms") or []
+            if battery is not None and not it.get("here"):
+                need = battery_need(r, it, place)
+                if needs_charge(battery, need):
+                    # Home to charge first, to what the rest of the queue needs.
+                    t += travel_minutes(transit, place, ["dock"]) if place != "dock" else 0.0
+                    place = "dock"
+                    need = battery_need(r, it, place)
+                    rest = need + sum(battery_need(r, x, None) for x in items_all[idx + 1:])
+                    goal = charge_goal(rest, need)
+                    t += r["bat"].charge_minutes(battery, goal)
+                    battery = goal
+                battery -= need
+            elif battery is not None:
+                battery -= battery_need(r, it, place)
             if kind == "wet":
                 if first and mode and r.get("pre_wash", True) and prev_kind is None:
                     t += PRE_WASH_MIN
@@ -213,6 +259,7 @@ def live_robot_model(
     dd: dict[str, Any],
     transit: dict[str, dict[str, float]] | None = None,
     place: str | None = None,
+    bat: Any = None,
 ) -> dict[str, Any]:
     """`simulate_queues` input for one robot of the running job: the items
     still to run, the active one reduced to what is left of it. Shared by the
@@ -227,7 +274,8 @@ def live_robot_model(
         est = float(it.get("est_min") or 0.0)
         if st == "active":
             est *= 1 - min(item_pct(dd, it), 100) / 100
-        row = {"id": it["id"], "kind": it.get("kind"), "rooms": it.get("rooms") or [], "est_min": est}
+        row = {"id": it["id"], "kind": it.get("kind"), "rooms": it.get("rooms") or [], "est_min": est,
+               "fan": str(it["fan_speed"]).lower() if it.get("fan_speed") else None}
         if st in ("active", "sent"):
             row["here"] = True  # in the room or on its way: no travel left to model
         items.append(row)
@@ -245,6 +293,8 @@ def live_robot_model(
         "pre_wash": not (wash.get("washed_at") and not since) and dd.get("mop_dirty") is not False,
         "transit": transit or {},
         "place": place or "dock",
+        "bat": bat,
+        "battery": dd.get("battery"),
     }
 
 
@@ -552,11 +602,14 @@ class CleanPlanner:
         dd = getattr(dev, "data", None) or {}
         tm = getattr(self.coord, "transit_minutes", None)
         rp = getattr(self.coord, "robot_place", None)
+        bm = getattr(self.coord, "battery_model", None)
         # A mop the dock already washed needs no wash before the first wet room.
         return {"wash_mode": mode, "interval": interval, "batch": batch,
                 "pre_wash": dd.get("mop_dirty") is not False,
                 "transit": tm(duid) if callable(tm) else {},
-                "place": rp(duid) if callable(rp) else "dock"}
+                "place": rp(duid) if callable(rp) else "dock",
+                "bat": bm(duid) if callable(bm) else None,
+                "battery": dd.get("battery")}
 
     def _estimate_timeline(
         self,
@@ -611,6 +664,11 @@ class CleanPlanner:
             return cache[k]
 
         models = getattr(self, "_model_cache", None)
+
+        def fan(duid: str, kind: str) -> str | None:
+            f = self._settings_for_duid(settings, kind, duid).get("fan_speed")
+            return str(f).lower() if f else None
+
         robots: dict[str, dict[str, Any]] = {}
         for kind, assign_ in (("dry", dry_assign), ("wet", wet_assign)):
             for duid, rooms in assign_.items():
@@ -634,6 +692,7 @@ class CleanPlanner:
                     r["items"].append({
                         "id": f"{kind}-{duid}-{i}", "kind": kind, "rooms": [room],
                         "est_min": e(duid, room, kind),
+                        "fan": fan(duid, kind),
                     })
         return robots
 

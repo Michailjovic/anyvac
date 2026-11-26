@@ -6,6 +6,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.65.0] - 2026-11-26
+
+Card unchanged (1.62.1). The battery part of docs/53 (§5).
+
+- **AnyVac learns each robot's battery** from ordinary use: the drain in %/min
+  while cleaning, per kind (dry / wet) and per fan speed, and the charging speed
+  below and above 80 % (charging slows there). Measured in segments of one
+  activity (at least 3 min and 2 %); every accepted segment is also kept as a
+  sample (date, kind, setting, rate — up to 300) for the battery-health estimate
+  planned later. Stored in `.storage/anyvac_battery`; published as
+  `battery_model` (`{drain, charge, samples}`). Until measured: 0.55 / 0.65 %/min
+  (dry / wet), charging 0.8 / 0.3 %/min.
+- **A room is sent only when the battery stays at or above 25 % after it**,
+  travel included. Otherwise the robot charges first — to 20 % (the firmware's
+  return level) + what the rest of its queue needs + 3 % (P1), at least enough
+  for that room — and then goes on; a robot stopped away from the dock is sent
+  home. A robot already at full charge goes anyway (the firmware recharges and
+  resumes on its own). The 30 % start minimum stays.
+- **The timing model knows it too:** a charge stop and its duration are in the
+  plan, the order search and the live `job_progress` finish time.
+- Tests: 601 (charging speed below / above 80 %, drain per fan speed, P1 target,
+  learning from snapshots and too-short segments, a charge stop in the
+  timeline, the runner waiting for the charge and sending a stopped robot home).
+
 ## [1.64.0] - 2026-11-26
 
 Card unchanged (1.62.1). The order planner of docs/53 (§1–§4); the battery
