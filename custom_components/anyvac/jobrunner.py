@@ -27,7 +27,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
-from homeassistant.core import Context, HomeAssistant
+from homeassistant.core import Context, HomeAssistant, callback
 from homeassistant.helpers.event import async_call_later
 from homeassistant.util import dt as dt_util
 
@@ -265,6 +265,7 @@ class JobRunner:
             self._publish(force=True)
             await self._step()
 
+    @callback
     def _on_coordinator_update(self) -> None:
         if self._closed or self._publishing:
             return
@@ -280,6 +281,11 @@ class JobRunner:
         if old is not None:
             old()
 
+        # Must be a HA callback: without it `async_call_later` runs a plain
+        # function in a worker thread, `async_create_task` raises there, and the
+        # step never runs (field 2026-11-26 — acceptance checks lost, a room
+        # blocked as "command not accepted" while the robot was cleaning it).
+        @callback
         def _fire(_now: Any) -> None:
             self._timers.pop(key, None)
             if not self._closed:
@@ -287,6 +293,7 @@ class JobRunner:
 
         self._timers[key] = async_call_later(self.hass, delay, _fire)
 
+    @callback
     def _on_timeout(self, _now: Any) -> None:
         self._timers.pop("job", None)
         open_items = [it["id"] for it in self.items() if it["state"] not in FINAL]
@@ -362,6 +369,12 @@ class JobRunner:
     async def _send(self, q: dict[str, Any], it: dict[str, Any], dd: dict[str, Any]) -> None:
         duid = q["duid"]
         entity = q["vacuum"]
+        # The map's target segments and the robot's state before it got the
+        # command: right after a task ends the map still shows the old room's
+        # segments for a while (field 2026-11-26), see `_check_accepted`.
+        # Taken before the call — `dd` is the live device data.
+        before_targets = sorted(int(x) for x in dd.get("target_segments") or [])
+        before_state = dd.get("status_state")
         await self._apply_settings(it)
         for coord in _coordinators(self.hass):
             coord.set_task_item(duid, set(it.get("rooms") or []))
@@ -389,6 +402,8 @@ class JobRunner:
         it["state"] = "sent"
         it["sent_at"] = _iso(now)
         it["sent_from_dock"] = self._docked(dd)
+        it["sent_targets"] = before_targets
+        it["sent_state"] = before_state
         it["attempts"] = int(it.get("attempts") or 0) + 1
         q["phase"] = "starting"
         if q["first_sent_at"] is None:
@@ -404,7 +419,18 @@ class JobRunner:
         a command it cannot take and the service still reports success."""
         state = dd.get("status_state")
         targets = set(dd.get("target_segments") or [])
-        matches = not targets or targets == set(it["segments"])
+        # The robot was free when it got the command (the runner sends only
+        # then), so a robot that is now cleaning runs OUR task — even while its
+        # map still lists the previous room's segments (the map lags the task
+        # by up to a snapshot; S8 chained Kitchen -> Living room in 22 s and the
+        # map said Kitchen for 45 s). A map showing yet other segments still
+        # means a different task.
+        stale = (
+            it.get("sent_targets") is not None
+            and sorted(targets) == it["sent_targets"]
+            and it.get("sent_state") not in ACTIVE_STATES
+        )
+        matches = not targets or targets == set(it["segments"]) or stale
         started = state in ACTIVE_STATES or (
             it.get("sent_from_dock") and dd.get("in_cleaning") and state in WASH_STATES
         )
@@ -642,6 +668,7 @@ class JobRunner:
             return
         it = self._current(q)
         if it is None:
+            self._adopt_unaccepted(q, data)
             return
         if it["state"] == "sent" and not data.get("rooms_result"):
             # The previous task's end, reported after we sent the next one.
@@ -673,6 +700,27 @@ class JobRunner:
             coord.set_task_item(duid, None)
         self._save()
         await self._step()
+
+    def _adopt_unaccepted(self, q: dict[str, Any], data: dict[str, Any]) -> None:
+        """A room blocked as "command not accepted" that the robot then cleaned
+        after all: the task's result says so — take it as done instead of
+        leaving the job thinking the room was never cleaned."""
+        cleaned = {r.get("room") for r in data.get("rooms_result") or [] if r.get("cleaned")}
+        changed = False
+        for it in q["items"]:
+            if (it["state"] == "blocked" and it.get("reason") == "command not accepted"
+                    and set(it.get("rooms") or []) and set(it.get("rooms") or []) <= cleaned):
+                it["state"] = "done"
+                it.pop("reason", None)
+                it["done_at"] = _iso(dt_util.utcnow())
+                it["result"] = [r for r in data.get("rooms_result") or [] if r.get("room") in (it.get("rooms") or [])]
+                if it.get("kind") == "dry":
+                    self.dry_rooms_done.update(it.get("rooms") or [])
+                changed = True
+                _LOGGER.info("AnyVac job %s: %s %s cleaned after all", self.job_id, q["vacuum"], it["rooms"])
+        if changed:
+            self._save()
+            self.hass.async_create_task(self._locked_step())
 
     @staticmethod
     def _count_mopping(q: dict[str, Any], minutes: float) -> None:
@@ -742,6 +790,17 @@ class JobRunner:
 
     def _maybe_finish(self) -> None:
         if self._closed:
+            return
+        # A robot whose room was blocked as "command not accepted" but which is
+        # cleaning anyway may well be doing that room: wait for its task to end
+        # (`_adopt_unaccepted`) instead of closing the job under it.
+        unsure = [
+            q for q in self.queues.values()
+            if any(it["state"] == "blocked" and it.get("reason") == "command not accepted" for it in q["items"])
+            and self._device(q["duid"]).get("status_state") in ACTIVE_STATES
+        ]
+        if unsure:
+            self._schedule("finish-wait", 60)
             return
         if all(it["state"] in FINAL for it in self.items()) and not any(q.get("pausing") for q in self.queues.values()):
             for q in self.queues.values():

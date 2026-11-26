@@ -940,6 +940,26 @@ def _resolve_map_content(coord: Any) -> Any | None:
     return map_content
 
 
+def _current_map_entity(hass: Any, coord: Any, home: Any) -> str | None:
+    """The `image` entity of the robot's current map. The Roborock integration
+    names it `{duid_slug}_map_{map name or "Map <flag>"}` (its own unique id);
+    None when anything on the way is missing."""
+    try:
+        current = getattr(home, "current_map_data", None)
+        flag = getattr(current, "map_flag", None)
+        infos = getattr(home, "home_map_info", None) or {}
+        info = infos.get(flag) if flag is not None else None
+        slug = getattr(coord, "duid_slug", None)
+        if hass is None or info is None or not slug:
+            return None
+        name = getattr(info, "name", None) or f"Map {flag}"
+        from homeassistant.helpers import entity_registry as er
+
+        return er.async_get(hass).async_get_entity_id("image", ROBOROCK_DOMAIN, f"{slug}_map_{name}")
+    except Exception:  # noqa: BLE001 - a lookup must never break the update
+        return None
+
+
 def _dock_error_name(err: Any) -> str | None:
     """Name of a set dock error (`RoborockDockErrorCode`), None for none/ok."""
     try:
@@ -4683,6 +4703,11 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         except Exception as err:  # noqa: BLE001 - debug data must never break the update
             _LOGGER.debug("AnyVac: debug extraction failed: %s", err)
             data["debug_map"] = None
+
+        # Which Roborock image entity shows THIS map (card 1.62.1): Roborock
+        # makes one per saved floor and keeps all of them "live", so the card
+        # could not tell them apart (S7 MaxV with two maps had none).
+        data["map_entity"] = _current_map_entity(getattr(self, "hass", None), coord, home)
 
         # docs/40 Fáze 0: raw map bytes inventory (length + short hash) only — the
         # bytes THEMSELVES never go on `debug_map` / any sensor attribute, since

@@ -279,3 +279,45 @@ async def test_retry_puts_a_blocked_room_back_into_its_queue(monkeypatch) -> Non
     await rig.poll()
     await rig.finish_room(s8, ["Hall"])
     assert rig.hass.services.sent("vacuum.s8") == [[16], [17], [16]]  # Living again
+
+
+async def test_a_chained_room_is_accepted_while_the_map_still_shows_the_last_one(monkeypatch) -> None:
+    """Field 2026-11-26: S8 took Living room on its way home from Kitchen, but its
+    map kept listing Kitchen's segments for 45 s — the room was blocked as "command
+    not accepted", the job ended under the cleaning robot and the queue vanished."""
+    rig = Rig(monkeypatch)
+    s8 = rig.add("s8", "vacuum.s8")
+    runner = await _start(rig, [item("s8", "vacuum.s8", "dry", "Kitchen", 3), item("s8", "vacuum.s8", "dry", "Living", 4)])
+    await rig.poll()
+    await rig.finish_room(s8, ["Kitchen"])
+    assert rig.hass.services.sent("vacuum.s8")[-1] == [4]
+    s8.data["target_segments"] = [3]  # the map lags behind the task
+    for _ in range(5):
+        rig.clock.advance(seconds=15)
+        await rig.poll()
+    living = runner.queues["s8"]["items"][1]
+    assert living["state"] == "active"
+    assert not runner._closed
+
+
+async def test_a_room_blocked_as_not_accepted_that_gets_cleaned_counts_as_done(monkeypatch) -> None:
+    rig = Rig(monkeypatch)
+    s6 = rig.add("s6", "vacuum.s6")
+    runner = await _start(rig, [item("s6", "vacuum.s6", "dry", "A", 1)])
+    s6.data.update(target_segments=[9])  # a map that names some other room
+    for _ in range(8):
+        rig.clock.advance(seconds=15)
+        await rig.poll()
+    first = runner.queues["s6"]["items"][0]
+    assert first["state"] == "blocked" and first["reason"] == "command not accepted"
+    assert not runner._closed  # the robot is cleaning — the job waits
+    await rig.finish_room(s6, ["A"])
+    assert first["state"] == "done"
+
+
+async def test_timer_callbacks_run_in_the_event_loop() -> None:
+    """`async_call_later` runs a plain function in a worker thread."""
+    from homeassistant.core import is_callback
+
+    assert is_callback(jr.JobRunner._on_timeout)
+    assert is_callback(jr.JobRunner._on_coordinator_update)

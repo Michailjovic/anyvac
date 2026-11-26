@@ -6,6 +6,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.62.1] - 2026-11-26
+
+Pairs with card 1.62.1. Field fixes: on 2026-11-26 the queue vanished mid-clean
+and new jobs could be started (not the laptop going to sleep).
+
+- **A chained room was blocked as "command not accepted" while the robot
+  cleaned it.** S8 took Living room on its way home from Kitchen (22 s), but its
+  map kept listing Kitchen's segments for over 45 s. The acceptance check
+  wanted the new segments, blocked the room, and — it being the last open item —
+  ended the job: no queue in the card, Start enabled again, and the path of the
+  job wiped by the next task. Now a robot that was free when it got the command
+  and is cleaning while its map still shows the segments it had **before** the
+  command counts as having taken it.
+- **Safety net:** a room blocked as "command not accepted" that the robot then
+  reports cleaned becomes done, and the job does not end while such a robot is
+  still cleaning.
+- **Runner timers ran in a worker thread** (`async_call_later` with a plain
+  function): every acceptance re-check and retry raised `RuntimeError` and was
+  lost (12× in the log). They are HA callbacks now.
+- **`map_entity`** on the sensor: the Roborock image entity of the robot's
+  current map (Roborock keeps one per saved map, all of them live). The card
+  uses it.
+- Tests: 576 (stale-map acceptance, late completion, callback timers — the
+  first two fail without the fix; `map_entity`).
+
 ## [1.62.0] - 2026-11-26
 
 Pairs with card 1.62.0 (the queue while cleaning, service points in the robot sheet).
