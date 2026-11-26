@@ -386,3 +386,34 @@ async def test_no_pre_wash_when_the_dock_washed_the_mop_after_its_last_mopping(m
     ], wash={"s8": {"mode": "room", "interval_min": 15}})
     await rig.poll()
     assert _washes(rig, "vacuum.s8") == 0
+
+
+async def test_free_robot_reorders_its_queue_so_the_mop_can_start_early(monkeypatch) -> None:
+    """docs/53 §4.4: the runner re-plans the rest of a free robot's queue."""
+    rig = Rig(monkeypatch)
+    rig.add("s6", "vacuum.s6")
+    rig.add("s8", "vacuum.s8", wet=True)
+    runner = await _start(rig, [
+        item("s6", "vacuum.s6", "dry", "Big", 1, est=30.0),
+        item("s6", "vacuum.s6", "dry", "Small", 2, est=3.0),
+        item("s8", "vacuum.s8", "wet", "Small", 2, est=20.0),
+        item("s8", "vacuum.s8", "wet", "Big", 1, est=20.0),
+    ])
+    assert rig.hass.services.sent("vacuum.s6")[0] == [2]
+    assert [it["room"] for it in runner.queues["s6"]["items"]] == ["Small", "Big"]
+
+
+async def test_replanning_leaves_a_room_placed_by_hand(monkeypatch) -> None:
+    rig = Rig(monkeypatch)
+    rig.add("s6", "vacuum.s6")
+    rig.add("s8", "vacuum.s8", wet=True)
+    big = item("s6", "vacuum.s6", "dry", "Big", 1, est=30.0)
+    big["manual"] = True
+    runner = await _start(rig, [
+        big,
+        item("s6", "vacuum.s6", "dry", "Small", 2, est=3.0),
+        item("s8", "vacuum.s8", "wet", "Small", 2, est=20.0),
+        item("s8", "vacuum.s8", "wet", "Big", 1, est=20.0),
+    ])
+    assert rig.hass.services.sent("vacuum.s6")[0] == [1]
+    assert [it["room"] for it in runner.queues["s6"]["items"]] == ["Big", "Small"]

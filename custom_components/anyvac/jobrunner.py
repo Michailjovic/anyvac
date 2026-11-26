@@ -329,6 +329,8 @@ class JobRunner:
                 q["phase"] = "done"
                 self._report_vacuum(q)
                 continue
+            if self._robot_free(dd):
+                self._replan(q)
             nxt = self._next_ready(q)
             if nxt is None:
                 q["phase"] = "waiting_gate"
@@ -748,12 +750,68 @@ class JobRunner:
             wash["mop_min_since_wash"] = 0.0
             wash["washed_at"] = _iso(dt_util.utcnow())
 
+    def _robot_model(self, duid: str, q: dict[str, Any]) -> dict[str, Any]:
+        """`planner.live_robot_model` with the coordinator's travel data."""
+        from .planner import live_robot_model
+
+        transit, place = {}, None
+        for coord in _coordinators(self.hass):
+            tm, rp = getattr(coord, "transit_minutes", None), getattr(coord, "robot_place", None)
+            if callable(tm):
+                transit = tm(duid) or {}
+            if callable(rp):
+                place = rp(duid)
+            break
+        return live_robot_model(q, self._device(duid), transit, place)
+
+    def _replan(self, q: dict[str, Any]) -> None:
+        """docs/53 §4.4: when the robot is free, put the rest of its queue in
+        the order that ends the job soonest, with the times measured so far.
+        Rooms the user placed by hand (`manual`, P2) keep their slot; a batch
+        robot keeps the app's order."""
+        from .planner import candidate_orders, plan_score
+
+        if q.get("batch"):
+            return
+        slots = [i for i, it in enumerate(q["items"]) if it["state"] == "queued" and not it.get("manual")]
+        if len(slots) < 2:
+            return
+        key = tuple((it["id"], it["state"]) for it in self.items())
+        keys = self.__dict__.setdefault("_replan_keys", {})
+        if keys.get(q["duid"]) == key:
+            return
+        keys[q["duid"]] = key
+        pool = [q["items"][i] for i in slots]
+        original = list(q["items"])
+        others = {d: self._robot_model(d, oq) for d, oq in self.queues.items() if oq is not q}
+
+        def apply(order: list[dict[str, Any]]) -> None:
+            items = list(original)
+            for i, it in zip(slots, order):
+                items[i] = it
+            q["items"] = items
+
+        best, best_order = None, pool
+        for n, order in enumerate(candidate_orders(pool)):
+            if n >= 2000:
+                break
+            apply(order)
+            sc = plan_score({**others, q["duid"]: self._robot_model(q["duid"], q)})
+            if best is None or sc < best:
+                best, best_order = sc, order
+        apply(best_order)
+        if [it["id"] for it in best_order] != [it["id"] for it in pool]:
+            keys[q["duid"]] = tuple((it["id"], it["state"]) for it in self.items())
+            _LOGGER.info("AnyVac job %s: %s new order %s", self.job_id, q["vacuum"],
+                         [it.get("room") or it.get("rooms") for it in best_order])
+            self._save()
+
     def _gate_eta_min(self, it: dict[str, Any]) -> float | None:
         """Minutes until the dry pass of `it`'s room(s) is expected to end —
         the same timing model as the plan and `job_progress`."""
-        from .planner import live_robot_model, simulate_queues  # local, as in the coordinator
+        from .planner import simulate_queues  # local, as in the coordinator
 
-        robots = {duid: live_robot_model(q, self._device(duid)) for duid, q in self.queues.items()}
+        robots = {duid: self._robot_model(duid, q) for duid, q in self.queues.items()}
         times = simulate_queues(robots)
         rooms = set(it.get("rooms") or [])
         ends = [

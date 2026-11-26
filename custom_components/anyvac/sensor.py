@@ -99,6 +99,7 @@ class AnyVacMapSensor(CoordinatorEntity[AnyVacCoordinator], SensorEntity):
             "reach",
             # docs/52 §5 item 7 — named service points per vacuum.
             "service_points",
+            "travel_min",
         }
     )
 

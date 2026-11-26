@@ -67,4 +67,5 @@ STORE_KEYS: tuple[str, ...] = (
     "reach_masks",
     "job",
     "service_points",
+    "transit",
 )

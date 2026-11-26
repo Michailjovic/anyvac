@@ -40,6 +40,7 @@ from homeassistant.util import dt as dt_util
 from . import coverage as covmod
 from . import homeframe, livediff, localchannel
 from . import reach as reachmod
+from . import transit as transitmod
 from .const import (
     DEFAULT_EXPOSE_LEGACY_MM,
     DEFAULT_LIVE_DIFF,
@@ -1402,6 +1403,16 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # the robot's OWN mm — what `app_goto_target` takes, so going there
         # needs no conversion. Persisted across restarts.
         self._sp_store: Store = Store(hass, 1, f"{DOMAIN}_service_points")
+        # docs/53 §3: travel between rooms. Default from the floor of the map
+        # (`transit.floor_minutes`, computed in the executor when the map
+        # changes), measured transits on top (EMA per robot, from -> to).
+        self._transit_store: Store = Store(hass, 1, f"{DOMAIN}_transit")
+        self._transit_learned: dict[str, dict[str, dict[str, float]]] = {}
+        self._transit_default: dict[str, dict[str, dict[str, float]]] = {}
+        self._transit_key: dict[str, Any] = {}
+        self._transit_busy: set[str] = set()
+        self._transit_watch: dict[str, dict[str, Any]] = {}
+        self._last_task_room: dict[str, str] = {}
         self._service_points: dict[str, list[dict[str, Any]]] = {}
         # The room order set in the Roborock app, read from the robot
         # (`get_clean_sequence`, docs/52 O1): {duid: {room: position}} + when.
@@ -2391,7 +2402,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         from .planner import live_robot_model  # local: planner imports nothing from here
 
         dev = (self.data or {}).get(duid)
-        return live_robot_model(q, getattr(dev, "data", None) or {})
+        return live_robot_model(q, getattr(dev, "data", None) or {}, self.transit_minutes(duid), self.robot_place(duid))
 
     @staticmethod
     def _item_pct(dd: dict[str, Any], it: dict[str, Any]) -> int:
@@ -2609,8 +2620,94 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         measurement targets of the task (docs/52 §9.3). None = not known."""
         if rooms:
             self._task_item[duid] = set(rooms)
+            self._watch_transit(duid, set(rooms))
         else:
-            self._task_item.pop(duid, None)
+            done = self._task_item.pop(duid, None)
+            if done and len(done) == 1 and hasattr(self, "_last_task_room"):
+                self._last_task_room[duid] = next(iter(done))
+
+    # ── Travel between rooms (docs/53 §3) ────────────────────────────────────
+
+    def transit_minutes(self, duid: str) -> dict[str, dict[str, float]]:
+        """{from: {to: minutes}} incl. "dock" for one robot: the floor model
+        with measured transits on top. Empty until the map was read."""
+        return transitmod.blend(
+            getattr(self, "_transit_default", {}).get(duid) or {},
+            getattr(self, "_transit_learned", {}).get(duid) or {},
+        )
+
+    def robot_place(self, duid: str) -> str:
+        """Where the robot is for the timing model: "dock" or a room name."""
+        dd = getattr((self.data or {}).get(duid), "data", None) or {}
+        if not dd.get("in_cleaning") or dd.get("status_state") in ("charging", "charging_complete"):
+            return transitmod.DOCK
+        return getattr(self, "_last_task_room", {}).get(duid) or transitmod.DOCK
+
+    def _watch_transit(self, duid: str, rooms: set[str]) -> None:
+        if not hasattr(self, "_transit_watch"):
+            return
+        self._transit_watch[duid] = {
+            "to": rooms, "from": self.robot_place(duid),
+            "t0": dt_util.utcnow(), "tainted": False,
+        }
+
+    def _note_transit(self, device: AnyVacDevice) -> None:
+        """Learn the travel time of a task: from the command to the first map
+        snapshot that shows the robot cleaning in its target room. A wash on
+        the way (the dock washes before leaving) does not count."""
+        watch = getattr(self, "_transit_watch", {}).get(device.duid)
+        if not watch:
+            return
+        state = device.data.get("status_state")
+        if state in ("washing_the_mop", "washing_the_mop_2", "going_to_wash_the_mop"):
+            watch["tainted"] = True
+            return
+        if state not in ACTIVE_CLEAN_STATES:
+            return
+        room = None
+        pos = device.data.get("vacuum_position")
+        geo = (self._geo.get(device.duid) or (None, None, None))[2]
+        if geo is not None and isinstance(pos, dict) and pos.get("x") is not None:
+            room = geo.room_at(float(pos["x"]), float(pos["y"]))
+        room = room or device.data.get("vacuum_room_name")
+        if room not in watch["to"]:
+            return
+        self._transit_watch.pop(device.duid, None)
+        minutes = (dt_util.utcnow() - watch["t0"]).total_seconds() / 60
+        frm = watch.get("from")
+        if watch["tainted"] or not frm or frm == room or not (0.05 <= minutes <= 30):
+            return
+        row = self._transit_learned.setdefault(device.duid, {}).setdefault(frm, {})
+        old = row.get(room)
+        row[room] = round(minutes if old is None else 0.6 * old + 0.4 * minutes, 2)
+        self._delay_save(self._transit_store, lambda: self._transit_learned, 10)
+
+    def _maybe_update_transit(self, device: AnyVacDevice) -> None:
+        """Recompute the floor model in the executor when the map changed."""
+        if not hasattr(self, "_transit_busy"):
+            return
+        duid = device.duid
+        geo = (self._geo.get(duid) or (None, None, None))[2]
+        if geo is None or geo.room_id is None:
+            return
+        ch = device.data.get("charger") or {}
+        key = (id(geo), ch.get("x"), ch.get("y"))
+        if self._transit_key.get(duid) == key or duid in self._transit_busy:
+            return
+        self._transit_key[duid] = key
+        self._transit_busy.add(duid)
+
+        async def _run() -> None:
+            try:
+                self._transit_default[duid] = await self.hass.async_add_executor_job(
+                    transitmod.floor_minutes, geo.room_id, geo.left, geo.top, dict(geo.seg_names), dict(ch)
+                )
+            except Exception as err:  # noqa: BLE001 - travel is an estimate, never break the poll
+                _LOGGER.debug("AnyVac: travel model for %s failed: %s", duid, err)
+            finally:
+                self._transit_busy.discard(duid)
+
+        self.hass.async_create_task(_run())
 
     def discard_task(self, duid: str) -> None:
         """Forget what the running task measured without learning from it: the
@@ -3507,6 +3604,14 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         sel = await self._sel_store.async_load()
         if isinstance(sel, list):
             self._selected_rooms = {str(r) for r in sel}
+        tr_store = getattr(self, "_transit_store", None)
+        tr = await tr_store.async_load() if tr_store else None
+        if isinstance(tr, dict):
+            self._transit_learned = {
+                str(d): {str(a): {str(b): float(v) for b, v in row.items() if isinstance(v, (int, float))}
+                         for a, row in rows.items() if isinstance(row, dict)}
+                for d, rows in tr.items() if isinstance(rows, dict)
+            }
         sp_store = getattr(self, "_sp_store", None)  # absent in __new__-built test doubles
         self._service_points = _parse_service_points(await sp_store.async_load() if sp_store else None)
         pins = await self._pins_store.async_load()
@@ -4219,6 +4324,9 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     self._detect_room_done(device)
                     self._track_and_emit(device)
                     self._attribute_points(device)
+                    self._note_transit(device)
+                    self._maybe_update_transit(device)
+                    device.data["travel_min"] = self.transit_minutes(device.duid) or None
                     self._maybe_harvest_pending(device)
                     self._record_clean_type_trace(device, ct_session_before)
                     progress = self._build_progress(device)

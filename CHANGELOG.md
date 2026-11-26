@@ -6,6 +6,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.64.0] - 2026-11-26
+
+Card unchanged (1.62.1). The order planner of docs/53 (§1–§4); the battery
+part (§5) follows in 1.65.0.
+
+- **Travel between rooms.** Each robot gets a travel table from its own map:
+  the shortest way along the floor (BFS on the 50 mm room grid) between every
+  room and the dock, at ~0.3 m/s; worked out in the executor when the map
+  changes. Measured travel replaces it: from the command to the first snapshot
+  of the robot cleaning its target room (a mop wash on the way does not count),
+  averaged per robot and pair of places, stored in `.storage/anyvac_transit`.
+  Published as `travel_min` (`{from: {to: minutes}}`, `dock` included).
+- **The timing model counts travel** (`simulate_queues`): to the first room
+  from where the robot is, between rooms, and from the dock after a wash or a
+  wait. Plans and `job_progress` now include it, so times run a little longer
+  than before and closer to reality.
+- **The plan searches for the order** that ends the whole job soonest (ties:
+  every robot back home soonest, then the earliest finishes): every order up to
+  6 rooms per robot and pass, single moves above that, and moving a room to
+  another robot that can do it — never a room the user pinned. Each candidate
+  is scored by the same model as the ETA. Small dry rooms first, no driving
+  back and forth, dry rooms the mop robot needs soon — all of it falls out of
+  that one rule instead of hand-written sorting.
+- **Re-planning while cleaning** (docs/53 §4.4): when a robot is free, the
+  rest of its queue is put in the best order again with the times measured so
+  far. Rooms moved by hand (P2) keep their place; batch robots keep the app's
+  order.
+- Tests: 593 (travel along the floor, measured travel and a wash on the way,
+  where the robot is, no zigzag, small dry rooms first, pins, re-planning and
+  a room placed by hand).
+
 ## [1.63.0] - 2026-11-26
 
 Card unchanged (1.62.1). Two pieces of docs/52 §5a.

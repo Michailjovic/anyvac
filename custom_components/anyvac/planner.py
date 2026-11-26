@@ -14,6 +14,7 @@ the robot maps goes through ``segment_id``.
 
 from __future__ import annotations
 
+import itertools
 import logging
 from typing import Any
 
@@ -44,6 +45,12 @@ WASH_DURATION_MIN = 2.25
 CHAIN_GAP_MIN = 0.35
 END_WASH_MIN = 6.5
 PRE_WASH_MIN = 3.0
+
+# docs/53 §4: the order search. Up to this many rooms per robot and pass,
+# every order is tried; above it, swaps and moves until nothing improves.
+EXHAUSTIVE_MAX = 6
+# Simulations one plan may spend (~20 µs each).
+SEARCH_BUDGET = 6000
 
 
 def vacuum_entity_for_duid(hass: HomeAssistant, duid: str) -> str | None:
@@ -115,9 +122,22 @@ def simulate_queues(robots: dict[str, dict[str, Any]]) -> dict[str, tuple[float,
         mode, interval, batch = r.get("wash_mode"), r.get("interval"), bool(r.get("batch"))
         since_wash = float(r.get("since_wash") or 0.0)
         prev_kind: str | None = r.get("prev_kind")
+        # docs/53 §3: travel between rooms. `transit` = {from: {to: minutes}}
+        # with "dock"; `place` = where the robot is now. No data → no travel
+        # (the model before 1.64.0).
+        transit = r.get("transit") or {}
+        place = r.get("place") or "dock"
+
+        def travel(to_rooms: list[str]) -> float:
+            if not to_rooms or place == to_rooms[0]:
+                return 0.0
+            v = (transit.get(place) or {}).get(to_rooms[0])
+            return float(v) if isinstance(v, (int, float)) else 0.0
+
         first = True
         for it in r.get("items") or []:
             kind = it.get("kind")
+            rooms = it.get("rooms") or []
             if kind == "wet":
                 if first and mode and r.get("pre_wash", True) and prev_kind is None:
                     t += PRE_WASH_MIN
@@ -129,19 +149,22 @@ def simulate_queues(robots: dict[str, dict[str, Any]]) -> dict[str, tuple[float,
                     if wash_now:
                         t += END_WASH_MIN
                         since_wash = 0.0
+                        place = "dock"
                     else:
                         t += CHAIN_GAP_MIN
                 gate = max(
-                    (dry_finish.get(room, 0.0) for room in it.get("rooms") or []),
+                    (dry_finish.get(room, 0.0) for room in rooms),
                     default=0.0,
                 )
+                if gate > t + 1e-9 and not first:
+                    place = "dock"  # nothing to do yet: it went home and waits
                 start = max(t, gate)
             else:
                 if not first and not batch:
                     t += CHAIN_GAP_MIN
                 start = t
             remaining = max(float(it.get("est_min") or 0.0), 0.0)
-            end = start
+            end = start + (0.0 if it.get("here") else travel(rooms))
             if kind == "wet" and interval and interval > 0:
                 # The firmware's own counter only runs inside one task.
                 in_task = since_wash if batch else 0.0
@@ -156,8 +179,10 @@ def simulate_queues(robots: dict[str, dict[str, Any]]) -> dict[str, tuple[float,
             t = end
             times[it["id"]] = (start, end)
             if kind == "dry":
-                for room in it.get("rooms") or []:
+                for room in rooms:
                     dry_finish[room] = max(dry_finish.get(room, 0.0), end)
+            if rooms:
+                place = rooms[-1]
             prev_kind = kind
             first = False
 
@@ -183,7 +208,12 @@ def item_pct(dd: dict[str, Any], it: dict[str, Any]) -> int:
     return round(sum(vals) / len(vals)) if vals else 0
 
 
-def live_robot_model(q: dict[str, Any], dd: dict[str, Any]) -> dict[str, Any]:
+def live_robot_model(
+    q: dict[str, Any],
+    dd: dict[str, Any],
+    transit: dict[str, dict[str, float]] | None = None,
+    place: str | None = None,
+) -> dict[str, Any]:
     """`simulate_queues` input for one robot of the running job: the items
     still to run, the active one reduced to what is left of it. Shared by the
     coordinator (`job_progress`) and the runner (when to pre-wash)."""
@@ -197,7 +227,10 @@ def live_robot_model(q: dict[str, Any], dd: dict[str, Any]) -> dict[str, Any]:
         est = float(it.get("est_min") or 0.0)
         if st == "active":
             est *= 1 - min(item_pct(dd, it), 100) / 100
-        items.append({"id": it["id"], "kind": it.get("kind"), "rooms": it.get("rooms") or [], "est_min": est})
+        row = {"id": it["id"], "kind": it.get("kind"), "rooms": it.get("rooms") or [], "est_min": est}
+        if st in ("active", "sent"):
+            row["here"] = True  # in the room or on its way: no travel left to model
+        items.append(row)
     wash = q.get("wash") or {}
     since = wash.get("mop_min_since_wash") or 0.0
     return {
@@ -210,7 +243,43 @@ def live_robot_model(q: dict[str, Any], dd: dict[str, Any]) -> dict[str, Any]:
         # The dock washed the mop during this job and it has not mopped since:
         # the first wet room starts without the wash before it.
         "pre_wash": not (wash.get("washed_at") and not since) and dd.get("mop_dirty") is not False,
+        "transit": transit or {},
+        "place": place or "dock",
     }
+
+
+def plan_score(robots: dict[str, dict[str, Any]]) -> tuple[float, float, float]:
+    """How good a set of queues is (docs/53 §1): (end of the whole job, every
+    robot back in its dock, sum of finishes) — compare as a tuple, lower wins.
+    The drive home after the last room is no cleaning time, but a robot that
+    ends next to its dock is free sooner."""
+    times = simulate_queues(robots)
+    ends = [f for _, f in times.values()]
+    home = 0.0
+    for r in robots.values():
+        items = r.get("items") or []
+        if not items:
+            continue
+        last = items[-1]
+        rooms = last.get("rooms") or []
+        back = ((r.get("transit") or {}).get(rooms[-1]) or {}).get("dock") if rooms else None
+        home = max(home, times[last["id"]][1] + (float(back) if isinstance(back, (int, float)) else 0.0))
+    return (round(max(ends, default=0.0), 3), round(home, 3), round(sum(ends), 3))
+
+
+def candidate_orders(rooms: list[Any]):
+    """Every order up to `EXHAUSTIVE_MAX`, else every single move of one entry."""
+    if len(rooms) <= EXHAUSTIVE_MAX:
+        yield from (list(p) for p in itertools.permutations(rooms))
+        return
+    n = len(rooms)
+    yield list(rooms)
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                o = list(rooms)
+                o.insert(j, o.pop(i))
+                yield o
 
 
 class CleanPlanner:
@@ -376,6 +445,12 @@ class CleanPlanner:
         room falls back to normal assignment. Returns (assignment, unassigned)."""
         allowed = self._allowed(kind, vacuums)
         cands = [d for d in self.devices if d in allowed and self._capable(d, kind)]
+        # For the order search (docs/53): who else could take a room, and
+        # which rooms the user pinned (those never change robot).
+        if not hasattr(self, "_search_cands"):
+            self._search_cands, self._search_pinned = {}, {}
+        self._search_cands[kind] = list(cands)
+        self._search_pinned[kind] = set()
         out: dict[str, list[str]] = {}
         load: dict[str, float] = {d: 0.0 for d in cands}
         unassigned: list[str] = []
@@ -392,6 +467,7 @@ class CleanPlanner:
                 pduid = self._resolve_duid(str(pref))
                 if pduid and pduid in cands and self._duid_owns_room(pduid, room):
                     owners = [pduid]
+                    self._search_pinned[kind].add(room)
                 else:
                     _LOGGER.warning(
                         "AnyVac clean: pin %s -> %s not applicable for %s pass; "
@@ -474,9 +550,13 @@ class CleanPlanner:
         mode, interval = self.wash_mode(duid)
         dev = (getattr(self.coord, "data", None) or {}).get(duid)
         dd = getattr(dev, "data", None) or {}
+        tm = getattr(self.coord, "transit_minutes", None)
+        rp = getattr(self.coord, "robot_place", None)
         # A mop the dock already washed needs no wash before the first wet room.
         return {"wash_mode": mode, "interval": interval, "batch": batch,
-                "pre_wash": dd.get("mop_dirty") is not False}
+                "pre_wash": dd.get("mop_dirty") is not False,
+                "transit": tm(duid) if callable(tm) else {},
+                "place": rp(duid) if callable(rp) else "dock"}
 
     def _estimate_timeline(
         self,
@@ -489,21 +569,7 @@ class CleanPlanner:
         (``{duid: [room, ...]}`` per pass). Thin wrapper over `simulate_queues`,
         the same model the live `job_progress` uses."""
         batch = batch or set()
-        robots: dict[str, dict[str, Any]] = {}
-        for kind, assign_ in (("dry", dry_assign), ("wet", wet_assign)):
-            for duid, rooms in assign_.items():
-                r = robots.setdefault(duid, {**self.robot_model(duid, duid in batch), "items": []})
-                if duid in batch:
-                    r["items"].append({
-                        "id": f"{kind}-{duid}-batch", "kind": kind, "rooms": list(rooms),
-                        "est_min": sum(self._item_estimate(duid, x, kind, settings) for x in rooms),
-                    })
-                    continue
-                for i, room in enumerate(rooms):
-                    r["items"].append({
-                        "id": f"{kind}-{duid}-{i}", "kind": kind, "rooms": [room],
-                        "est_min": self._item_estimate(duid, room, kind, settings),
-                    })
+        robots = self._robots_for(dry_assign, wet_assign, batch, settings)
         times = simulate_queues(robots)
         room_finish: dict[str, dict[str, float]] = {"dry": {}, "wet": {}}
         queues: dict[str, list[dict[str, Any]]] = {}
@@ -526,6 +592,132 @@ class CleanPlanner:
             # Kept for older cards: the room order no longer depends on the app.
             "unsequenced": [],
         }
+
+    def _robots_for(
+        self,
+        dry_assign: dict[str, list[str]],
+        wet_assign: dict[str, list[str]],
+        batch: set[str],
+        settings: dict[str, Any] | None,
+        est: dict[tuple[str, str, str], float] | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """`simulate_queues` input for queues already in order."""
+        cache = est if est is not None else {}
+
+        def e(duid: str, room: str, kind: str) -> float:
+            k = (duid, room, kind)
+            if k not in cache:
+                cache[k] = self._item_estimate(duid, room, kind, settings)
+            return cache[k]
+
+        models = getattr(self, "_model_cache", None)
+        robots: dict[str, dict[str, Any]] = {}
+        for kind, assign_ in (("dry", dry_assign), ("wet", wet_assign)):
+            for duid, rooms in assign_.items():
+                if duid not in robots:
+                    key = (duid, duid in batch)
+                    if models is not None and key in models:
+                        base = models[key]
+                    else:
+                        base = self.robot_model(duid, duid in batch)
+                        if models is not None:
+                            models[key] = base
+                    robots[duid] = {**base, "items": []}
+                r = robots[duid]
+                if duid in batch:
+                    r["items"].append({
+                        "id": f"{kind}-{duid}-batch", "kind": kind, "rooms": list(rooms),
+                        "est_min": sum(e(duid, x, kind) for x in rooms),
+                    })
+                    continue
+                for i, room in enumerate(rooms):
+                    r["items"].append({
+                        "id": f"{kind}-{duid}-{i}", "kind": kind, "rooms": [room],
+                        "est_min": e(duid, room, kind),
+                    })
+        return robots
+
+    def optimize_order(
+        self,
+        dry_assign: dict[str, list[str]],
+        wet_assign: dict[str, list[str]],
+        batch: set[str],
+        settings: dict[str, Any] | None,
+    ) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+        """docs/53 §4: the order (and, for rooms nobody pinned, the robot)
+        with the earliest end of the whole job, ties broken by the earliest
+        sum of finishes. Each candidate is scored by `simulate_queues` — the
+        same model as the ETA, travel and mop washes included. Batch robots
+        keep the app's order (the firmware decides)."""
+        est: dict[tuple[str, str, str], float] = {}
+        self._model_cache = {}
+        budget = [SEARCH_BUDGET]
+        assigns = {"dry": {d: list(r) for d, r in dry_assign.items()},
+                   "wet": {d: list(r) for d, r in wet_assign.items()}}
+
+        def score() -> tuple[float, float, float]:
+            budget[0] -= 1
+            return plan_score(self._robots_for(assigns["dry"], assigns["wet"], batch, settings, est))
+
+        best = score()
+        orders = candidate_orders
+
+        try:
+            for _round in range(4):
+                improved = False
+                for kind in ("dry", "wet"):
+                    for duid in list(assigns[kind]):
+                        if duid in batch or len(assigns[kind][duid]) < 2:
+                            continue
+                        keep = assigns[kind][duid]
+                        for o in orders(keep):
+                            if budget[0] <= 0:
+                                raise StopIteration
+                            assigns[kind][duid] = o
+                            sc = score()
+                            if sc < best:
+                                best, keep, improved = sc, o, True
+                        assigns[kind][duid] = keep
+                    # Hand a room to another robot that can do it.
+                    pinned = getattr(self, "_search_pinned", {}).get(kind, set())
+                    cands = getattr(self, "_search_cands", {}).get(kind, [])
+                    for src in list(assigns[kind]):
+                        if src in batch:
+                            continue
+                        for room in list(assigns[kind].get(src, [])):
+                            if room in pinned:
+                                continue
+                            for dst in cands:
+                                if dst == src or dst in batch or not self._duid_owns_room(dst, room) or not self.entity_of.get(dst):
+                                    continue
+                                before = {d: list(r) for d, r in assigns[kind].items()}
+                                assigns[kind][src] = [x for x in assigns[kind][src] if x != room]
+                                target = assigns[kind].setdefault(dst, [])
+                                best_pos = None
+                                for pos in range(len(target) + 1):
+                                    if budget[0] <= 0:
+                                        assigns[kind] = before
+                                        raise StopIteration
+                                    target.insert(pos, room)
+                                    sc = score()
+                                    if sc < best:
+                                        best, best_pos = sc, pos
+                                    target.pop(pos)
+                                if best_pos is None:
+                                    assigns[kind] = before
+                                else:
+                                    target.insert(best_pos, room)
+                                    if not assigns[kind][src]:
+                                        assigns[kind].pop(src)
+                                    improved = True
+                                    break
+                if not improved:
+                    break
+        except StopIteration:
+            pass
+        finally:
+            self._model_cache = None
+        return assigns["dry"], assigns["wet"]
 
     def _settings_for_duid(
         self, settings: dict[str, Any] | None, kind: str, duid: str
@@ -614,6 +806,7 @@ class CleanPlanner:
                 if self.entity_of.get(d)
             }
 
+        dry_assign, wet_assign = self.optimize_order(dry_assign, wet_assign, batch_duids, settings)
         items: list[dict[str, Any]] = []
         for kind, assign_ in (("dry", dry_assign), ("wet", wet_assign)):
             for duid, rms in assign_.items():
