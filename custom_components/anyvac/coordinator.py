@@ -2510,6 +2510,10 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 "state": q.get("phase") or "idle",
                 "items": qitems,
                 "wash": dict(q.get("wash") or {}),
+                # The robot stopped on its own error (field 2026-11-27: S7 a
+                # badly seated dustbin) — the room under way stays active until
+                # it is fixed and resumed, so the card has to say why it waits.
+                "robot_error": (dd.get("vacuum_error") or "error") if dd.get("status_state") == "error" else None,
                 # docs/52 §9.4: the charging stops the timing model put in (the
                 # wait before an item is otherwise a gap with no reason).
                 "planned_stops": [
@@ -3809,6 +3813,8 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             self._battery_learned = {
                 str(d): dict(v) for d, v in bat.items() if isinstance(v, dict) and d != "__open"
             }
+            if any([batterymod.reclassify(v) for v in self._battery_learned.values()]):
+                self._delay_save(self._battery_store, self._battery_payload, 5)
             for d, raw in open_segs.items():
                 seg = batterymod.seg_from_dict(raw)
                 if seg is not None:
@@ -5096,6 +5102,9 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # (docs/14 rule 4). ``transit`` = in a self-service/driving state.
         state_name = _s("state_name") or getattr(_s("state"), "name", None)
         data["status_state"] = state_name
+        # Name of the robot's own error (`RoborockErrorCode`, e.g. "no_dustbin"),
+        # None without one — the queue says why a robot stopped.
+        data["vacuum_error"] = _dock_error_name(_s("error_code"))
         # ``transit`` is a *session* concept (mid-clean self-service driving). Outside a
         # cleaning session it must read False — a docked robot is "charging" which is in
         # TRANSIT_STATES, and the dangling True after a clean confused the card's debug

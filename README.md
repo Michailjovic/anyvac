@@ -41,6 +41,7 @@ or mm math on the card side:
 | `rooms_estimate` | learned per-room clean-time estimates in minutes **per pass**: `{room: {dry, wet, "wet@<mop route>"}}` (docs/16, per pass and route since 1.63.0) |
 | `travel_min` | travel time between rooms and the dock, `{from: {to: minutes}}` — the way along the floor of the map, measured transits on top (docs/53, 1.64.0) |
 | `battery_model` | learned battery drain (%/min per kind and fan speed) and charging speed (below / above 80 %), with the number of samples kept (docs/53 §5, 1.65.0) |
+| `vacuum_error` | the robot's own error by name (`RoborockErrorCode`, e.g. `no_dustbin`), `null` without one (1.65.4) |
 | `wash_min` | learned length of a mop wash in minutes: `mid` = inside a task (drive to the dock + wash), `dock` = started in the dock (the pre-wash) (1.65.3) |
 | `mop_dirty` | has the mop mopped since the dock last washed it (`null` until seen); drives the pre-wash while a wet robot waits for its room (1.63.0) |
 | `rooms_progress` | per-room debug progress: `{room: {spatial_pct, visited_cells, total_cells, time_pct, elapsed_s, est_s}}` |

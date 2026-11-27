@@ -176,3 +176,33 @@ def test_an_open_segment_survives_a_restart() -> None:
     payload = co._battery_payload()
     assert payload["s8"] == {"drain": {"wet": 0.3}}
     assert bm.seg_from_dict(payload["__open"]["s8"]) == seg
+
+
+def test_vacuuming_with_the_mop_down_counts_as_dry() -> None:
+    """Field 2026-11-27: S7 vacuum-and-mop at max+ drained 0.79 %/min, S8
+    mop-only 0.29 — the suction decides, not the water."""
+    assert bm.kind_of("wet", False, True) == "dry"
+    assert bm.kind_of("wet", False, False) == "wet"
+    assert bm.kind_of("wet", True, False) == "dry"
+    assert bm.kind_of("dry", False, None) == "dry"
+    m = bm.Model(drain={"dry@max_plus": 0.79, "wet": 0.29})
+    assert m.drain_rate("wet", "max_plus") == 0.79
+    assert m.drain_rate("wet", "off") == 0.29
+
+
+def test_old_wet_samples_with_the_suction_on_are_replayed_as_dry() -> None:
+    learned = {
+        "drain": {"dry": 0.789, "dry@max_plus": 0.789, "wet": 0.788, "wet@max_plus": 0.788},
+        "samples": [
+            {"at": "2026-11-27T09:23:00+00:00", "kind": "dry", "setting": "max_plus", "rate": 0.789},
+            {"at": "2026-11-27T10:40:00+00:00", "kind": "wet", "setting": "max_plus", "rate": 0.788},
+            {"at": "2026-11-27T11:00:00+00:00", "kind": "lo", "setting": None, "rate": 0.8},
+        ],
+    }
+    assert bm.reclassify(learned) is True
+    assert learned["drain"] == {"dry": 0.789, "dry@max_plus": 0.789}
+    assert [s["kind"] for s in learned["samples"]] == ["dry", "dry", "lo"]
+    assert bm.reclassify(learned) is False
+    s8 = {"drain": {"wet": 0.292, "wet@off": 0.292},
+          "samples": [{"at": "x", "kind": "wet", "setting": "off", "rate": 0.292}]}
+    assert bm.reclassify(s8) is False

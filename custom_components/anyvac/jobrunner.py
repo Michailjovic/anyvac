@@ -1252,6 +1252,15 @@ class JobRunner:
                     it["state"] = "active"
                     for coord in _coordinators(self.hass):
                         coord.set_task_item(duid, set(it.get("rooms") or []))
+                    # The restart may have cut the send-again-and-check after the
+                    # robot took the room (field 2026-11-27: S7 took the Bedroom at
+                    # 10:23:23, HA restarted at 10:24, and S7 vacuumed it with the
+                    # mop down and water on — its firmware had reset the settings
+                    # when the Kitchen task closed). Apply them once more and
+                    # check; a change the user made on the robot was already
+                    # taken into the item's settings, so it is what gets applied.
+                    it.pop("baseline", None)
+                    self.hass.async_create_task(self._reapply_and_verify(duid, it))
                 else:
                     self._warn(f"{q['vacuum']} cleans something else than the job sent; the job stopped")
                     for x in q["items"]:

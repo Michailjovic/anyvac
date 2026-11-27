@@ -141,6 +141,30 @@ async def test_job_is_saved_and_resumes_after_a_restart(monkeypatch) -> None:
     assert rig.hass.services.sent() == [[1], [2]]
 
 
+async def test_restart_right_after_the_robot_took_a_room_applies_the_settings(monkeypatch) -> None:
+    """Field 2026-11-27: S7 took the Bedroom at 10:23:23, HA restarted at 10:24
+    and the send-again-and-check never ran — S7 vacuumed with the mop down.
+    After the restart the runner applies the item's settings once more."""
+    rig = Rig(monkeypatch)
+    s6 = rig.add("s6", "vacuum.s6")
+    it = item("s6", "vacuum.s6", "dry", "A", 1, fan_speed="max",
+              selects=[{"entity_id": "select.s6_mop_intensity", "option": "off"}])
+    runner = await _start(rig, [it])
+    snap = rig.coord.saved[-1]           # saved while "sent", before the check
+    runner.finish(keep_saved=True)
+    s6.data["mop_signal"] = {"fan_speed_name": "balanced"}   # firmware default
+    rig.hass.services.states["select.s6_mop_intensity"] = "mild"
+    before = rig.hass.services.count("select", "select_option")
+    resumed = jr.JobRunner.from_snapshot(rig.hass, snap)
+    await resumed.start(restored=True)
+    await rig.drain()
+    assert resumed.queues["s6"]["items"][0]["state"] == "active"
+    assert rig.hass.services.count("select", "select_option") > before
+    assert rig.hass.services.states["select.s6_mop_intensity"] == "off"
+    assert s6.data["mop_signal"]["fan_speed_name"] == "max"
+    assert rig.hass.services.sent() == [[1]]   # not sent again
+
+
 async def test_restart_while_docked_sends_the_unfinished_room_again(monkeypatch) -> None:
     rig = Rig(monkeypatch)
     s6, items = _three(rig)

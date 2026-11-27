@@ -74,6 +74,8 @@ class Model:
 
     def drain_rate(self, kind: str | None, setting: str | None = None) -> float:
         k = kind if kind in ("dry", "wet") else "dry"
+        if k == "wet" and setting and not str(setting).lower().startswith("off"):
+            k = "dry"  # mopping with the suction on drains like vacuuming (`kind_of`)
         if setting and f"{k}@{setting}" in self.drain:
             return self.drain[f"{k}@{setting}"]
         return self.drain.get(k, DEFAULT_DRAIN[k])
@@ -109,12 +111,51 @@ def activity(data: dict[str, Any], cleaning_states: set[str]) -> tuple[str | Non
     state = data.get("status_state")
     battery = data.get("battery")
     if data.get("in_cleaning") and state in cleaning_states and not data.get("transit"):
-        wet = data.get("clean_type") == "wet" and not data.get("water_off")
         fan = (data.get("mop_signal") or {}).get("fan_speed_name")
-        return ("wet" if wet else "dry"), (str(fan).lower() if fan else None)
+        return kind_of(data.get("clean_type"), bool(data.get("water_off")), data.get("vacuuming")), (
+            str(fan).lower() if fan else None
+        )
     if state == "charging" and isinstance(battery, (int, float)) and battery < 100:
         return ("charge_hi" if battery >= 80 else "charge_lo"), None
     return None, None
+
+
+def kind_of(clean_type: Any, water_off: bool, vacuuming: Any) -> str:
+    """What drains the battery: "wet" = mopping only (suction off), "dry" =
+    the suction runs, with or without the mop. The fan is what costs: S8
+    mopping with the fan off 0.29 %/min, S7 vacuuming at max+ with the mop
+    down 0.79 %/min — the same as without it (field 2026-11-27, where S7's
+    vacuum-and-mop was learned as "wet")."""
+    wet = clean_type == "wet" and not water_off
+    return "wet" if wet and vacuuming is False else "dry"
+
+
+def reclassify(learned: dict[str, Any]) -> bool:
+    """Replay the kept samples with `kind_of`'s rule (1.65.4): a "wet" sample
+    measured with the suction on is a "dry" one. Rebuilds the drain table;
+    True when something changed."""
+    samples = learned.get("samples") or []
+    if not any(s.get("kind") == "wet" and s.get("setting") not in (None, "off") for s in samples):
+        return False
+    old = list(samples)
+    learned["samples"] = []
+    learned["drain"] = {}
+    for s in old:
+        kind = s.get("kind")
+        if kind == "wet" and s.get("setting") not in (None, "off"):
+            kind = "dry"
+        rate = s.get("rate")
+        if not isinstance(rate, (int, float)):
+            continue
+        if kind in ("lo", "hi"):
+            learned["samples"].append(dict(s))
+            continue
+        table = learned["drain"]
+        for k in [kind] if not s.get("setting") else [kind, f"{kind}@{s['setting']}"]:
+            prev = table.get(k)
+            table[k] = round(rate if prev is None else 0.7 * prev + 0.3 * rate, 3)
+        learned["samples"].append({**s, "kind": kind})
+    return True
 
 
 def close(seg: Segment) -> tuple[str, float] | None:

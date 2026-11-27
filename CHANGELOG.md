@@ -6,6 +6,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.65.4] - 2026-11-27
+
+- **S7 vacuumed the Bedroom with the mop down and the water on.** Its
+  firmware goes back to its own settings (vacuum and mop, water mild) when a
+  task closes, so the runner applies the item's settings again right after the
+  robot takes the next room, and checks them. HA restarted a minute after S7
+  took the Bedroom (field 2026-11-27, 10:23:23 → 10:24) and that send-again
+  never ran: the restored job only marked the room active. After a restart the
+  runner now applies and checks the settings of the room under way again (a
+  change the user made on the robot was already taken into the item, so that
+  is what gets applied).
+- **The battery model counts what drains it: the suction.** A clean with the
+  fan running is "dry" with or without the mop; "wet" is mopping with the
+  suction off. S7's vacuum-and-mop run was learned as "wet" at 0.79 %/min —
+  the same as its dry rate — and would have been used for real mopping. The
+  kept samples are replayed with the new rule once (S7's "wet" sample becomes
+  a "dry@max_plus" one); a wet item with the fan on is timed at the dry rate.
+- **A robot that stopped on its own error says so.** New attribute
+  `vacuum_error` (the `RoborockErrorCode` name, e.g. `no_dustbin`, field
+  2026-11-27: a badly seated dustbin) and `job_progress.queues[*].robot_error`
+  while the robot is in the error state. The room under way stays active until
+  it is fixed and resumed, as before; the card now shows why the robot waits.
+
 ## [1.65.3] - 2026-11-27
 
 - **Queued rooms kept the times from the moment the job started.** A room's
