@@ -69,3 +69,16 @@ def test_values_from_before_per_pass_are_whole_cleans_until_measured() -> None:
     assert p._estimate("s6", "Living", "dry", repeat=2) == 30.0          # still a whole clean
     payload = c._est_payload()
     assert payload["__format"] == 2 and payload["__legacy"] == [["s6", "Living", "dry"]]
+
+
+def test_old_whole_clean_values_can_be_converted_to_per_pass() -> None:
+    c = object.__new__(AnyVacCoordinator)
+    c._estimates = {"s6": {"Bathroom": {"dry": 5.0}}, "s8": {"Living": {"wet": 38.0, "dry": 3.0}}}
+    c._est_legacy = {("s6", "Bathroom", "dry"), ("s8", "Living", "wet")}
+    c._delay_save = lambda *a, **k: None
+    c._est_store = None
+    c.async_update_listeners = lambda: None
+    assert c.convert_whole_cleans(2) == 2
+    assert c._estimates == {"s6": {"Bathroom": {"dry": 2.5}}, "s8": {"Living": {"wet": 19.0, "dry": 3.0}}}
+    assert c._est_legacy == set()
+    assert c.convert_whole_cleans(2) == 0  # once only

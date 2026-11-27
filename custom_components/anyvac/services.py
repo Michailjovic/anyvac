@@ -342,6 +342,10 @@ RESET_LEARNING_SCHEMA = vol.Schema(
         vol.Optional("kind"): vol.In(["dry", "wet"]),
         vol.Optional("estimates", default=True): bool,
         vol.Optional("baselines", default=True): bool,
+        # Instead of deleting: turn the whole-clean estimates learned before
+        # 1.63.0 into per-pass values, dividing by the passes they were
+        # cleaned with (field 2026-11-27: every preset of the user had 2).
+        vol.Optional("legacy_passes"): vol.All(vol.Coerce(int), vol.Range(min=1, max=3)),
     }
 )
 
@@ -1884,6 +1888,10 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
             coord.reset_reach(duid=call.data.get("duid"), room=call.data.get("room"))
 
     async def _handle_reset_learning(call: ServiceCall) -> None:
+        if call.data.get("legacy_passes"):
+            for coord in _coordinators(hass):
+                coord.convert_whole_cleans(int(call.data["legacy_passes"]), duid=call.data.get("duid"))
+            return
         for coord in _coordinators(hass):
             coord.reset_learning(
                 duid=call.data.get("duid"),

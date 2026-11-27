@@ -6,6 +6,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.65.3] - 2026-11-27
+
+- **Queued rooms kept the times from the moment the job started.** A room's
+  estimate was written into the queue once, so a job started on old values
+  kept showing them (and the finish time built on them) even after the
+  learning had changed (field 2026-11-27, ~357 min left with the new values
+  already learned). Each queued room now reads the current learned time
+  (per pass, × the passes it is cleaned with) whenever the queue changes; a
+  room under way or done keeps its value.
+- **A run that was already going at a restart no longer teaches a room.** Its
+  first part was missed, so the room looked done in a minute (S8 Corridor:
+  1 min, 100 %, field 2026-11-27). Such a run still draws the path and
+  finishes the job, but it writes no time, no completion % and no reach mask;
+  `calib_debug` says "started before a restart".
+- **The plan no longer charges a robot for nothing.** Until a robot is
+  measured, the plan used 0.65 %/min for mopping — S8 really takes 0.27
+  %/min — and put two charging stops (72 + 42 min) into its queue that it
+  never needed (field 2026-11-27, ETA 15:07). The starting values are now
+  what the field measured: 0.7 %/min vacuuming (S6 0.69, S7 0.81) and 0.3
+  %/min mopping. The robot's own measurement replaces them as before.
+- **Charging stops are published.** `job_progress.queues[*].planned_stops`
+  (docs/52 §9.4) was always empty; it now lists every charge the timing model
+  put in: `{type: charge, before_item, est_min, to_pct, start_at, finish_at}`.
+  The card shows it above the room it is for.
+- **Battery measuring survives a drive and a restart.** The drive to the next
+  room of the same clean (`returning_home` between two tasks, up to 2 min) no
+  longer ends the measuring segment — S6 cut its clean into one segment per
+  room, and none was long enough to teach. The open segment is saved with the
+  learned rates, so a restart of Home Assistant no longer loses it (field: 20
+  min of S6 lost at 10:25).
+- **Mop washes are measured per robot** (new `wash_min` attribute): a wash in
+  the dock (the pre-wash) and one inside a task (drive to the dock + wash).
+  The timing model uses them instead of the fixed 3 / 2.25 min, and the
+  pre-wash starts that long + 30 s before the room is ready, not 4 min (field
+  2026-11-27: the S8 pre-wash took 5.2 min and S8 waited 2.6 min for it).
+- **A start from the dock costs its real time.** The command reaches the
+  robot, it backs out and finds itself: ~1.1 min dock → Bathroom for S6 and
+  S8 against ~0.3 min along the floor (S6: 31 s from the command to the first
+  cleaning state). Each robot's measured overhead (measured − floor, over the
+  rooms it was measured going to from the dock, at most 2 min) is added to its
+  starts from the dock into rooms not measured yet.
+- **One slow drive no longer sets a travel time.** A transit was an average
+  where each new one weighed 40 %, so one drive slowed by another robot (field
+  2026-11-27: S8 met S6 in the kitchen, Bedroom → Corridor 1.4 min instead of
+  ~0.4) set the time for days. The last 5 drives per pair are kept and the
+  lower middle one is used — a drive can only come out longer than the way,
+  never shorter. The start overhead from the dock takes the same middle value.
+  Stored values from before become the first sample.
+- **Device lookup without the deprecated call.** `device_registry.async_get_device`
+  (removed in HA 2027.8) is replaced by `async_get_devices`.
+- **`anyvac.reset_learning` can convert instead of delete:** `legacy_passes`
+  (1–3) divides the estimates learned before 1.63.0 — one value for all passes
+  of a clean — by the passes they were cleaned with, so they become per-pass
+  values like every estimate learned since. Once only; values learned per pass
+  are untouched. Optional `duid` limits it to one robot.
+
 ## [1.65.2] - 2026-11-27
 
 - **Travel was empty until the first clean.** The room geometry the travel

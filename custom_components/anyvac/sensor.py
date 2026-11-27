@@ -101,6 +101,7 @@ class AnyVacMapSensor(CoordinatorEntity[AnyVacCoordinator], SensorEntity):
             "service_points",
             "travel_min",
             "battery_model",
+            "wash_min",
         }
     )
 

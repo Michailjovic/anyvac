@@ -1411,9 +1411,10 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         self._sp_store: Store = Store(hass, 1, f"{DOMAIN}_service_points")
         # docs/53 §3: travel between rooms. Default from the floor of the map
         # (`transit.floor_minutes`, computed in the executor when the map
-        # changes), measured transits on top (EMA per robot, from -> to).
+        # changes), measured transits on top (last 5 per robot and pair, low median).
         self._transit_store: Store = Store(hass, 1, f"{DOMAIN}_transit")
         self._transit_learned: dict[str, dict[str, dict[str, float]]] = {}
+        self._transit_samples: dict[str, dict[str, dict[str, list[float]]]] = {}
         self._transit_default: dict[str, dict[str, dict[str, float]]] = {}
         self._transit_key: dict[str, Any] = {}
         self._transit_busy: set[str] = set()
@@ -1421,6 +1422,12 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         self._last_task_room: dict[str, str] = {}
         # docs/53 §5: learned drain / charging speed per robot (+ samples for
         # the later battery-health estimate), and the open measuring segment.
+        # How long a mop wash takes, per robot: "mid" = in a task (drive to the
+        # dock + wash), "dock" = started in the dock (the pre-wash). Field
+        # 2026-11-27: the S8 pre-wash took 5.2 min against the 3 assumed.
+        self._wash_store: Store = Store(hass, 1, f"{DOMAIN}_wash")
+        self._wash_learned: dict[str, dict[str, float]] = {}
+        self._wash_watch: dict[str, dict[str, Any]] = {}
         self._battery_store: Store = Store(hass, 1, f"{DOMAIN}_battery")
         self._battery_learned: dict[str, dict[str, Any]] = {}
         self._bat_seg: dict[str, batterymod.Segment] = {}
@@ -2442,7 +2449,8 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         data = self.data or {}
         queues = st.get("queues") or {}
         robots = {duid: self._live_robot_model(duid, q) for duid, q in queues.items()}
-        times = simulate_queues(robots)
+        stops: dict[str, list[dict[str, Any]]] = {}
+        times = simulate_queues(robots, stops)
         left = max((f for _, f in times.values()), default=0.0)
 
         def at(minutes: float) -> str:
@@ -2502,7 +2510,16 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                 "state": q.get("phase") or "idle",
                 "items": qitems,
                 "wash": dict(q.get("wash") or {}),
-                "planned_stops": [],
+                # docs/52 §9.4: the charging stops the timing model put in (the
+                # wait before an item is otherwise a gap with no reason).
+                "planned_stops": [
+                    {
+                        "type": "charge", "before_item": s["before"],
+                        "est_min": round(s["end"] - s["start"], 1), "to_pct": s["to_pct"],
+                        "start_at": at(s["start"]), "finish_at": at(s["end"]),
+                    }
+                    for s in stops.get(duid) or []
+                ],
             }
         rooms = {r["room"] for r in out_rows}
         rooms_done = {
@@ -2674,6 +2691,17 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         now = dt_util.utcnow()
         mode, setting = batterymod.activity(device.data, ACTIVE_CLEAN_STATES)
         seg = segs.get(device.duid)
+        if (
+            mode is None and seg is not None and not seg.mode.startswith("charge")
+            and device.data.get("in_cleaning")
+            and device.data.get("status_state") in ("returning_home", *ACTIVE_CLEAN_STATES)
+            and (now - seg.t_last).total_seconds() <= batterymod.BRIDGE_S
+        ):
+            # Driving to the next room of the same clean: the segment goes on.
+            mode, setting = seg.mode, seg.setting
+            bridging = True
+        else:
+            bridging = False
         if seg is not None and mode == seg.mode and setting == seg.setting:
             # The level as of the last Roborock push, timed at the push.
             pushed = getattr(self, "_bat_push", {}).get(device.duid)
@@ -2689,14 +2717,28 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     batterymod.learn(
                         self._battery_learned.setdefault(device.duid, {}), res[0], res[1], seg.setting, now
                     )
-                    self._delay_save(self._battery_store, lambda: self._battery_learned, 30)
                 seg = None
+                self._delay_save(self._battery_store, self._battery_payload, 30)
         if mode is None:
             return
         if seg is None:
             segs[device.duid] = batterymod.Segment(mode, setting, now, float(b), now, float(b))
+            self._delay_save(self._battery_store, self._battery_payload, 30)
         else:
-            seg.t_last, seg.b_last = now, float(b)
+            n_edges = len(seg.edges)
+            if not bridging:
+                seg.t_last, seg.b_last = now, float(b)
+            if len(seg.edges) != n_edges:
+                self._delay_save(self._battery_store, self._battery_payload, 30)
+
+    def _battery_payload(self) -> dict[str, Any]:
+        """What the battery store keeps: the learned rates per robot and the
+        segments being measured (so a restart does not lose them)."""
+        out: dict[str, Any] = {d: v for d, v in self._battery_learned.items()}
+        open_segs = {d: batterymod.seg_to_dict(s) for d, s in (getattr(self, "_bat_seg", None) or {}).items()}
+        if open_segs:
+            out["__open"] = open_segs
+        return out
 
     def _note_battery_push(self, duid: str | None, coord: Any) -> None:
         """Time of each battery level change as Roborock pushes it — far closer
@@ -2715,6 +2757,37 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             seg = self._bat_seg.get(duid)
             if seg is not None and last is not None:
                 seg.edge(now, float(level))
+
+    def _note_wash(self, device: AnyVacDevice) -> None:
+        """Measure every mop wash: from the first snapshot that shows the
+        robot going to wash (or washing) to the first that shows it doing
+        something else."""
+        watches = getattr(self, "_wash_watch", None)
+        if watches is None:
+            return
+        state = device.data.get("status_state")
+        now = dt_util.utcnow()
+        w = watches.get(device.duid)
+        washing = state in WASH_STATES or state == "going_to_wash_the_mop"
+        if washing:
+            if w is None:
+                kind = "mid" if device.data.get("in_cleaning") and state == "going_to_wash_the_mop" else "dock"
+                watches[device.duid] = {"t0": now, "kind": kind}
+            return
+        if w is None:
+            return
+        watches.pop(device.duid, None)
+        minutes = (now - w["t0"]).total_seconds() / 60
+        if not 0.5 <= minutes <= 20:
+            return
+        row = self._wash_learned.setdefault(device.duid, {})
+        old = row.get(w["kind"])
+        row[w["kind"]] = round(minutes if old is None else 0.6 * old + 0.4 * minutes, 2)
+        self._delay_save(self._wash_store, lambda: self._wash_learned, 10)
+
+    def wash_minutes(self, duid: str) -> dict[str, float]:
+        """Learned wash length of one robot: {"mid": .., "dock": ..} (minutes)."""
+        return dict(getattr(self, "_wash_learned", {}).get(duid) or {})
 
     def _watch_transit(self, duid: str, rooms: set[str]) -> None:
         if not hasattr(self, "_transit_watch"):
@@ -2750,10 +2823,13 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         frm = watch.get("from")
         if watch["tainted"] or not frm or frm == room or not (0.05 <= minutes <= 30):
             return
+        samples = self.__dict__.setdefault("_transit_samples", {})
+        kept = samples.setdefault(device.duid, {}).setdefault(frm, {}).setdefault(room, [])
+        kept.append(round(minutes, 2))
+        del kept[:-transitmod.SAMPLES_KEPT]
         row = self._transit_learned.setdefault(device.duid, {}).setdefault(frm, {})
-        old = row.get(room)
-        row[room] = round(minutes if old is None else 0.6 * old + 0.4 * minutes, 2)
-        self._delay_save(self._transit_store, lambda: self._transit_learned, 10)
+        row[room] = transitmod.low_median(kept)
+        self._delay_save(self._transit_store, lambda: self._transit_samples, 10)
 
     def _maybe_update_transit(self, device: AnyVacDevice) -> None:
         """Recompute the floor model in the executor when the map changed."""
@@ -2887,6 +2963,25 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         of them are still whole cleans from before 1.63.0."""
         return {"__format": 2, "__legacy": sorted(list(x) for x in getattr(self, "_est_legacy", set())), **self._estimates}
 
+    def convert_whole_cleans(self, passes: int, duid: str | None = None) -> int:
+        """Turn the estimates learned before 1.63.0 (one value for all passes)
+        into per-pass values: divide by `passes`, the passes they were cleaned
+        with. Returns how many values changed."""
+        n = 0
+        for key in sorted(getattr(self, "_est_legacy", set())):
+            d, room, kind = key
+            if duid and d != duid:
+                continue
+            rec = (self._estimates.get(d) or {}).get(room) or {}
+            if isinstance(rec.get(kind), (int, float)):
+                rec[kind] = round(float(rec[kind]) / max(1, passes), 1)
+                n += 1
+            self._est_legacy.discard(key)
+        if n:
+            self._delay_save(self._est_store, self._est_payload, 2)
+            self.async_update_listeners()
+        return n
+
     def estimate_is_whole_clean(self, duid: str, room: str, kind: str) -> bool:
         """True for a value learned before 1.63.0 (all passes in one)."""
         return (duid, room, kind) in getattr(self, "_est_legacy", set())
@@ -3008,7 +3103,11 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
 
         seen = self._path_seen.setdefault(duid, {"dry": 0, "wet": 0})
         layers = (("dry", "_path_dry"), ("wet", "_path_wet"))
-        run = self._runs.setdefault(duid, covmod.RunTracker())
+        run = self._runs.get(duid)
+        if run is None:
+            run = self._runs[duid] = covmod.RunTracker()
+            if device.data.get("in_cleaning") and device.data.get("status_state") in ACTIVE_CLEAN_STATES:
+                run.partial = True  # first seen mid-task: after a restart
 
         # Slice out the new points per layer (handle a path reset) regardless of state.
         new_by_layer: dict[str, list[dict[str, float]]] = {}
@@ -3575,7 +3674,7 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         # 90 up (the firmware ended the run inside it, the tail is measurement noise).
         completion: dict[str, dict[str, int]] = {}
         coverage_changed = False
-        for nm in run.activated:
+        for nm in ([] if run.partial else run.activated):
             for kind in covmod.KINDS:
                 res = run.kind_result(geo, nm, kind)
                 if res is None or res["floor"] < 5:
@@ -3603,7 +3702,9 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     "floor": res["floor"] if res else None,
                     "passes": run.passes,
                 }
-                if res is None or res["floor"] < 5:
+                if run.partial:
+                    krec["accepted"], krec["reason"] = False, "started before a restart"
+                elif res is None or res["floor"] < 5:
                     krec["accepted"], krec["reason"] = False, "no evidence of this kind"
                 elif nm not in run.activated:
                     krec["accepted"], krec["reason"] = False, "not cleaned (transit only)"
@@ -3626,7 +3727,8 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             calib_rooms[nm] = room_rec
         if coverage_changed:
             self._delay_save(self._cov_pct_store, lambda: self._room_coverage, 5)
-        self._record_reach(device, run, geo)
+        if not run.partial:
+            self._record_reach(device, run, geo)
         self._last_calib[duid] = {
             "at": dt_util.utcnow().isoformat(timespec="seconds"),
             "clean_type": ct,
@@ -3703,14 +3805,41 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         bat_store = getattr(self, "_battery_store", None)
         bat = await bat_store.async_load() if bat_store else None
         if isinstance(bat, dict):
-            self._battery_learned = {str(d): dict(v) for d, v in bat.items() if isinstance(v, dict)}
+            open_segs = bat.get("__open") if isinstance(bat.get("__open"), dict) else {}
+            self._battery_learned = {
+                str(d): dict(v) for d, v in bat.items() if isinstance(v, dict) and d != "__open"
+            }
+            for d, raw in open_segs.items():
+                seg = batterymod.seg_from_dict(raw)
+                if seg is not None:
+                    self.__dict__.setdefault("_bat_seg", {})[str(d)] = seg
+        wa_store = getattr(self, "_wash_store", None)
+        wa = await wa_store.async_load() if wa_store else None
+        if isinstance(wa, dict):
+            self._wash_learned = {
+                str(d): {str(k): float(v) for k, v in row.items() if isinstance(v, (int, float))}
+                for d, row in wa.items() if isinstance(row, dict)
+            }
         tr_store = getattr(self, "_transit_store", None)
         tr = await tr_store.async_load() if tr_store else None
         if isinstance(tr, dict):
-            self._transit_learned = {
-                str(d): {str(a): {str(b): float(v) for b, v in row.items() if isinstance(v, (int, float))}
+            # Samples per pair (1.65.3); before, one averaged value per pair —
+            # it becomes the first sample.
+            def _samples(v: Any) -> list[float]:
+                if isinstance(v, (int, float)):
+                    return [float(v)]
+                if isinstance(v, list):
+                    return [float(x) for x in v if isinstance(x, (int, float))][-transitmod.SAMPLES_KEPT:]
+                return []
+
+            self._transit_samples = {
+                str(d): {str(a): {str(b): s for b, v in row.items() if (s := _samples(v))}
                          for a, row in rows.items() if isinstance(row, dict)}
                 for d, rows in tr.items() if isinstance(rows, dict)
+            }
+            self._transit_learned = {
+                d: {a: {b: transitmod.low_median(s) for b, s in row.items()} for a, row in rows.items()}
+                for d, rows in self._transit_samples.items()
             }
         sp_store = getattr(self, "_sp_store", None)  # absent in __new__-built test doubles
         self._service_points = _parse_service_points(await sp_store.async_load() if sp_store else None)
@@ -4430,6 +4559,8 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     self._track_and_emit(device)
                     self._attribute_points(device)
                     self._note_transit(device)
+                    self._note_wash(device)
+                    device.data["wash_min"] = self.wash_minutes(device.duid) or None
                     self._note_battery(device)
                     lb = self._battery_learned.get(device.duid) or {}
                     device.data["battery_model"] = {

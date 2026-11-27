@@ -109,10 +109,51 @@ def floor_minutes(
     return out
 
 
+# The start from the dock is slower than the floor model knows: the command
+# reaches the robot, it backs out and finds itself (field 2026-11-27: S6
+# 31 s from the command to the first cleaning state, ~1.1 min dock → Bathroom
+# for S6 and S8 against ~0.3 min of floor). Measured per robot as what its
+# learned starts from the dock take over the floor model, at most this.
+DOCK_START_MAX = 2.0
+
+
+# Measured transits kept per pair; the value used is their low median.
+SAMPLES_KEPT = 5
+
+
+def low_median(values: list[float]) -> float:
+    """The lower of the two middle values: a transit can only come out longer
+    than the drive (another robot in the way, an obstacle, a late snapshot),
+    never shorter — a single slow one must not set the time (field
+    2026-11-27: S8 met S6 in the kitchen on its way, 1.4 min instead of ~0.4)."""
+    vals = sorted(values)
+    return vals[(len(vals) - 1) // 2]
+
+
+def dock_start(default: dict[str, dict[str, float]], learned: dict[str, dict[str, float]]) -> float:
+    """Minutes a start from the dock takes over the floor model: the mean of
+    (measured − floor) over the rooms this robot was measured going to from
+    the dock; 0 before the first one."""
+    row_d = (default or {}).get(DOCK) or {}
+    row_l = (learned or {}).get(DOCK) or {}
+    diffs = [
+        float(v) - float(row_d[b])
+        for b, v in row_l.items()
+        if isinstance(v, (int, float)) and isinstance(row_d.get(b), (int, float))
+    ]
+    if not diffs:
+        return 0.0
+    return round(min(DOCK_START_MAX, max(0.0, low_median(diffs))), 2)
+
+
 def blend(default: dict[str, dict[str, float]], learned: dict[str, dict[str, float]]) -> dict[str, dict[str, float]]:
     """The floor model with the measured transits on top (docs/53 §3:
-    measured wins)."""
+    measured wins). A start from the dock to a room not measured yet gets the
+    robot's measured start overhead (`dock_start`) on top of the floor."""
+    start = dock_start(default, learned)
     out = {a: dict(row) for a, row in default.items()}
+    if start and DOCK in out:
+        out[DOCK] = {b: round(v + start, 2) for b, v in out[DOCK].items()}
     for a, row in (learned or {}).items():
         for b, v in (row or {}).items():
             if isinstance(v, (int, float)):

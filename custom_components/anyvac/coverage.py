@@ -275,6 +275,10 @@ class RunTracker:
         # Mop route of a wet run (`mop_route_name`, e.g. "deep_plus"), read while
         # the robot mops — the firmware resets it when the task closes.
         self.route: str | None = None
+        # The run was first seen in the middle of a task (after a restart): its
+        # first part is missing, so its times, completion and reach are not
+        # learned (field 2026-11-27: S8 Corridor read 1 min and 100 %).
+        self.partial: bool = False
         self.ignored: dict[str, float] = {}
         self._cand: str | None = None
         self._cand_len = 0.0

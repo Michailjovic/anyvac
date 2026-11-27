@@ -29,14 +29,21 @@ FIRMWARE_LOW = 20.0
 RESERVE = 25.0
 # docs/53 P1: charge to 20 % + what the rest of the queue needs + 3 %.
 CHARGE_MARGIN = 3.0
-# Starting values until the robot has been measured.
-DEFAULT_DRAIN = {"dry": 0.55, "wet": 0.65}
+# Starting values until the robot has been measured. Field 2026-11-27: S6
+# 0.69 and S7 0.81 %/min vacuuming, S8 0.27 %/min mopping — the old 0.65 for
+# mopping made the plan charge S8 twice for nothing (~110 min of ETA).
+DEFAULT_DRAIN = {"dry": 0.7, "wet": 0.3}
 DEFAULT_CHARGE = {"lo": 0.8, "hi": 0.3}
 SAMPLES_MAX = 300
 
 MIN_SEGMENT_MIN = 3.0
 MIN_SEGMENT_PCT = 2.0
 MAX_GAP_S = 300.0
+# A drive between two rooms of one clean (`returning_home` between two tasks,
+# the transit flag) does not end the segment: it is short and drains about
+# the same. Field 2026-11-27: S6 cut every room into its own segment, and the
+# first level change of each one only marks its start — none was long enough.
+BRIDGE_S = 120.0
 
 
 @dataclass
@@ -129,6 +136,31 @@ def close(seg: Segment) -> tuple[str, float] | None:
         return None
     rate = -delta / minutes
     return (seg.mode, round(rate, 3)) if 0.02 <= rate <= 5 else None
+
+
+def seg_to_dict(seg: Segment) -> dict[str, Any]:
+    """An open segment for the store: it survives a restart of Home Assistant
+    (field 2026-11-27: the restart lost 20 min of S6 measuring)."""
+    return {
+        "mode": seg.mode, "setting": seg.setting,
+        "t0": seg.t0.isoformat(), "b0": seg.b0,
+        "t_last": seg.t_last.isoformat(), "b_last": seg.b_last,
+        "edges": [[t.isoformat(), b] for t, b in seg.edges],
+    }
+
+
+def seg_from_dict(d: Any) -> Segment | None:
+    if not isinstance(d, dict) or not isinstance(d.get("mode"), str):
+        return None
+    try:
+        return Segment(
+            d["mode"], d.get("setting"),
+            datetime.fromisoformat(d["t0"]), float(d["b0"]),
+            datetime.fromisoformat(d["t_last"]), float(d["b_last"]),
+            [(datetime.fromisoformat(t), float(b)) for t, b in d.get("edges") or []],
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def learn(learned: dict[str, Any], key: str, rate: float, setting: str | None, at: datetime) -> None:

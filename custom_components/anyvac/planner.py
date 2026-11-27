@@ -54,9 +54,21 @@ EXHAUSTIVE_MAX = 6
 SEARCH_BUDGET = 6000
 
 
+def _roborock_device(hass: HomeAssistant, duid: str) -> Any:
+    """The Roborock device with this duid. `async_get_device(identifiers=)`
+    is deprecated (stops in HA 2027.8: identifiers are no longer unique across
+    config entries) — `async_get_devices` returns every match; the one of the
+    roborock integration is the one we want."""
+    reg = dr.async_get(hass)
+    if not hasattr(reg, "async_get_devices"):  # HA before the new lookup
+        return reg.async_get_device(identifiers={(ROBOROCK_DOMAIN, duid)})
+    devices = reg.async_get_devices(identifiers={(ROBOROCK_DOMAIN, duid)})
+    return devices[0] if devices else None
+
+
 def vacuum_entity_for_duid(hass: HomeAssistant, duid: str) -> str | None:
     """vacuum.* entity of the Roborock device with this duid (device registry)."""
-    device = dr.async_get(hass).async_get_device(identifiers={(ROBOROCK_DOMAIN, duid)})
+    device = _roborock_device(hass, duid)
     if device is None:
         return None
     for ent in er.async_entries_for_device(er.async_get(hass), device.id):
@@ -82,7 +94,7 @@ def duid_for_entity(hass: HomeAssistant, entity_id: str) -> str | None:
 def selects_for_duid(hass: HomeAssistant, duid: str) -> dict[str, str]:
     """Mop-related select entities of the device: {mop_mode, mop_intensity}."""
     out: dict[str, str] = {}
-    device = dr.async_get(hass).async_get_device(identifiers={(ROBOROCK_DOMAIN, duid)})
+    device = _roborock_device(hass, duid)
     if device is None:
         return out
     for ent in er.async_entries_for_device(er.async_get(hass), device.id):
@@ -129,7 +141,10 @@ def needs_charge(battery: float | None, need: float) -> bool:
     return battery is not None and battery < 99 and battery - need < batterymod.RESERVE
 
 
-def simulate_queues(robots: dict[str, dict[str, Any]]) -> dict[str, tuple[float, float]]:
+def simulate_queues(
+    robots: dict[str, dict[str, Any]],
+    stops: dict[str, list[dict[str, Any]]] | None = None,
+) -> dict[str, tuple[float, float]]:
     """Start/finish minute of every queue item (docs/52 §3, §5a).
 
     ``robots`` = ``{key: {items, wash_mode, interval, batch, since_wash,
@@ -146,11 +161,17 @@ Between two items of a room-by-room
     interval (``WASH_DURATION_MIN`` each). A batch robot is one task.
 
     The single timing model of AnyVac: the planner uses it for the plan, the
-    coordinator for the live ``job_progress`` (docs/14 rule 2)."""
+    coordinator for the live ``job_progress`` (docs/14 rule 2).
+
+    ``stops``, when given, is filled with the charging stops the model put in:
+    ``{robot key: [{before, start, end, to_pct}]}`` (minutes from now)."""
     times: dict[str, tuple[float, float]] = {}
     dry_finish: dict[str, float] = {}
 
-    def run_robot(r: dict[str, Any]) -> None:
+    def run_robot(key: str, r: dict[str, Any]) -> None:
+        my_stops: list[dict[str, Any]] = []
+        if stops is not None:
+            stops[key] = my_stops
         t = float(r.get("offset") or 0.0)
         mode, interval, batch = r.get("wash_mode"), r.get("interval"), bool(r.get("batch"))
         since_wash = float(r.get("since_wash") or 0.0)
@@ -200,14 +221,16 @@ Between two items of a room-by-room
                     need = battery_need(r, it, place)
                     rest = need + sum(battery_need(r, x, None) for x in pending)
                     goal = charge_goal(rest, need)
-                    t += r["bat"].charge_minutes(battery, goal)
+                    charge = r["bat"].charge_minutes(battery, goal)
+                    my_stops.append({"before": it["id"], "start": t, "end": t + charge, "to_pct": round(goal)})
+                    t += charge
                     battery = goal
                 battery -= need
             elif battery is not None:
                 battery -= battery_need(r, it, place)
             if kind == "wet":
                 if first and mode and r.get("pre_wash", True) and prev_kind is None:
-                    t += PRE_WASH_MIN
+                    t += r.get("wash_dock") or PRE_WASH_MIN
                 elif not first and not batch:
                     wash_now = prev_kind == "wet" and (
                         mode in ("room", "unknown")
@@ -235,9 +258,10 @@ Between two items of a room-by-room
             if kind == "wet" and interval and interval > 0:
                 # The firmware's own counter only runs inside one task.
                 in_task = since_wash if batch else 0.0
+                wash_len = r.get("wash_mid") or WASH_DURATION_MIN
                 while in_task + remaining >= interval:
                     chunk = interval - in_task
-                    end += chunk + WASH_DURATION_MIN
+                    end += chunk + wash_len
                     remaining -= chunk
                     in_task = 0.0
                     since_wash = 0.0
@@ -258,8 +282,8 @@ Between two items of a room-by-room
     # iterate to a fixed point (a few rounds always settle: gates are acyclic).
     for _ in range(6):
         before = dict(times)
-        for r in robots.values():
-            run_robot(r)
+        for key, r in robots.items():
+            run_robot(key, r)
         if times == before:
             break
     return times
@@ -316,7 +340,20 @@ def live_robot_model(
         "place": place or "dock",
         "bat": bat,
         "battery": dd.get("battery"),
+        **_wash_lengths(dd),
     }
+
+
+def _wash_lengths(dd: dict[str, Any]) -> dict[str, float]:
+    """The robot's learned wash lengths for `simulate_queues` (absent = the
+    defaults `WASH_DURATION_MIN` / `PRE_WASH_MIN`)."""
+    w = dd.get("wash_min") or {}
+    out: dict[str, float] = {}
+    if isinstance(w.get("mid"), (int, float)):
+        out["wash_mid"] = float(w["mid"])
+    if isinstance(w.get("dock"), (int, float)):
+        out["wash_dock"] = float(w["dock"])
+    return out
 
 
 def plan_score(robots: dict[str, dict[str, Any]]) -> tuple[float, float, float]:
@@ -641,7 +678,8 @@ class CleanPlanner:
                 "transit": tm(duid) if callable(tm) else {},
                 "place": rp(duid) if callable(rp) else "dock",
                 "bat": bm(duid) if callable(bm) else None,
-                "battery": dd.get("battery")}
+                "battery": dd.get("battery"),
+                **_wash_lengths(dd)}
 
     def _estimate_timeline(
         self,

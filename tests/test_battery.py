@@ -123,3 +123,56 @@ def test_timing_model_charges_when_the_next_room_does_not_fit() -> None:
     assert end == pytest.approx(20 + 0.35 + 6 + 20)
     r["battery"] = 100
     assert simulate_queues({"r": r})["b"][1] == pytest.approx(40.35)
+
+
+def test_the_timing_model_reports_its_charging_stops() -> None:
+    m = bm.Model(drain={"dry": 1.0}, charge={"lo": 1.0, "hi": 1.0})
+    r = {"items": [{"id": "a", "kind": "dry", "rooms": ["A"], "est_min": 20},
+                   {"id": "b", "kind": "dry", "rooms": ["B"], "est_min": 20}],
+         "bat": m, "battery": 60}
+    stops: dict = {}
+    simulate_queues({"r": r}, stops)
+    assert stops == {"r": [{"before": "b", "start": pytest.approx(20.0), "end": pytest.approx(26.0), "to_pct": 46}]}
+    r["battery"] = 100
+    stops = {}
+    simulate_queues({"r": r}, stops)
+    assert stops == {"r": []}
+
+
+def test_a_drive_to_the_next_room_does_not_cut_the_segment(monkeypatch) -> None:
+    """Field 2026-11-27: S6 Bathroom → Corridor with `returning_home` between
+    the tasks. Each room on its own was too short; together they teach."""
+    t0 = c.dt_util.utcnow()
+    now = [t0]
+    co = _co(monkeypatch, now)
+
+    def at(sec, **d):
+        now[0] = t0 + timedelta(seconds=sec)
+        co._note_battery(_dev(**d))
+
+    level = 90
+    for s in range(0, 150, 30):          # room 1: 90 -> 89 (one change only)
+        at(s, battery=level - (1 if s >= 90 else 0))
+    at(160, battery=89, status_state="returning_home")
+    at(200, battery=89, status_state="returning_home")
+    for s in range(230, 450, 30):        # room 2: seen 88 at 260, 87 at 350, 86 at 440
+        lv = 89 - (1 if s >= 240 else 0) - (1 if s >= 330 else 0) - (1 if s >= 420 else 0)
+        at(s, battery=lv)
+    at(460, battery=86, in_cleaning=False, status_state="charging")
+    # Edges 89 @ 90 s .. 86 @ 440 s: 3 % in 350 s, across the drive.
+    assert co._battery_learned["s6"]["drain"]["dry"] == pytest.approx(3 / (350 / 60), abs=0.005)
+
+
+def test_an_open_segment_survives_a_restart() -> None:
+    t0 = c.dt_util.utcnow()
+    seg = bm.Segment("wet", "off", t0, 90.0, t0 + timedelta(minutes=4), 88.0,
+                     [(t0 + timedelta(minutes=1), 89.0), (t0 + timedelta(minutes=4), 88.0)])
+    back = bm.seg_from_dict(bm.seg_to_dict(seg))
+    assert back == seg
+    assert bm.seg_from_dict({"mode": "dry"}) is None
+    co = object.__new__(c.AnyVacCoordinator)
+    co._battery_learned = {"s8": {"drain": {"wet": 0.3}}}
+    co._bat_seg = {"s8": seg}
+    payload = co._battery_payload()
+    assert payload["s8"] == {"drain": {"wet": 0.3}}
+    assert bm.seg_from_dict(payload["__open"]["s8"]) == seg

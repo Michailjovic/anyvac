@@ -314,6 +314,7 @@ class JobRunner:
 
     async def _step(self) -> None:
         now = dt_util.utcnow()
+        self._refresh_estimates()
         for duid, q in self.queues.items():
             if self._closed:
                 return
@@ -809,6 +810,48 @@ class JobRunner:
             break
         return live_robot_model(q, self._device(duid), transit, place, bat)
 
+    def _refresh_estimates(self) -> None:
+        """Re-read the learned time of every room still to come — once at the
+        start (also after a restart) and after every room that ends: each
+        finished room may have taught a new value. Field 2026-11-27: the queue
+        kept the estimates of the moment the job started, so neither a fix nor
+        anything learned that morning reached the ETA."""
+        key = tuple(it["state"] for it in self.items())
+        if self.__dict__.get("_est_key") == key:
+            return
+        self._est_key = key
+        from .planner import DEFAULT_ROOM_MIN, CleanPlanner
+
+        coords = _coordinators(self.hass)
+        if not coords:
+            return
+        try:
+            planner = CleanPlanner(self.hass, coords[0])
+        except Exception:  # noqa: BLE001 - keep the old estimates
+            return
+        changed = False
+        for q in self.queues.values():
+            if q.get("batch"):
+                continue
+            for it in q["items"]:
+                if it["state"] != "queued":
+                    continue
+                kind = it.get("kind")
+                repeat = max(1, int(it.get("repeat") or 1))
+                route = (it.get("expect") or {}).get("mop_mode") if kind == "wet" else None
+                try:
+                    est = sum(
+                        planner._estimate(q["duid"], r, kind, repeat, route) or DEFAULT_ROOM_MIN * repeat
+                        for r in it.get("rooms") or []
+                    )
+                except Exception:  # noqa: BLE001
+                    continue
+                if est and abs(est - float(it.get("est_min") or 0.0)) > 0.05:
+                    it["est_min"] = round(est, 1)
+                    changed = True
+        if changed:
+            self._save()
+
     def _replan(self, q: dict[str, Any]) -> None:
         """docs/53 §4.4: when the robot is free, put the rest of its queue in
         the order that ends the job soonest, with the times measured so far.
@@ -885,9 +928,14 @@ class JobRunner:
         if not self._docked(dd) or state in WASH_STATES or state == "error":
             return
         eta = self._gate_eta_min(nxt)
-        if eta is None or eta > PREWASH_LEAD_MIN:
+        # As long as this robot's wash takes, plus half a minute (field
+        # 2026-11-27: the S8 pre-wash took 5.2 min, the 4 min lead left it
+        # washing 2.6 min after the Bathroom was ready).
+        learned = (dd.get("wash_min") or {}).get("dock")
+        lead = float(learned) + 0.5 if isinstance(learned, (int, float)) else PREWASH_LEAD_MIN
+        if eta is None or eta > lead:
             if eta is not None:
-                self._schedule(f"prewash-{q['duid']}", max(30.0, (eta - PREWASH_LEAD_MIN) * 60))
+                self._schedule(f"prewash-{q['duid']}", max(30.0, (eta - lead) * 60))
             return
         q["prewash_for"] = nxt["id"]
         try:

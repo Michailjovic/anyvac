@@ -462,3 +462,26 @@ async def test_the_job_keeps_its_vacuum_roles_for_rooms_added_later(monkeypatch)
     assert runner.snapshot()["vacuums"] == roles
     again = jr.JobRunner.from_snapshot(rig.hass, runner.snapshot())
     assert again is not None and again.vacuums == roles
+
+
+async def test_queued_rooms_take_the_current_learned_times(monkeypatch) -> None:
+    """Field 2026-11-27: the queue kept the estimates from the job's start."""
+    from custom_components.anyvac import planner as pl
+
+    class P:
+        def __init__(self, hass, coord):
+            pass
+
+        def _estimate(self, duid, room, kind, repeat=1, route=None):
+            return {"A": 3.0, "B": 7.0}[room] * repeat
+
+    monkeypatch.setattr(pl, "CleanPlanner", P)
+    rig = Rig(monkeypatch)
+    s6 = rig.add("s6", "vacuum.s6")
+    a = item("s6", "vacuum.s6", "dry", "A", 1, est=30.0)
+    b = item("s6", "vacuum.s6", "dry", "B", 2, est=30.0)
+    b["repeat"] = 2
+    runner = await _start(rig, [a, b])
+    items = {it["room"]: it for it in runner.queues["s6"]["items"]}
+    assert items["A"]["est_min"] == 3.0    # refreshed before it was sent
+    assert items["B"]["est_min"] == 14.0   # 7 per pass x 2

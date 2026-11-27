@@ -291,6 +291,10 @@
         "baselines": {
           "name": "Smazat uložená procenta",
           "description": "Smazat uložená procenta dokončení."
+        },
+        "legacy_passes": {
+          "name": "Převést staré odhady (průjezdy)",
+          "description": "Místo mazání převede odhady naučené před verzí 1.63.0 (jedna hodnota za všechny průjezdy) na čas jednoho průjezdu – vydělí je počtem průjezdů, se kterými vznikly (1–3). Ostatní pole kromě duid se pak ignorují."
         }
       }
     },
