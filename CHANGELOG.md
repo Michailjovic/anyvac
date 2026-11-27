@@ -6,6 +6,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.65.2] - 2026-11-27
+
+- **Travel was empty until the first clean.** The room geometry the travel
+  table comes from was built only while a robot cleaned, so `travel_min` was
+  empty with every robot docked and the first plan had no travel in it (field
+  2026-11-27). It is built when the map changes now, cleaning or not.
+- **A room added to a running job ignored the job's roles.** The card starts a
+  job with `vacuums` (dry = S6 + S7, wet = S8), but `edit_job add` planned
+  without it: an added Bedroom went dry to S8 and wet to S7, which has no mop
+  washing (field 2026-11-27). The job now keeps the limit it was started with
+  (also across a restart) and plans added rooms with it; `edit_job` accepts its
+  own `vacuums` too.
+- **The timing model now takes rooms the way the runner does:** the room under
+  way first, then the first room in queue order whose dry pass is done, and
+  only when none is ready, the one that gets ready first. It used to run each
+  queue strictly in order, so after a re-plan S8 was timed to start the
+  Bathroom it was already mopping after the Corridor and the Kitchen (field
+  2026-11-27, times an hour off in the queue). The plan shows each queue in
+  the order it will run; "back home" in the plan score counts from the room
+  that ends last in time.
+- **Estimates learned before 1.63.0 are no longer multiplied by the passes.**
+  They were whole cleans with every pass in one value; 1.63.0 read them as one
+  pass and doubled them for a 2-pass preset (field 2026-11-27: "402 min left"
+  for about two hours of cleaning — S6 did the Bathroom on 2 passes in 5 min
+  against a stored 4). Such values are marked when loaded (store format 2) and
+  used as they are; the first per-pass measurement of that room replaces them
+  instead of being averaged in. Estimates keep one decimal now (a small room
+  takes 2–3 minutes per pass).
+- Tests: 605.
+
 ## [1.65.1] - 2026-11-26
 
 - **Battery rates are measured between level changes**, not between the ends

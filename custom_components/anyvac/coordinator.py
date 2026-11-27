@@ -1341,6 +1341,11 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         self._session_rooms: dict[str, set[str]] = {}
         self._session_start: dict[str, datetime] = {}
         self._est_store: Store = Store(hass, 1, f"{DOMAIN}_room_estimates")
+        # Estimates learned before 1.63.0 were whole cleans (all passes in
+        # one value). (duid, room, kind) here = such a value: the planner does
+        # not multiply it by `repeat`, and the first per-pass sample replaces
+        # it (field 2026-11-27: 402 min left for ~2 h of cleaning).
+        self._est_legacy: set[tuple[str, str, str]] = set()
         # Learned clean-time estimates kept PER VACUUM (cleaning speeds differ between
         # models, so they are never shared): {duid: {room_name: {dry: min, wet: min}}}
         self._estimates: dict[str, dict[str, dict[str, float]]] = {}
@@ -1999,7 +2004,8 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
 
         if estimates:
             _prune(self._estimates)
-            self._delay_save(self._est_store, lambda: self._estimates, 2)
+            self._est_legacy = {x for x in self._est_legacy if x[2] in (self._estimates.get(x[0]) or {}).get(x[1], {})}
+            self._delay_save(self._est_store, self._est_payload, 2)
         if baselines:
             # `_room_coverage` has no duid dimension (mirrors `_history`'s cross-fleet
             # room-name keying), so a duid-scoped reset still clears by room/kind only.
@@ -2754,7 +2760,14 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         if not hasattr(self, "_transit_busy"):
             return
         duid = device.duid
-        geo = (self._geo.get(duid) or (None, None, None))[2]
+        # The coverage pipeline builds the geometry only while cleaning; the
+        # plan needs travel before the first room is sent (field 2026-11-27:
+        # empty `travel_min` with every robot docked). Cached by map, cheap.
+        try:
+            geo = self._update_geometry(device)
+        except Exception as err:  # noqa: BLE001 - travel is an estimate, never break the poll
+            _LOGGER.debug("AnyVac: geometry for travel unavailable for %s: %s", duid, err)
+            geo = None
         if geo is None or geo.room_id is None:
             return
         ch = device.data.get("charger") or {}
@@ -2857,10 +2870,26 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
             return None, None
         rec = self._estimates.setdefault(duid, {}).setdefault(room, {})
         before = rec.get(kind)
-        after = round(minutes) if before is None else round(0.6 * before + 0.4 * minutes)
+        legacy = getattr(self, "_est_legacy", set())
+        if (duid, room, kind) in legacy:
+            # A whole-clean value from before 1.63.0: the first per-pass sample
+            # replaces it instead of being averaged into it.
+            legacy.discard((duid, room, kind))
+            before = None
+        # One decimal: a per-pass value of a small room is 2–3 minutes.
+        after = round(minutes, 1) if before is None else round(0.6 * before + 0.4 * minutes, 1)
         rec[kind] = after
-        self._delay_save(self._est_store, lambda: self._estimates, 5)
+        self._delay_save(self._est_store, self._est_payload, 5)
         return before, after
+
+    def _est_payload(self) -> dict[str, Any]:
+        """What the estimate store keeps: per-pass values (format 2) and which
+        of them are still whole cleans from before 1.63.0."""
+        return {"__format": 2, "__legacy": sorted(list(x) for x in getattr(self, "_est_legacy", set())), **self._estimates}
+
+    def estimate_is_whole_clean(self, duid: str, room: str, kind: str) -> bool:
+        """True for a value learned before 1.63.0 (all passes in one)."""
+        return (duid, room, kind) in getattr(self, "_est_legacy", set())
 
     def _update_geometry(self, device: AnyVacDevice) -> covmod.Geometry | None:
         """Coverage geometry for one vacuum (docs/45 §2.1): room floor decoded
@@ -3844,8 +3873,10 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
         est = await self._est_store.async_load()
         if isinstance(est, dict):
             loaded: dict[str, dict[str, dict[str, float]]] = {}
+            per_pass = est.get("__format") == 2
+            legacy_saved = {tuple(x) for x in est.get("__legacy") or [] if isinstance(x, list) and len(x) == 3}
             for duid, rooms in est.items():
-                if not isinstance(rooms, dict):
+                if str(duid).startswith("__") or not isinstance(rooms, dict):
                     continue
                 for room, kinds in rooms.items():
                     if not isinstance(kinds, dict):
@@ -3853,6 +3884,9 @@ class AnyVacCoordinator(DataUpdateCoordinator[dict[str, AnyVacDevice]]):
                     vals = {k: float(v) for k, v in kinds.items() if isinstance(v, (int, float))}
                     if vals:
                         loaded.setdefault(duid, {})[room] = vals
+                        for k in vals:
+                            if not per_pass or (duid, room, k) in legacy_saved:
+                                self._est_legacy.add((duid, room, k))
             self._estimates = loaded
         paths = await self._paths_store.async_load()
         if isinstance(paths, dict):

@@ -128,6 +128,7 @@ class JobRunner:
         wash: dict[str, dict[str, Any]] | None = None,
         job_id: str | None = None,
         started_at: datetime | None = None,
+        vacuums: Any = None,
     ) -> None:
         self.hass = hass
         # 1.51.8 (B4): the context of the call that started the job, handed to
@@ -137,6 +138,10 @@ class JobRunner:
         self.started_at = started_at or dt_util.utcnow()
         self.mode = mode
         self.settings = settings or {}
+        # The `vacuums` limit of the call that started the job (roles of the
+        # card: dry = S6 + S7, wet = S8). A room added later keeps to it
+        # (field 2026-11-27: an added Bedroom went dry to S8 and wet to S7).
+        self.vacuums = vacuums
         self.warnings: list[str] = []
         self.queues: dict[str, dict[str, Any]] = {}
         self._seq = 0
@@ -1118,6 +1123,7 @@ class JobRunner:
             "started_at": _iso(self.started_at),
             "mode": self.mode,
             "settings": self.settings,
+            "vacuums": self.vacuums,
             "user_id": getattr(self.context, "user_id", None),
             "queues": self.queues,
             "dry_rooms_done": sorted(self.dry_rooms_done),
@@ -1170,7 +1176,7 @@ class JobRunner:
         runner = cls(
             hass, [], mode=snap.get("mode") or "dry", settings=snap.get("settings"),
             context=Context(user_id=user_id) if user_id else None,
-            job_id=snap.get("job_id"), started_at=started,
+            job_id=snap.get("job_id"), started_at=started, vacuums=snap.get("vacuums"),
         )
         runner.queues = {str(k): v for k, v in (snap.get("queues") or {}).items()}
         runner.dry_rooms_done = set(snap.get("dry_rooms_done") or [])

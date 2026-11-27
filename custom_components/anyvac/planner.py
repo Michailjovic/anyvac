@@ -136,7 +136,9 @@ def simulate_queues(robots: dict[str, dict[str, Any]]) -> dict[str, tuple[float,
     offset, pre_wash}}``; an item is ``{id, kind, rooms, est_min}`` (for the
     item a robot is working on now, ``est_min`` is what is LEFT of it). Each
     robot runs its items in order. A wet item waits for the dry item(s) of the
-    same room(s); dry items never wait. Between two items of a room-by-room
+    same room(s); dry items never wait. A robot takes the item under way first,
+then the first item in its order whose room is ready, as the runner does.
+Between two items of a room-by-room
     robot: ``CHAIN_GAP_MIN`` when the next one is sent on the way home, or
     ``END_WASH_MIN`` when a wet robot docks to wash first (after every room in
     the app's by-room mode, once the mopping since the last wash reaches the
@@ -166,8 +168,27 @@ def simulate_queues(robots: dict[str, dict[str, Any]]) -> dict[str, tuple[float,
         battery = r.get("battery") if r.get("bat") is not None else None
         battery = float(battery) if isinstance(battery, (int, float)) else None
         items_all = r.get("items") or []
+        pending = list(items_all)
+
+        def gate_of(x: dict[str, Any]) -> float:
+            if x.get("kind") != "wet":
+                return 0.0
+            return max((dry_finish.get(room, 0.0) for room in x.get("rooms") or []), default=0.0)
+
         first = True
-        for idx, it in enumerate(items_all):
+        while pending:
+            # The runner's choice (`_next_ready`): the item under way first, then
+            # the first one in queue order whose room is ready; none ready → the
+            # one whose dry pass ends first (the robot waits for it). Field
+            # 2026-11-27: a strict order made a wet robot "wait" for the Corridor
+            # while it was already mopping the Bathroom.
+            here = [x for x in pending if x.get("here")]
+            if here or batch:
+                it = (here or pending)[0]
+            else:
+                ready = [x for x in pending if gate_of(x) <= t + 1e-9]
+                it = ready[0] if ready else min(pending, key=gate_of)
+            pending.remove(it)
             kind = it.get("kind")
             rooms = it.get("rooms") or []
             if battery is not None and not it.get("here"):
@@ -177,7 +198,7 @@ def simulate_queues(robots: dict[str, dict[str, Any]]) -> dict[str, tuple[float,
                     t += travel_minutes(transit, place, ["dock"]) if place != "dock" else 0.0
                     place = "dock"
                     need = battery_need(r, it, place)
-                    rest = need + sum(battery_need(r, x, None) for x in items_all[idx + 1:])
+                    rest = need + sum(battery_need(r, x, None) for x in pending)
                     goal = charge_goal(rest, need)
                     t += r["bat"].charge_minutes(battery, goal)
                     battery = goal
@@ -310,7 +331,8 @@ def plan_score(robots: dict[str, dict[str, Any]]) -> tuple[float, float, float]:
         items = r.get("items") or []
         if not items:
             continue
-        last = items[-1]
+        # The item that ends last in time (the runner may take them out of order).
+        last = max(items, key=lambda x: times[x["id"]][1])
         rooms = last.get("rooms") or []
         back = ((r.get("transit") or {}).get(rooms[-1]) or {}).get("dock") if rooms else None
         home = max(home, times[last["id"]][1] + (float(back) if isinstance(back, (int, float)) else 0.0))
@@ -430,9 +452,19 @@ class CleanPlanner:
         if not rec and self._paired_names():
             rec = ests.get(self._own_room_name(duid, room))
         rec = rec or {}
-        val = (rec.get(f"wet@{str(route).lower()}") if kind == "wet" and route else None) \
-            or rec.get(kind) or rec.get("dry") or rec.get("wet")
-        return float(val) * max(1, int(repeat or 1)) if val else None
+        room_key = room if room in ests else self._own_room_name(duid, room) if self._paired_names() else room
+        key = None
+        for k in ((f"wet@{str(route).lower()}" if kind == "wet" and route else None), kind, "dry", "wet"):
+            if k and rec.get(k):
+                key = k
+                break
+        if key is None:
+            return None
+        val = float(rec[key])
+        whole = getattr(self.coord, "estimate_is_whole_clean", None)
+        if callable(whole) and whole(duid, room_key, key):
+            return val  # learned before 1.63.0: already all passes in one
+        return val * max(1, int(repeat or 1))
 
     def _item_estimate(self, duid: str, room: str, kind: str, settings: dict[str, Any] | None) -> float:
         ks = self._settings_for_duid(settings, kind, duid)
@@ -774,8 +806,16 @@ class CleanPlanner:
                     break
         except StopIteration:
             pass
-        finally:
-            self._model_cache = None
+        # The queue in the order the robots will actually take it (the runner
+        # picks the first READY item, so ties of the search are only display).
+        times = simulate_queues(self._robots_for(assigns["dry"], assigns["wet"], batch, settings, est))
+        self._model_cache = None
+        for kind in ("dry", "wet"):
+            for duid, rooms in assigns[kind].items():
+                if duid in batch:
+                    continue
+                order = sorted(range(len(rooms)), key=lambda i: (times.get(f"{kind}-{duid}-{i}", (0.0, 0.0))[0], i))
+                assigns[kind][duid] = [rooms[i] for i in order]
         return assigns["dry"], assigns["wet"]
 
     def _settings_for_duid(

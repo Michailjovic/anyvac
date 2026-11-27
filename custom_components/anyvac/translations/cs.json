@@ -205,6 +205,10 @@
         "settings": {
           "name": "Nastavení",
           "description": "Stejný tvar jako u anyvac.clean. S „add“: nastavení přidaných místností. Samotné: nové nastavení uvedených vysavačů pro místnosti ve frontě i pro tu, kterou právě uklízí (hned)."
+        },
+        "vacuums": {
+          "name": "Vysavače",
+          "description": "Které vysavače smí přidané místnosti převzít, jako u anyvac.clean (seznam, nebo seznamy dry / wet). Výchozí: omezení, se kterým byl úklid spuštěn."
         }
       }
     },

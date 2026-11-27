@@ -445,6 +445,14 @@ edit_job:
       example: '["Bathroom"]'
       selector:
         object:
+    vacuums:
+      name: Vacuums
+      description: >-
+        Which vacuums may take the added rooms, as in anyvac.clean (a list, or
+        dry / wet lists). Default: the limit the running job was started with.
+      example: '{"dry": ["vacuum.s6"], "wet": ["vacuum.s8"]}'
+      selector:
+        object:
     retry:
       name: Retry rooms
       description: >-

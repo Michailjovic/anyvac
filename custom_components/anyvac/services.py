@@ -386,6 +386,12 @@ _KIND = vol.In(["dry", "wet"])
 EDIT_JOB_SCHEMA = vol.Schema(
     {
         vol.Optional("add"): [str],
+        # Which robots may take added rooms (as in `anyvac.clean`); default:
+        # the limit the running job was started with.
+        vol.Optional("vacuums"): vol.Any(
+            [str],
+            vol.Schema({vol.Optional("dry"): [str], vol.Optional("wet"): [str]}),
+        ),
         vol.Optional("remove"): [str],
         # Blocked rooms to put back into their queue (the card's Retry).
         vol.Optional("retry"): [str],
@@ -1666,10 +1672,11 @@ async def _start_job(
     settings: dict[str, Any] | None,
     wash: dict[str, dict[str, Any]],
     context: Context | None,
+    vacuums: Any = None,
 ) -> JobRunner:
     """Cancel any previous job (docs/13 C6: no parallel double-driving) and run."""
     _cancel_jobs(hass)
-    runner = JobRunner(hass, items, mode=mode, settings=settings, context=context, wash=wash)
+    runner = JobRunner(hass, items, mode=mode, settings=settings, context=context, wash=wash, vacuums=vacuums)
     await runner.start()
     return runner
 
@@ -1926,7 +1933,7 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
         wash = {it["duid"]: planner.wash_info(it["duid"]) for it in items}
         await _start_job(
             hass, items, mode=call.data.get("mode", "dry"), settings=call.data.get("settings"),
-            wash=wash, context=call.context,
+            wash=wash, context=call.context, vacuums=call.data.get("vacuums"),
         )
 
     async def _handle_plan(call: ServiceCall) -> dict[str, Any]:
@@ -1946,14 +1953,14 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
             planner, coord = _planner()
             items, plan = planner.build_tasks(
                 rooms=add, mode=call.data.get("mode") or "dry", pin=call.data.get("pin") or coord.room_pins or None,
-                settings=call.data.get("settings"),
+                settings=call.data.get("settings"), vacuums=call.data.get("vacuums"),
             )
             if not items:
                 raise HomeAssistantError(f"anyvac.edit_job: no capable vacuum for {add}")
             wash = {it["duid"]: planner.wash_info(it["duid"]) for it in items}
             runner = await _start_job(
                 hass, items, mode=call.data.get("mode") or "dry", settings=call.data.get("settings"),
-                wash=wash, context=call.context,
+                wash=wash, context=call.context, vacuums=call.data.get("vacuums"),
             )
             return {"job_id": runner.job_id, "added": [it["id"] for it in items]}
         out: dict[str, Any] = {
@@ -1976,7 +1983,7 @@ def async_register_services(hass: HomeAssistant) -> None:  # noqa: C901 - one re
                 # behind what it already has; the wet pass is gated as usual.
                 items, _plan = planner.build_tasks(
                     rooms=add, mode=mode or job.mode, pin=call.data.get("pin") or coord.room_pins or None,
-                    settings=settings,
+                    settings=settings, vacuums=call.data.get("vacuums") or getattr(job, "vacuums", None),
                 )
                 items = [it for it in items if not all((r, it["kind"]) in busy for r in it["rooms"])]
                 wash = {it["duid"]: planner.wash_info(it["duid"]) for it in items}

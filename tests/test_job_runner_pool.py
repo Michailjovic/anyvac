@@ -449,3 +449,16 @@ async def test_a_robot_stopped_away_from_the_dock_is_sent_home_to_charge(monkeyp
     await _start(rig, [item("s6", "vacuum.s6", "dry", "A", 1, est=20.0)])
     await rig.poll()
     assert rig.hass.services.count("vacuum", "return_to_base", "vacuum.s6") == 1
+
+
+async def test_the_job_keeps_its_vacuum_roles_for_rooms_added_later(monkeypatch) -> None:
+    """Field 2026-11-27: Bedroom added during a job went dry to S8 and wet to S7.
+    The job remembers the `vacuums` limit it was started with (also across a
+    restart) and `edit_job add` plans with it."""
+    rig = Rig(monkeypatch)
+    rig.add("s6", "vacuum.s6")
+    roles = {"dry": ["vacuum.s6"], "wet": ["vacuum.s8"]}
+    runner = jr.JobRunner(rig.hass, [item("s6", "vacuum.s6", "dry", "A", 1)], mode="both", vacuums=roles)
+    assert runner.snapshot()["vacuums"] == roles
+    again = jr.JobRunner.from_snapshot(rig.hass, runner.snapshot())
+    assert again is not None and again.vacuums == roles

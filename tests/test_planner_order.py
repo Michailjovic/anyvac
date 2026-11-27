@@ -92,3 +92,18 @@ def test_floor_minutes_follows_the_floor_not_the_straight_line() -> None:
 
 def test_learned_transit_overrides_the_floor_model() -> None:
     assert tr.blend({"A": {"B": 2.0}}, {"A": {"B": 0.7}, "dock": {"A": 1.1}}) == {"A": {"B": 0.7}, "dock": {"A": 1.1}}
+
+
+def test_the_room_under_way_comes_first_and_a_ready_room_before_a_waiting_one() -> None:
+    """Field 2026-11-27: S8's queue was Corridor, Kitchen, Bathroom; the runner
+    sent Bathroom (the only room whose dry pass was done) and the model still
+    timed Bathroom after the other two."""
+    dry = {"items": [{"id": "d-cor", "kind": "dry", "rooms": ["Corridor"], "est_min": 4, "here": True},
+                     {"id": "d-kit", "kind": "dry", "rooms": ["Kitchen"], "est_min": 10}]}
+    wet = {"items": [{"id": "w-cor", "kind": "wet", "rooms": ["Corridor"], "est_min": 5},
+                     {"id": "w-kit", "kind": "wet", "rooms": ["Kitchen"], "est_min": 5},
+                     {"id": "w-bath", "kind": "wet", "rooms": ["Bathroom"], "est_min": 6, "here": True}]}
+    t = simulate_queues({"s6": dry, "s8": wet})
+    assert t["w-bath"] == (0.0, 6.0)
+    assert t["w-cor"][0] == pytest.approx(6.35)      # Corridor dry ended at 4
+    assert t["w-kit"][0] >= t["d-kit"][1]
